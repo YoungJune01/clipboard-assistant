@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "clipboard-assistant",
+  "productName": "Clipboard Assistant",
   "version": "0.1.0",
-  "identifier": "com.clipboardassistant.app",
+  "identifier": "com.clipboardassistant.desktop",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
@@ -12,13 +12,13 @@
   "app": {
     "windows": [
       {
-        "title": "clipboard-assistant",
+        "title": "Clipboard Assistant",
         "width": 800,
         "height": 600
       }
     ],
     "security": {
-      "csp": null
+      "csp": "default-src 'self'; connect-src ipc: http://ipc.localhost; img-src 'self' data:; style-src 'self'; script-src 'self'"
     }
   },
   "bundle": {

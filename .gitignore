@@ -12,6 +12,30 @@ dist
 dist-ssr
 *.local
 
+# Local environment configuration
+.env
+.env.*
+!.env.example
+!.env.*.example
+
+# Local secrets and private keys
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+id_ed25519*
+secrets.json
+
+# Sanitized examples are safe to version
+!*.example.pem
+!*.example.key
+!*.example.p12
+!*.example.pfx
+!id_rsa*.example
+!id_ed25519*.example
+!secrets.example.json
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

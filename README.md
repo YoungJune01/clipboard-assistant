@@ -1,6 +1,16 @@
-# Tauri + React + Typescript
+# Clipboard Assistant
 
-This template should help get you started developing with Tauri, React and Typescript in Vite.
+Clipboard Assistant is a Windows desktop application built with Tauri, React, and TypeScript.
+
+## Development
+
+Install dependencies and run the standard project checks:
+
+```text
+npm ci
+npm run build
+cargo check --manifest-path src-tauri/Cargo.toml --locked
+```
 
 ## Recommended IDE Setup
 
