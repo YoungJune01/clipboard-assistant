@@ -11,7 +11,7 @@ use std::{
 
 use chrono::Utc;
 use windows::Win32::{
-    Foundation::{CloseHandle, ERROR_SUCCESS, GetLastError, HANDLE, HGLOBAL, HWND, SetLastError},
+    Foundation::{CloseHandle, ERROR_SUCCESS, GetLastError, HANDLE, HGLOBAL, SetLastError},
     System::{
         DataExchange::{
             CloseClipboard, GetClipboardData, GetClipboardSequenceNumber,
@@ -26,13 +26,15 @@ use windows::core::{PCWSTR, w};
 use crate::domain::{CapturedClipboard, ClipboardRepresentation, ContentIdentity, SourceIdentity};
 
 use super::message_loop::{
-    ListenerState, WM_CLIPBOARD_LISTENER_SHUTDOWN, run_message_loop, wake_and_join,
+    ListenerReady, ListenerState, WM_CLIPBOARD_LISTENER_SHUTDOWN, run_message_loop, wake_and_join,
 };
 
 const CF_UNICODETEXT_FORMAT: u32 = 13;
 const CF_DIBV5_FORMAT: u32 = 17;
 const MAX_PENDING_PRODUCT_WRITE_EVENTS: usize = 32;
-const LISTENER_READY_TIMEOUT: Duration = Duration::from_secs(3);
+const MAX_TEXT_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
+const MAX_IMAGE_PAYLOAD_BYTES: usize = 256 * 1024 * 1024;
+const LISTENER_BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClipboardEvent {
@@ -41,7 +43,7 @@ pub struct ClipboardEvent {
 }
 
 pub struct ClipboardListener {
-    hwnd_value: isize,
+    listener_thread_id: u32,
     events: Sender<ClipboardEvent>,
     product_write: Arc<Mutex<ProductWriteState>>,
     shutdown: Sender<()>,
@@ -53,6 +55,7 @@ impl ClipboardListener {
     pub fn start(events: Sender<ClipboardEvent>) -> Result<Self, ClipboardListenerError> {
         let product_write = Arc::new(Mutex::new(ProductWriteState::Idle));
         let thread_product_write = Arc::clone(&product_write);
+        let (bootstrap_sender, bootstrap_receiver) = sync_channel(0);
         let (ready_sender, ready_receiver) = sync_channel(1);
         let (shutdown_sender, shutdown_receiver) = std::sync::mpsc::channel();
         let shutdown_event = unsafe { CreateEventW(None, true, false, PCWSTR::null()) }
@@ -62,13 +65,15 @@ impl ClipboardListener {
         let thread = match thread::Builder::new()
             .name("clipboard-listener".to_owned())
             .spawn(move || {
-                run_message_loop(
-                    thread_events,
-                    thread_product_write,
-                    ready_sender,
-                    shutdown_receiver,
-                    HANDLE(thread_shutdown_event as *mut std::ffi::c_void),
-                )
+                bootstrap_listener_thread(bootstrap_sender, || {
+                    run_message_loop(
+                        thread_events,
+                        thread_product_write,
+                        ready_sender,
+                        shutdown_receiver,
+                        HANDLE(thread_shutdown_event as *mut std::ffi::c_void),
+                    )
+                })
             }) {
             Ok(thread) => thread,
             Err(error) => {
@@ -80,8 +85,14 @@ impl ClipboardListener {
         };
 
         let thread = std::cell::RefCell::new(Some(thread));
-        let hwnd_value = orchestrate_listener_start(
-            || classify_ready_wait(ready_receiver.recv_timeout(LISTENER_READY_TIMEOUT)),
+        orchestrate_listener_start(
+            move || {
+                classify_ready_wait(
+                    bootstrap_receiver
+                        .recv_timeout(LISTENER_BOOTSTRAP_TIMEOUT)
+                        .map(Ok),
+                )
+            },
             || unsafe { SetEvent(shutdown_event) }.map_err(ShutdownFailure::Signal),
             || {
                 join_listener_thread(
@@ -93,8 +104,34 @@ impl ClipboardListener {
             },
             || close_shutdown_event(shutdown_event),
         )?;
+        let listener_ready =
+            match ready_receiver.recv() {
+                Ok(Ok(listener_ready)) => listener_ready,
+                Ok(Err(error)) => {
+                    let joined =
+                        join_listener_thread(thread.borrow_mut().take().expect(
+                            "startup thread must be available after initialization failure",
+                        ));
+                    let close = close_shutdown_event(shutdown_event);
+                    return Err(combine_startup_failure(error, joined, close));
+                }
+                Err(_) => {
+                    let joined = join_listener_thread(
+                        thread
+                            .borrow_mut()
+                            .take()
+                            .expect("startup thread must be available after initialization exit"),
+                    );
+                    let close = close_shutdown_event(shutdown_event);
+                    return Err(combine_startup_failure(
+                        ClipboardListenerError::UnexpectedThreadExit,
+                        joined,
+                        close,
+                    ));
+                }
+            };
         Ok(Self {
-            hwnd_value,
+            listener_thread_id: listener_ready.thread_id,
             events,
             product_write,
             shutdown: shutdown_sender,
@@ -129,29 +166,44 @@ impl ClipboardListener {
         let Some(thread) = self.thread.take() else {
             return Ok(());
         };
-        let hwnd_value = self.hwnd_value;
+        let thread = std::cell::RefCell::new(Some(thread));
+        let listener_thread_id = self.listener_thread_id;
         let event_value = self.shutdown_event_value;
         let attempt = wake_and_join(
+            || match event_value {
+                Some(value) => unsafe { SetEvent(HANDLE(value as *mut std::ffi::c_void)) }
+                    .map_err(ShutdownFailure::Signal),
+                None => Ok(()),
+            },
             || {
                 self.shutdown
                     .send(())
                     .map_err(|_| ShutdownFailure::ControlDisconnected)
             },
+            || {
+                !thread
+                    .borrow()
+                    .as_ref()
+                    .expect("shutdown thread must be available before join")
+                    .is_finished()
+            },
             || unsafe {
-                windows::Win32::UI::WindowsAndMessaging::PostMessageW(
-                    Some(HWND(hwnd_value as *mut std::ffi::c_void)),
+                windows::Win32::UI::WindowsAndMessaging::PostThreadMessageW(
+                    listener_thread_id,
                     WM_CLIPBOARD_LISTENER_SHUTDOWN,
                     Default::default(),
                     Default::default(),
                 )
                 .map_err(ShutdownFailure::PostMessage)
             },
-            || match event_value {
-                Some(value) => unsafe { SetEvent(HANDLE(value as *mut std::ffi::c_void)) }
-                    .map_err(ShutdownFailure::Signal),
-                None => Ok(()),
+            || {
+                join_listener_thread(
+                    thread
+                        .borrow_mut()
+                        .take()
+                        .expect("shutdown thread must be available for join"),
+                )
             },
-            || join_listener_thread(thread),
         );
         let close = self
             .shutdown_event_value
@@ -215,7 +267,9 @@ impl fmt::Display for ClipboardListenerError {
                 formatter.write_str("clipboard listener exited before ready")
             }
             Self::ThreadPanicked => formatter.write_str("clipboard listener thread panicked"),
-            Self::ReadyTimeout => formatter.write_str("clipboard listener ready wait timed out"),
+            Self::ReadyTimeout => {
+                formatter.write_str("clipboard listener thread bootstrap timed out")
+            }
             Self::Cleanup(failures) => write!(
                 formatter,
                 "clipboard listener cleanup failed in {} stage(s)",
@@ -379,10 +433,10 @@ fn route_event(
         let mut state = lock_unpoisoned(state);
         match &mut *state {
             ProductWriteState::Armed { pending, .. } => {
-                let oldest =
-                    (pending.len() == MAX_PENDING_PRODUCT_WRITE_EVENTS).then(|| pending.remove(0));
-                pending.push(event);
-                oldest
+                if pending.len() < MAX_PENDING_PRODUCT_WRITE_EVENTS {
+                    pending.push(event);
+                }
+                None
             }
             ProductWriteState::Expected { sequence } if *sequence == event.sequence_number => {
                 *state = ProductWriteState::Idle;
@@ -455,14 +509,7 @@ impl Drop for ProductWriteGuard {
     fn drop(&mut self) {
         if !self.finished {
             let mut state = lock_unpoisoned(&self.state);
-            if let ProductWriteState::Armed { pending, .. } =
-                std::mem::replace(&mut *state, ProductWriteState::Idle)
-            {
-                drop(state);
-                for event in pending {
-                    let _ = self.events.send(event);
-                }
-            }
+            *state = ProductWriteState::Idle;
         }
     }
 }
@@ -479,10 +526,18 @@ fn read_supported_representations()
         if let Some(text) = read_unicode_text(CF_UNICODETEXT_FORMAT)? {
             representations.push(ClipboardRepresentation::UnicodeText { text });
         }
-        if let Some(bytes) = read_global_bytes(png_format)? {
+        if let Some(bytes) = read_global_bytes(
+            png_format,
+            MAX_IMAGE_PAYLOAD_BYTES,
+            ClipboardPayloadKind::Image,
+        )? {
             representations.push(ClipboardRepresentation::Png { bytes });
         }
-        if let Some(bytes) = read_global_bytes(CF_DIBV5_FORMAT)? {
+        if let Some(bytes) = read_global_bytes(
+            CF_DIBV5_FORMAT,
+            MAX_IMAGE_PAYLOAD_BYTES,
+            ClipboardPayloadKind::Image,
+        )? {
             representations.push(ClipboardRepresentation::DibV5 { bytes });
         }
         Ok((sequence_number, representations))
@@ -495,6 +550,11 @@ fn read_supported_representations()
 enum ClipboardReadError {
     Windows(ClipboardReadOperation, windows::core::Error),
     InvalidUnicodeText(UnicodeTextError),
+    PayloadTooLarge {
+        kind: ClipboardPayloadKind,
+        size: usize,
+        limit: usize,
+    },
     OperationAndClose {
         operation: Box<ClipboardReadError>,
         close: windows::core::Error,
@@ -508,6 +568,10 @@ impl fmt::Display for ClipboardReadError {
             Self::InvalidUnicodeText(reason) => {
                 write!(formatter, "clipboard Unicode text is {reason}")
             }
+            Self::PayloadTooLarge { kind, size, limit } => write!(
+                formatter,
+                "clipboard {kind} payload size {size} exceeds the supported limit {limit}"
+            ),
             Self::OperationAndClose { operation, .. } => {
                 write!(formatter, "{operation}; closing clipboard also failed")
             }
@@ -523,8 +587,23 @@ impl Error for ClipboardReadError {
                 let _ = close;
                 Some(operation)
             }
-            Self::InvalidUnicodeText(_) => None,
+            Self::InvalidUnicodeText(_) | Self::PayloadTooLarge { .. } => None,
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ClipboardPayloadKind {
+    UnicodeText,
+    Image,
+}
+
+impl fmt::Display for ClipboardPayloadKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::UnicodeText => "Unicode text",
+            Self::Image => "image",
+        })
     }
 }
 
@@ -630,12 +709,20 @@ impl Drop for ClipboardGuard {
 }
 
 fn read_unicode_text(format: u32) -> Result<Option<String>, ClipboardReadError> {
-    read_global_bytes(format)?
-        .map(|bytes| decode_unicode_text(&bytes).map_err(ClipboardReadError::InvalidUnicodeText))
-        .transpose()
+    read_global_bytes(
+        format,
+        MAX_TEXT_PAYLOAD_BYTES,
+        ClipboardPayloadKind::UnicodeText,
+    )?
+    .map(|bytes| decode_unicode_text(&bytes).map_err(ClipboardReadError::InvalidUnicodeText))
+    .transpose()
 }
 
-fn read_global_bytes(format: u32) -> Result<Option<Vec<u8>>, ClipboardReadError> {
+fn read_global_bytes(
+    format: u32,
+    max_bytes: usize,
+    kind: ClipboardPayloadKind,
+) -> Result<Option<Vec<u8>>, ClipboardReadError> {
     if unsafe { IsClipboardFormatAvailable(format) }.is_err() {
         return Ok(None);
     }
@@ -653,9 +740,22 @@ fn read_global_bytes(format: u32) -> Result<Option<Vec<u8>>, ClipboardReadError>
             windows::core::Error::from_win32(),
         ));
     }
+    classify_payload_size(len, max_bytes, kind)?;
     let bytes = unsafe { std::slice::from_raw_parts(lock.pointer.cast::<u8>(), len) }.to_vec();
     lock.unlock()?;
     Ok(Some(bytes))
+}
+
+fn classify_payload_size(
+    size: usize,
+    limit: usize,
+    kind: ClipboardPayloadKind,
+) -> Result<(), ClipboardReadError> {
+    if size <= limit {
+        Ok(())
+    } else {
+        Err(ClipboardReadError::PayloadTooLarge { kind, size, limit })
+    }
 }
 
 struct GlobalMemoryLock {
@@ -799,6 +899,16 @@ fn orchestrate_listener_start<T>(
     }
 }
 
+fn bootstrap_listener_thread<T>(
+    bootstrap: std::sync::mpsc::SyncSender<()>,
+    initialize: impl FnOnce() -> Result<T, ClipboardListenerError>,
+) -> Result<T, ClipboardListenerError> {
+    bootstrap
+        .send(())
+        .map_err(|_| ClipboardListenerError::UnexpectedThreadExit)?;
+    initialize()
+}
+
 pub(super) fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
         .lock()
@@ -807,7 +917,8 @@ pub(super) fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, 
 
 pub(super) type EventSender = Sender<ClipboardEvent>;
 pub(super) type ProductWriteOwnership = Arc<Mutex<ProductWriteState>>;
-pub(super) type ReadySender = std::sync::mpsc::SyncSender<Result<isize, ClipboardListenerError>>;
+pub(super) type ReadySender =
+    std::sync::mpsc::SyncSender<Result<ListenerReady, ClipboardListenerError>>;
 pub(super) type ShutdownReceiver = std::sync::mpsc::Receiver<()>;
 
 #[cfg(test)]
@@ -820,9 +931,11 @@ mod tests {
     use chrono::Utc;
 
     use super::{
-        ClipboardEvent, ClipboardListenerError, MAX_PENDING_PRODUCT_WRITE_EVENTS,
-        ProductWriteGuard, ProductWriteState, ReadyWait, ShutdownFailure, classify_format_read,
-        classify_global_unlock, classify_registered_format, combine_clipboard_operation_and_close,
+        ClipboardEvent, ClipboardListenerError, ClipboardPayloadKind, ClipboardReadError,
+        MAX_IMAGE_PAYLOAD_BYTES, MAX_PENDING_PRODUCT_WRITE_EVENTS, MAX_TEXT_PAYLOAD_BYTES,
+        ProductWriteGuard, ProductWriteState, ReadyWait, ShutdownFailure,
+        bootstrap_listener_thread, classify_format_read, classify_global_unlock,
+        classify_payload_size, classify_registered_format, combine_clipboard_operation_and_close,
         decode_unicode_text, orchestrate_listener_start, route_event,
     };
     use crate::domain::{CapturedClipboard, ContentIdentity, SourceIdentity};
@@ -870,7 +983,7 @@ mod tests {
     }
 
     #[test]
-    fn dropping_unfinished_write_replays_pending_events() {
+    fn dropping_unfinished_write_discards_identity_unknown_events() {
         let (events, receiver) = mpsc::channel();
         let state = Arc::new(Mutex::new(ProductWriteState::Armed {
             baseline: 60,
@@ -884,7 +997,7 @@ mod tests {
             finished: false,
         });
 
-        assert_eq!(receiver.recv().unwrap().sequence_number, 61);
+        assert!(receiver.try_recv().is_err());
     }
 
     #[test]
@@ -907,7 +1020,7 @@ mod tests {
     }
 
     #[test]
-    fn owned_write_pending_events_are_bounded_without_losing_order() {
+    fn owned_write_pending_events_keep_the_earliest_bounded_prefix() {
         let (events, receiver) = mpsc::channel();
         let state = Arc::new(Mutex::new(ProductWriteState::Armed {
             baseline: 70,
@@ -936,7 +1049,122 @@ mod tests {
             .try_iter()
             .map(|event| event.sequence_number)
             .collect();
-        assert_eq!(observed, (71..70 + event_count as u32).collect::<Vec<_>>());
+        assert_eq!(
+            observed,
+            (71..71 + MAX_PENDING_PRODUCT_WRITE_EVENTS as u32).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn overflow_never_publishes_product_sequence_and_drops_late_external_events() {
+        let (events, receiver) = mpsc::channel();
+        let state = Arc::new(Mutex::new(ProductWriteState::Armed {
+            baseline: 80,
+            pending: Vec::new(),
+        }));
+        let product_sequence = 81;
+        route_event(&state, &events, event(product_sequence));
+        for offset in 2..=MAX_PENDING_PRODUCT_WRITE_EVENTS + 5 {
+            route_event(&state, &events, event(80 + offset as u32));
+        }
+
+        assert!(receiver.try_recv().is_err());
+        ProductWriteGuard {
+            state,
+            events,
+            finished: false,
+        }
+        .finish(product_sequence);
+
+        let observed: Vec<_> = receiver
+            .try_iter()
+            .map(|event| event.sequence_number)
+            .collect();
+        assert!(!observed.contains(&product_sequence));
+        assert_eq!(
+            observed,
+            (82..80 + MAX_PENDING_PRODUCT_WRITE_EVENTS as u32 + 1).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn payload_limits_accept_boundary_and_reject_one_byte_over() {
+        assert!(
+            classify_payload_size(
+                MAX_TEXT_PAYLOAD_BYTES,
+                MAX_TEXT_PAYLOAD_BYTES,
+                ClipboardPayloadKind::UnicodeText,
+            )
+            .is_ok()
+        );
+        assert!(matches!(
+            classify_payload_size(
+                MAX_TEXT_PAYLOAD_BYTES + 1,
+                MAX_TEXT_PAYLOAD_BYTES,
+                ClipboardPayloadKind::UnicodeText,
+            ),
+            Err(ClipboardReadError::PayloadTooLarge {
+                kind: ClipboardPayloadKind::UnicodeText,
+                ..
+            })
+        ));
+        assert!(
+            classify_payload_size(
+                MAX_IMAGE_PAYLOAD_BYTES,
+                MAX_IMAGE_PAYLOAD_BYTES,
+                ClipboardPayloadKind::Image,
+            )
+            .is_ok()
+        );
+        assert!(matches!(
+            classify_payload_size(
+                MAX_IMAGE_PAYLOAD_BYTES + 1,
+                MAX_IMAGE_PAYLOAD_BYTES,
+                ClipboardPayloadKind::Image,
+            ),
+            Err(ClipboardReadError::PayloadTooLarge {
+                kind: ClipboardPayloadKind::Image,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn closed_bootstrap_receiver_prevents_listener_initialization() {
+        let (sender, receiver) = mpsc::sync_channel(0);
+        drop(receiver);
+        let initialized = RefCell::new(false);
+
+        let result = bootstrap_listener_thread(sender, || {
+            *initialized.borrow_mut() = true;
+            Ok(())
+        });
+
+        assert!(matches!(
+            result,
+            Err(ClipboardListenerError::UnexpectedThreadExit)
+        ));
+        assert!(!*initialized.borrow());
+    }
+
+    #[test]
+    fn bootstrap_wait_timeout_drops_receiver_before_join() {
+        let (sender, receiver) = mpsc::sync_channel(0);
+        let (gate_sender, gate_receiver) = mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            gate_receiver.recv().unwrap();
+            bootstrap_listener_thread(sender, || Ok(()))
+        });
+
+        let wait = receiver.recv_timeout(std::time::Duration::ZERO);
+        drop(receiver);
+        gate_sender.send(()).unwrap();
+
+        assert!(matches!(wait, Err(mpsc::RecvTimeoutError::Timeout)));
+        assert!(matches!(
+            thread.join().unwrap(),
+            Err(ClipboardListenerError::UnexpectedThreadExit)
+        ));
     }
 
     #[test]

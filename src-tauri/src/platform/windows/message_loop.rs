@@ -6,6 +6,7 @@ use windows::{
         System::{
             DataExchange::{AddClipboardFormatListener, RemoveClipboardFormatListener},
             LibraryLoader::GetModuleHandleW,
+            Threading::GetCurrentThreadId,
         },
         UI::WindowsAndMessaging::{
             CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
@@ -28,6 +29,10 @@ pub(super) const WM_CLIPBOARD_LISTENER_SHUTDOWN: u32 = WM_APP + 1;
 pub(super) struct ListenerState {
     pub events: EventSender,
     pub product_write: ProductWriteOwnership,
+}
+
+pub(super) struct ListenerReady {
+    pub thread_id: u32,
 }
 
 pub(super) fn run_message_loop(
@@ -113,7 +118,9 @@ unsafe fn run_message_loop_inner(
             cleanup,
         ));
     }
-    let _ = ready.send(Ok(hwnd.0 as isize));
+    let _ = ready.send(Ok(ListenerReady {
+        thread_id: unsafe { GetCurrentThreadId() },
+    }));
 
     let mut message = MSG::default();
     let loop_result = 'message_loop: loop {
@@ -269,20 +276,23 @@ pub(super) struct WakeAndJoinResult<WakeError, ThreadError> {
 }
 
 pub(super) fn wake_and_join<WakeError, ThreadError>(
-    mut control: impl FnMut() -> Result<(), WakeError>,
-    mut post: impl FnMut() -> Result<(), WakeError>,
     mut signal: impl FnMut() -> Result<(), WakeError>,
+    mut control: impl FnMut() -> Result<(), WakeError>,
+    is_thread_alive: impl FnOnce() -> bool,
+    mut post: impl FnMut() -> Result<(), WakeError>,
     join: impl FnOnce() -> Result<(), ThreadError>,
 ) -> WakeAndJoinResult<WakeError, ThreadError> {
     let mut failures = Vec::new();
-    if let Err(error) = control() {
-        failures.push(error);
-    }
-    if let Err(error) = post() {
-        failures.push(error);
-    }
     if let Err(error) = signal() {
         failures.push(error);
+        if let Err(error) = control() {
+            failures.push(error);
+        }
+        if is_thread_alive()
+            && let Err(error) = post()
+        {
+            failures.push(error);
+        }
     }
     WakeAndJoinResult {
         failures,
@@ -342,19 +352,23 @@ mod tests {
     use super::{cleanup_in_order, wake_and_join};
 
     #[test]
-    fn post_and_control_failures_still_signal_and_join() {
+    fn successful_event_signal_skips_thread_message_fallback_and_joins() {
         let calls = RefCell::new(Vec::new());
         let result = wake_and_join(
             || {
+                calls.borrow_mut().push("signal");
+                Ok::<(), &str>(())
+            },
+            || {
                 calls.borrow_mut().push("control");
-                Err("control")
+                Ok(())
+            },
+            || {
+                calls.borrow_mut().push("alive");
+                true
             },
             || {
                 calls.borrow_mut().push("post");
-                Err("post")
-            },
-            || {
-                calls.borrow_mut().push("signal");
                 Ok(())
             },
             || {
@@ -363,9 +377,73 @@ mod tests {
             },
         );
 
-        assert_eq!(result.failures, ["control", "post"]);
+        assert!(result.failures.is_empty());
         assert!(result.thread.is_ok());
-        assert_eq!(*calls.borrow(), ["control", "post", "signal", "join"]);
+        assert_eq!(*calls.borrow(), ["signal", "join"]);
+    }
+
+    #[test]
+    fn failed_event_signal_uses_live_thread_message_fallback_then_joins() {
+        let calls = RefCell::new(Vec::new());
+        let result = wake_and_join(
+            || {
+                calls.borrow_mut().push("signal");
+                Err("signal")
+            },
+            || {
+                calls.borrow_mut().push("control");
+                Err("control")
+            },
+            || {
+                calls.borrow_mut().push("alive");
+                true
+            },
+            || {
+                calls.borrow_mut().push("post");
+                Err("post")
+            },
+            || {
+                calls.borrow_mut().push("join");
+                Ok::<(), ()>(())
+            },
+        );
+
+        assert_eq!(result.failures, ["signal", "control", "post"]);
+        assert!(result.thread.is_ok());
+        assert_eq!(
+            *calls.borrow(),
+            ["signal", "control", "alive", "post", "join"]
+        );
+    }
+
+    #[test]
+    fn failed_event_signal_skips_post_for_finished_thread() {
+        let calls = RefCell::new(Vec::new());
+        let result = wake_and_join(
+            || {
+                calls.borrow_mut().push("signal");
+                Err("signal")
+            },
+            || {
+                calls.borrow_mut().push("control");
+                Ok(())
+            },
+            || {
+                calls.borrow_mut().push("alive");
+                false
+            },
+            || {
+                calls.borrow_mut().push("post");
+                Ok(())
+            },
+            || {
+                calls.borrow_mut().push("join");
+                Ok::<(), ()>(())
+            },
+        );
+
+        assert_eq!(result.failures, ["signal"]);
+        assert_eq!(*calls.borrow(), ["signal", "control", "alive", "join"]);
     }
 
     #[test]

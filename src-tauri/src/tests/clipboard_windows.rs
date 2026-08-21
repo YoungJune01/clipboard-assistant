@@ -74,7 +74,13 @@ impl Drop for ClipboardTextBackup {
 }
 
 #[test]
+#[ignore = "mutates the desktop clipboard; set CLIPBOARD_ASSISTANT_RUN_CLIPBOARD_TESTS=1 and run explicitly"]
 fn listener_captures_text_suppresses_owned_sequence_and_resumes() {
+    assert_eq!(
+        std::env::var("CLIPBOARD_ASSISTANT_RUN_CLIPBOARD_TESTS").as_deref(),
+        Ok("1"),
+        "set CLIPBOARD_ASSISTANT_RUN_CLIPBOARD_TESTS=1 for destructive clipboard tests"
+    );
     let _lock = NamedClipboardLock::acquire();
     let _backup = ClipboardTextBackup::capture();
     let (sender, receiver) = mpsc::channel();
