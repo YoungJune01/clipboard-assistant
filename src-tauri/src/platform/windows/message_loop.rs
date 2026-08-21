@@ -2,16 +2,17 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use windows::{
     Win32::{
-        Foundation::{HWND, LPARAM, LRESULT, WPARAM},
+        Foundation::{HANDLE, HWND, LPARAM, LRESULT, WAIT_FAILED, WAIT_OBJECT_0, WPARAM},
         System::{
             DataExchange::{AddClipboardFormatListener, RemoveClipboardFormatListener},
             LibraryLoader::GetModuleHandleW,
         },
         UI::WindowsAndMessaging::{
             CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-            GWLP_USERDATA, GetMessageW, GetWindowLongPtrW, HWND_MESSAGE, MSG, RegisterClassW,
-            SetWindowLongPtrW, TranslateMessage, UnregisterClassW, WINDOW_EX_STYLE, WINDOW_STYLE,
-            WM_APP, WM_CLIPBOARDUPDATE, WM_NCCREATE, WNDCLASSW,
+            GWLP_USERDATA, GetWindowLongPtrW, HWND_MESSAGE, MSG, MsgWaitForMultipleObjects,
+            PM_REMOVE, PeekMessageW, QS_ALLINPUT, RegisterClassW, SetWindowLongPtrW,
+            TranslateMessage, UnregisterClassW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP,
+            WM_CLIPBOARDUPDATE, WM_NCCREATE, WM_QUIT, WNDCLASSW,
         },
     },
     core::w,
@@ -34,8 +35,10 @@ pub(super) fn run_message_loop(
     product_write: ProductWriteOwnership,
     ready: ReadySender,
     shutdown: ShutdownReceiver,
+    shutdown_event: HANDLE,
 ) -> Result<(), ClipboardListenerError> {
-    let result = unsafe { run_message_loop_inner(events, product_write, &ready, &shutdown) };
+    let result =
+        unsafe { run_message_loop_inner(events, product_write, &ready, &shutdown, shutdown_event) };
     if let Err(error) = &result {
         let _ = ready.send(Err(clone_listener_error(error)));
     }
@@ -47,6 +50,7 @@ unsafe fn run_message_loop_inner(
     product_write: ProductWriteOwnership,
     ready: &ReadySender,
     shutdown: &ShutdownReceiver,
+    shutdown_event: HANDLE,
 ) -> Result<(), ClipboardListenerError> {
     let module = unsafe { GetModuleHandleW(None) }.map_err(ClipboardListenerError::Windows)?;
     let instance = windows::Win32::Foundation::HINSTANCE(module.0);
@@ -62,10 +66,7 @@ unsafe fn run_message_loop_inner(
             windows::core::Error::from_win32(),
         ));
     }
-    let _class = RegisteredWindowClass {
-        class_name,
-        instance,
-    };
+    let mut class_registered = true;
     let state_pointer = Box::into_raw(Box::new(ListenerState {
         events,
         product_write,
@@ -89,40 +90,70 @@ unsafe fn run_message_loop_inner(
         Ok(hwnd) => hwnd,
         Err(error) => {
             unsafe { drop(Box::from_raw(state_pointer)) };
-            return Err(ClipboardListenerError::Windows(error));
+            let cleanup = cleanup_in_order(
+                || Ok::<(), super::clipboard::CleanupFailure>(()),
+                || Ok::<(), super::clipboard::CleanupFailure>(()),
+                || {
+                    unsafe { UnregisterClassW(class_name, Some(instance)) }
+                        .map_err(super::clipboard::CleanupFailure::UnregisterClass)
+                },
+            );
+            return Err(combine_operation_and_cleanup(
+                ClipboardListenerError::Windows(error),
+                cleanup,
+            ));
         }
     };
-    let mut window = ListenerWindow {
-        hwnd,
-        listener_registered: false,
-    };
-    unsafe { AddClipboardFormatListener(hwnd) }.map_err(ClipboardListenerError::Windows)?;
-    window.listener_registered = true;
+    if let Err(error) = unsafe { AddClipboardFormatListener(hwnd) } {
+        let cleanup = unsafe {
+            cleanup_window_resources(hwnd, false, class_name, instance, &mut class_registered)
+        };
+        return Err(combine_operation_and_cleanup(
+            ClipboardListenerError::Windows(error),
+            cleanup,
+        ));
+    }
     let _ = ready.send(Ok(hwnd.0 as isize));
 
     let mut message = MSG::default();
-    loop {
-        let status = unsafe { GetMessageW(&mut message, None, 0, 0) };
-        if status.0 == -1 {
-            return Err(ClipboardListenerError::Windows(
+    let loop_result = 'message_loop: loop {
+        let wait = unsafe {
+            MsgWaitForMultipleObjects(Some(&[shutdown_event]), false, u32::MAX, QS_ALLINPUT)
+        };
+        if wait == WAIT_FAILED {
+            break Err(ClipboardListenerError::Windows(
                 windows::core::Error::from_win32(),
             ));
         }
-        if status.0 == 0 {
-            break;
+        if wait == WAIT_OBJECT_0 {
+            break Ok(());
         }
-        if message.message == WM_CLIPBOARD_LISTENER_SHUTDOWN {
-            match shutdown.try_recv() {
-                Ok(()) | Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
-                Err(std::sync::mpsc::TryRecvError::Empty) => continue,
+        while unsafe { PeekMessageW(&mut message, None, 0, 0, PM_REMOVE) }.as_bool() {
+            if message.message == WM_QUIT {
+                break 'message_loop Ok(());
+            }
+            if message.message == WM_CLIPBOARD_LISTENER_SHUTDOWN {
+                match shutdown.try_recv() {
+                    Ok(()) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        break 'message_loop Ok(());
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => continue,
+                }
+            }
+            unsafe {
+                let _ = TranslateMessage(&message);
+                DispatchMessageW(&message);
             }
         }
-        unsafe {
-            let _ = TranslateMessage(&message);
-            DispatchMessageW(&message);
-        }
+    };
+    let cleanup = unsafe {
+        cleanup_window_resources(hwnd, true, class_name, instance, &mut class_registered)
+    };
+    match loop_result {
+        Ok(()) if cleanup.is_empty() => Ok(()),
+        Ok(()) => Err(ClipboardListenerError::Cleanup(cleanup)),
+        Err(error) => Err(combine_operation_and_cleanup(error, cleanup)),
     }
-    Ok(())
 }
 
 unsafe extern "system" fn window_proc(
@@ -161,37 +192,101 @@ unsafe fn state_from_window(hwnd: HWND) -> Option<&'static ListenerState> {
     unsafe { pointer.as_ref() }
 }
 
-struct ListenerWindow {
+unsafe fn cleanup_window_resources(
     hwnd: HWND,
     listener_registered: bool,
+    class_name: windows::core::PCWSTR,
+    instance: windows::Win32::Foundation::HINSTANCE,
+    class_registered: &mut bool,
+) -> Vec<super::clipboard::CleanupFailure> {
+    cleanup_in_order(
+        || {
+            if listener_registered {
+                unsafe { RemoveClipboardFormatListener(hwnd) }
+                    .map_err(super::clipboard::CleanupFailure::RemoveListener)
+            } else {
+                Ok(())
+            }
+        },
+        || {
+            let pointer = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut ListenerState;
+            if !pointer.is_null() {
+                unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0) };
+                unsafe { drop(Box::from_raw(pointer)) };
+            }
+            unsafe { DestroyWindow(hwnd) }.map_err(super::clipboard::CleanupFailure::DestroyWindow)
+        },
+        || {
+            if *class_registered {
+                let result = unsafe { UnregisterClassW(class_name, Some(instance)) }
+                    .map_err(super::clipboard::CleanupFailure::UnregisterClass);
+                if result.is_ok() {
+                    *class_registered = false;
+                }
+                result
+            } else {
+                Ok(())
+            }
+        },
+    )
 }
 
-impl Drop for ListenerWindow {
-    fn drop(&mut self) {
-        unsafe {
-            if self.listener_registered {
-                let _ = RemoveClipboardFormatListener(self.hwnd);
-            }
-            let pointer = GetWindowLongPtrW(self.hwnd, GWLP_USERDATA) as *mut ListenerState;
-            if !pointer.is_null() {
-                SetWindowLongPtrW(self.hwnd, GWLP_USERDATA, 0);
-                drop(Box::from_raw(pointer));
-            }
-            let _ = DestroyWindow(self.hwnd);
+fn combine_operation_and_cleanup(
+    operation: ClipboardListenerError,
+    cleanup: Vec<super::clipboard::CleanupFailure>,
+) -> ClipboardListenerError {
+    if cleanup.is_empty() {
+        operation
+    } else {
+        ClipboardListenerError::OperationAndCleanup {
+            operation: Box::new(operation),
+            cleanup,
         }
     }
 }
 
-struct RegisteredWindowClass {
-    class_name: windows::core::PCWSTR,
-    instance: windows::Win32::Foundation::HINSTANCE,
+pub(super) fn cleanup_in_order<E>(
+    mut remove: impl FnMut() -> Result<(), E>,
+    mut destroy: impl FnMut() -> Result<(), E>,
+    mut unregister: impl FnMut() -> Result<(), E>,
+) -> Vec<E> {
+    let mut failures = Vec::new();
+    if let Err(error) = remove() {
+        failures.push(error);
+    }
+    if let Err(error) = destroy() {
+        failures.push(error);
+    }
+    if let Err(error) = unregister() {
+        failures.push(error);
+    }
+    failures
 }
 
-impl Drop for RegisteredWindowClass {
-    fn drop(&mut self) {
-        unsafe {
-            let _ = UnregisterClassW(self.class_name, Some(self.instance));
-        }
+pub(super) struct WakeAndJoinResult<WakeError, ThreadError> {
+    pub failures: Vec<WakeError>,
+    pub thread: Result<(), ThreadError>,
+}
+
+pub(super) fn wake_and_join<WakeError, ThreadError>(
+    mut control: impl FnMut() -> Result<(), WakeError>,
+    mut post: impl FnMut() -> Result<(), WakeError>,
+    mut signal: impl FnMut() -> Result<(), WakeError>,
+    join: impl FnOnce() -> Result<(), ThreadError>,
+) -> WakeAndJoinResult<WakeError, ThreadError> {
+    let mut failures = Vec::new();
+    if let Err(error) = control() {
+        failures.push(error);
+    }
+    if let Err(error) = post() {
+        failures.push(error);
+    }
+    if let Err(error) = signal() {
+        failures.push(error);
+    }
+    WakeAndJoinResult {
+        failures,
+        thread: join(),
     }
 }
 
@@ -208,5 +303,90 @@ fn clone_listener_error(error: &ClipboardListenerError) -> ClipboardListenerErro
             ClipboardListenerError::UnexpectedThreadExit
         }
         ClipboardListenerError::ThreadPanicked => ClipboardListenerError::ThreadPanicked,
+        ClipboardListenerError::ReadyTimeout => ClipboardListenerError::ReadyTimeout,
+        ClipboardListenerError::Cleanup(failures) => {
+            ClipboardListenerError::Cleanup(failures.clone())
+        }
+        ClipboardListenerError::OperationAndCleanup { operation, cleanup } => {
+            ClipboardListenerError::OperationAndCleanup {
+                operation: Box::new(clone_listener_error(operation)),
+                cleanup: cleanup.clone(),
+            }
+        }
+        ClipboardListenerError::Shutdown { failures, thread } => ClipboardListenerError::Shutdown {
+            failures: failures.iter().map(clone_shutdown_failure).collect(),
+            thread: thread
+                .as_ref()
+                .map(|error| Box::new(clone_listener_error(error))),
+        },
+    }
+}
+
+fn clone_shutdown_failure(
+    failure: &super::clipboard::ShutdownFailure,
+) -> super::clipboard::ShutdownFailure {
+    use super::clipboard::ShutdownFailure;
+
+    match failure {
+        ShutdownFailure::ControlDisconnected => ShutdownFailure::ControlDisconnected,
+        ShutdownFailure::PostMessage(error) => ShutdownFailure::PostMessage(error.clone()),
+        ShutdownFailure::Signal(error) => ShutdownFailure::Signal(error.clone()),
+        ShutdownFailure::CloseEvent(error) => ShutdownFailure::CloseEvent(error.clone()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+
+    use super::{cleanup_in_order, wake_and_join};
+
+    #[test]
+    fn post_and_control_failures_still_signal_and_join() {
+        let calls = RefCell::new(Vec::new());
+        let result = wake_and_join(
+            || {
+                calls.borrow_mut().push("control");
+                Err("control")
+            },
+            || {
+                calls.borrow_mut().push("post");
+                Err("post")
+            },
+            || {
+                calls.borrow_mut().push("signal");
+                Ok(())
+            },
+            || {
+                calls.borrow_mut().push("join");
+                Ok::<(), ()>(())
+            },
+        );
+
+        assert_eq!(result.failures, ["control", "post"]);
+        assert!(result.thread.is_ok());
+        assert_eq!(*calls.borrow(), ["control", "post", "signal", "join"]);
+    }
+
+    #[test]
+    fn cleanup_attempts_every_stage_in_order_and_preserves_failures() {
+        let calls = RefCell::new(Vec::new());
+        let failures = cleanup_in_order(
+            || {
+                calls.borrow_mut().push("remove");
+                Err("remove")
+            },
+            || {
+                calls.borrow_mut().push("destroy");
+                Err("destroy")
+            },
+            || {
+                calls.borrow_mut().push("unregister");
+                Err("unregister")
+            },
+        );
+
+        assert_eq!(*calls.borrow(), ["remove", "destroy", "unregister"]);
+        assert_eq!(failures, ["remove", "destroy", "unregister"]);
     }
 }
