@@ -1,6 +1,8 @@
+use std::fmt;
+
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TargetToken(usize);
 
 impl TargetToken {
@@ -10,6 +12,12 @@ impl TargetToken {
 
     pub fn platform_value(self) -> usize {
         self.0
+    }
+}
+
+impl fmt::Debug for TargetToken {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("TargetToken(<opaque>)")
     }
 }
 
@@ -76,5 +84,15 @@ mod tests {
             serde_json::from_str::<PasteOutcome>(&json).unwrap(),
             outcome
         );
+    }
+
+    #[test]
+    fn target_token_debug_does_not_expose_platform_value() {
+        let token = super::TargetToken::from_platform_value(987_654_321);
+
+        let debug = format!("{token:?}");
+
+        assert_eq!(debug, "TargetToken(<opaque>)");
+        assert!(!debug.contains("987654321"));
     }
 }

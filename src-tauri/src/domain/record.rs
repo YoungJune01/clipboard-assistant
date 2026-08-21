@@ -40,7 +40,7 @@ impl Default for GroupId {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, PartialEq, Eq, Serialize)]
 #[serde(transparent)]
 pub struct RecordNote(String);
 
@@ -64,6 +64,15 @@ impl RecordNote {
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+impl fmt::Debug for RecordNote {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RecordNote")
+            .field("characters", &self.0.chars().count())
+            .finish()
     }
 }
 
@@ -103,7 +112,7 @@ impl fmt::Display for RecordNoteError {
 
 impl Error for RecordNoteError {}
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClipboardRecord {
     pub id: RecordId,
     pub content_identity: ContentIdentity,
@@ -115,6 +124,24 @@ pub struct ClipboardRecord {
     pub pinned: bool,
     pub favorite: bool,
     pub sensitive: bool,
+}
+
+impl fmt::Debug for ClipboardRecord {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ClipboardRecord")
+            .field("id", &self.id)
+            .field("content_identity", &self.content_identity)
+            .field("captured_at", &self.captured_at)
+            .field("source", &self.source)
+            .field("representations", &self.representations)
+            .field("note", &self.note)
+            .field("group_id", &self.group_id)
+            .field("pinned", &self.pinned)
+            .field("favorite", &self.favorite)
+            .field("sensitive", &self.sensitive)
+            .finish()
+    }
 }
 
 impl ClipboardRecord {
@@ -232,6 +259,44 @@ mod tests {
 
         assert!(serde_json::from_str::<RecordNote>(&too_long).is_err());
         assert!(serde_json::from_str::<RecordNote>(r#""first\nsecond""#).is_err());
+    }
+
+    #[test]
+    fn debug_output_redacts_record_note_and_clipboard_payload() {
+        const SECRET_NOTE: &str = "DEBUG_SECRET_NOTE";
+        const SECRET_TEXT: &str = "DEBUG_SECRET_RECORD_TEXT";
+        let note = RecordNote::new(SECRET_NOTE).unwrap();
+        let note_debug = format!("{note:?}");
+
+        assert!(!note_debug.contains(SECRET_NOTE));
+        assert!(note_debug.contains("RecordNote"));
+        assert!(note_debug.contains("characters: 17"));
+
+        let mut record = ClipboardRecord::from_capture(CapturedClipboard {
+            content_identity: ContentIdentity::new("same"),
+            captured_at: Utc.with_ymd_and_hms(2026, 8, 22, 1, 2, 3).unwrap(),
+            source: SourceIdentity::default(),
+            representations: vec![
+                ClipboardRepresentation::UnicodeText {
+                    text: SECRET_TEXT.to_owned(),
+                },
+                ClipboardRepresentation::Png {
+                    bytes: vec![202, 254, 186, 190],
+                },
+            ],
+        });
+        record.note = Some(note);
+
+        let record_debug = format!("{record:?}");
+
+        assert!(!record_debug.contains(SECRET_NOTE));
+        assert!(!record_debug.contains(SECRET_TEXT));
+        assert!(!record_debug.contains("[202, 254, 186, 190]"));
+        assert!(record_debug.contains("ClipboardRecord"));
+        assert!(record_debug.contains("UnicodeText"));
+        assert!(record_debug.contains("characters: 24"));
+        assert!(record_debug.contains("Png"));
+        assert!(record_debug.contains("bytes: 4"));
     }
 
     #[test]
