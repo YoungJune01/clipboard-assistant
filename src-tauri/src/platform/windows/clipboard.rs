@@ -79,43 +79,28 @@ impl ClipboardListener {
             }
         };
 
-        match classify_ready_wait(ready_receiver.recv_timeout(LISTENER_READY_TIMEOUT)) {
-            ReadyWait::Ready(Ok(hwnd_value)) => Ok(Self {
-                hwnd_value,
-                events,
-                product_write,
-                shutdown: shutdown_sender,
-                shutdown_event_value: Some(shutdown_event.0 as isize),
-                thread: Some(thread),
-            }),
-            ReadyWait::Ready(Err(error)) => {
-                let joined = join_listener_thread(thread);
-                let close = close_shutdown_event(shutdown_event);
-                Err(combine_startup_failure(error, joined, close))
-            }
-            ReadyWait::Timeout => {
-                let signal = unsafe { SetEvent(shutdown_event) }.map_err(ShutdownFailure::Signal);
-                let joined = join_listener_thread(thread);
-                let close = close_shutdown_event(shutdown_event);
-                Err(combine_startup_shutdown(
-                    ClipboardListenerError::ReadyTimeout,
-                    signal.err().into_iter().collect(),
-                    joined,
-                    close,
-                ))
-            }
-            ReadyWait::Disconnected => {
-                let signal = unsafe { SetEvent(shutdown_event) }.map_err(ShutdownFailure::Signal);
-                let joined = join_listener_thread(thread);
-                let close = close_shutdown_event(shutdown_event);
-                Err(combine_startup_shutdown(
-                    ClipboardListenerError::UnexpectedThreadExit,
-                    signal.err().into_iter().collect(),
-                    joined,
-                    close,
-                ))
-            }
-        }
+        let thread = std::cell::RefCell::new(Some(thread));
+        let hwnd_value = orchestrate_listener_start(
+            || classify_ready_wait(ready_receiver.recv_timeout(LISTENER_READY_TIMEOUT)),
+            || unsafe { SetEvent(shutdown_event) }.map_err(ShutdownFailure::Signal),
+            || {
+                join_listener_thread(
+                    thread
+                        .borrow_mut()
+                        .take()
+                        .expect("startup thread must be available for cleanup"),
+                )
+            },
+            || close_shutdown_event(shutdown_event),
+        )?;
+        Ok(Self {
+            hwnd_value,
+            events,
+            product_write,
+            shutdown: shutdown_sender,
+            shutdown_event_value: Some(shutdown_event.0 as isize),
+            thread: thread.into_inner(),
+        })
     }
 
     pub fn begin_product_write(&self) -> Result<ProductWriteGuard, ClipboardListenerError> {
@@ -785,22 +770,32 @@ fn classify_ready_wait<T>(result: Result<T, RecvTimeoutError>) -> ReadyWait<T> {
     }
 }
 
-#[cfg(test)]
-fn wait_for_listener_ready<T, E>(
-    _timeout: Duration,
-    mut wait: impl FnMut() -> ReadyWait<T>,
-    mut signal: impl FnMut(),
-    mut wake: impl FnMut(),
-    mut join: impl FnMut() -> Result<(), E>,
-) -> Result<T, ()> {
-    match wait() {
-        ReadyWait::Ready(value) => Ok(value),
-        ReadyWait::Timeout | ReadyWait::Disconnected => {
-            signal();
-            wake();
-            let _ = join();
-            Err(())
-        }
+fn orchestrate_listener_start<T>(
+    wait: impl FnOnce() -> ReadyWait<Result<T, ClipboardListenerError>>,
+    signal: impl FnOnce() -> Result<(), ShutdownFailure>,
+    join: impl FnOnce() -> Result<(), ClipboardListenerError>,
+    close: impl FnOnce() -> Result<(), ShutdownFailure>,
+) -> Result<T, ClipboardListenerError> {
+    let startup = match wait() {
+        ReadyWait::Ready(Ok(value)) => return Ok(value),
+        ReadyWait::Ready(Err(error)) => (error, false),
+        ReadyWait::Timeout => (ClipboardListenerError::ReadyTimeout, true),
+        ReadyWait::Disconnected => (ClipboardListenerError::UnexpectedThreadExit, true),
+    };
+    let mut failures = Vec::new();
+    if startup.1
+        && let Err(error) = signal()
+    {
+        failures.push(error);
+    }
+    let joined = join();
+    let closed = close();
+    if startup.1 {
+        Err(combine_startup_shutdown(
+            startup.0, failures, joined, closed,
+        ))
+    } else {
+        Err(combine_startup_failure(startup.0, joined, closed))
     }
 }
 
@@ -820,16 +815,15 @@ mod tests {
     use std::{
         cell::RefCell,
         sync::{Arc, Mutex, mpsc},
-        time::Duration,
     };
 
     use chrono::Utc;
 
     use super::{
-        ClipboardEvent, MAX_PENDING_PRODUCT_WRITE_EVENTS, ProductWriteGuard, ProductWriteState,
-        ReadyWait, classify_format_read, classify_global_unlock, classify_registered_format,
-        combine_clipboard_operation_and_close, decode_unicode_text, route_event,
-        wait_for_listener_ready,
+        ClipboardEvent, ClipboardListenerError, MAX_PENDING_PRODUCT_WRITE_EVENTS,
+        ProductWriteGuard, ProductWriteState, ReadyWait, ShutdownFailure, classify_format_read,
+        classify_global_unlock, classify_registered_format, combine_clipboard_operation_and_close,
+        decode_unicode_text, orchestrate_listener_start, route_event,
     };
     use crate::domain::{CapturedClipboard, ContentIdentity, SourceIdentity};
 
@@ -946,21 +940,176 @@ mod tests {
     }
 
     #[test]
-    fn ready_timeout_signals_wakes_and_joins_before_returning() {
+    fn ready_success_does_not_run_startup_cleanup() {
         let calls = RefCell::new(Vec::new());
-        let outcome = wait_for_listener_ready(
-            Duration::ZERO,
-            || ReadyWait::<()>::Timeout,
-            || calls.borrow_mut().push("signal"),
-            || calls.borrow_mut().push("wake"),
+        let outcome = orchestrate_listener_start::<isize>(
+            || ReadyWait::Ready(Ok(41)),
+            || {
+                calls.borrow_mut().push("signal");
+                Ok(())
+            },
             || {
                 calls.borrow_mut().push("join");
-                Ok::<(), ()>(())
+                Ok(())
+            },
+            || {
+                calls.borrow_mut().push("close");
+                Ok(())
             },
         );
 
-        assert!(outcome.is_err());
-        assert_eq!(*calls.borrow(), ["signal", "wake", "join"]);
+        assert_eq!(outcome.unwrap(), 41);
+        assert!(calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn ready_timeout_signals_joins_and_closes_in_order() {
+        let calls = RefCell::new(Vec::new());
+        let outcome = orchestrate_listener_start::<isize>(
+            || ReadyWait::Timeout,
+            || {
+                calls.borrow_mut().push("signal");
+                Ok(())
+            },
+            || {
+                calls.borrow_mut().push("join");
+                Ok(())
+            },
+            || {
+                calls.borrow_mut().push("close");
+                Ok(())
+            },
+        );
+
+        assert!(matches!(outcome, Err(ClipboardListenerError::ReadyTimeout)));
+        assert_eq!(*calls.borrow(), ["signal", "join", "close"]);
+    }
+
+    #[test]
+    fn ready_disconnect_runs_the_same_startup_cleanup() {
+        let calls = RefCell::new(Vec::new());
+        let outcome = orchestrate_listener_start::<isize>(
+            || ReadyWait::Disconnected,
+            || {
+                calls.borrow_mut().push("signal");
+                Ok(())
+            },
+            || {
+                calls.borrow_mut().push("join");
+                Ok(())
+            },
+            || {
+                calls.borrow_mut().push("close");
+                Ok(())
+            },
+        );
+
+        assert!(matches!(
+            outcome,
+            Err(ClipboardListenerError::UnexpectedThreadExit)
+        ));
+        assert_eq!(*calls.borrow(), ["signal", "join", "close"]);
+    }
+
+    #[test]
+    fn startup_cleanup_attempts_all_stages_and_aggregates_failures() {
+        let calls = RefCell::new(Vec::new());
+        let outcome = orchestrate_listener_start::<isize>(
+            || ReadyWait::Timeout,
+            || {
+                calls.borrow_mut().push("signal");
+                Err(ShutdownFailure::Signal(windows_error(5)))
+            },
+            || {
+                calls.borrow_mut().push("join");
+                Err(ClipboardListenerError::ThreadPanicked)
+            },
+            || {
+                calls.borrow_mut().push("close");
+                Err(ShutdownFailure::CloseEvent(windows_error(6)))
+            },
+        );
+
+        assert_eq!(*calls.borrow(), ["signal", "join", "close"]);
+        match outcome.unwrap_err() {
+            ClipboardListenerError::Shutdown { failures, thread } => {
+                assert!(matches!(
+                    failures.as_slice(),
+                    [ShutdownFailure::Signal(_), ShutdownFailure::CloseEvent(_)]
+                ));
+                assert!(matches!(
+                    thread.as_deref(),
+                    Some(ClipboardListenerError::ThreadPanicked)
+                ));
+            }
+            error => panic!("expected aggregated startup shutdown error, got {error}"),
+        }
+    }
+
+    #[test]
+    fn each_startup_cleanup_failure_is_preserved_without_skipping_later_stages() {
+        for failing_stage in ["signal", "join", "close"] {
+            let calls = RefCell::new(Vec::new());
+            let outcome = orchestrate_listener_start::<isize>(
+                || ReadyWait::Timeout,
+                || {
+                    calls.borrow_mut().push("signal");
+                    if failing_stage == "signal" {
+                        Err(ShutdownFailure::Signal(windows_error(5)))
+                    } else {
+                        Ok(())
+                    }
+                },
+                || {
+                    calls.borrow_mut().push("join");
+                    if failing_stage == "join" {
+                        Err(ClipboardListenerError::ThreadPanicked)
+                    } else {
+                        Ok(())
+                    }
+                },
+                || {
+                    calls.borrow_mut().push("close");
+                    if failing_stage == "close" {
+                        Err(ShutdownFailure::CloseEvent(windows_error(6)))
+                    } else {
+                        Ok(())
+                    }
+                },
+            );
+
+            assert_eq!(*calls.borrow(), ["signal", "join", "close"]);
+            let ClipboardListenerError::Shutdown { failures, thread } = outcome.unwrap_err() else {
+                panic!("expected aggregated shutdown error for {failing_stage}");
+            };
+            match failing_stage {
+                "signal" => {
+                    assert!(matches!(failures.as_slice(), [ShutdownFailure::Signal(_)]));
+                    assert!(matches!(
+                        thread.as_deref(),
+                        Some(ClipboardListenerError::ReadyTimeout)
+                    ));
+                }
+                "join" => {
+                    assert!(failures.is_empty());
+                    assert!(matches!(
+                        thread.as_deref(),
+                        Some(ClipboardListenerError::ThreadPanicked)
+                    ));
+                }
+                "close" => {
+                    assert!(matches!(
+                        failures.as_slice(),
+                        [ShutdownFailure::CloseEvent(_)]
+                    ));
+                    assert!(matches!(
+                        thread.as_deref(),
+                        Some(ClipboardListenerError::ReadyTimeout)
+                    ));
+                }
+                _ => unreachable!(),
+            }
+        }
     }
 
     #[test]
@@ -999,6 +1148,10 @@ mod tests {
             combine_clipboard_operation_and_close::<(), &str, &str>(Err("read"), Err("close"))
                 .unwrap_err();
         assert_eq!(error, (Some("read"), Some("close")));
+    }
+
+    fn windows_error(code: u32) -> windows::core::Error {
+        windows::core::Error::from_hresult(windows::core::HRESULT::from_win32(code))
     }
 
     fn event(sequence_number: u32) -> ClipboardEvent {
