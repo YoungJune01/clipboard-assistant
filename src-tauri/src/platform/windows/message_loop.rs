@@ -6,14 +6,13 @@ use windows::{
         System::{
             DataExchange::{AddClipboardFormatListener, RemoveClipboardFormatListener},
             LibraryLoader::GetModuleHandleW,
-            Threading::GetCurrentThreadId,
         },
         UI::WindowsAndMessaging::{
             CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
             GWLP_USERDATA, GetWindowLongPtrW, HWND_MESSAGE, MSG, MsgWaitForMultipleObjects,
             PM_REMOVE, PeekMessageW, QS_ALLINPUT, RegisterClassW, SetWindowLongPtrW,
-            TranslateMessage, UnregisterClassW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP,
-            WM_CLIPBOARDUPDATE, WM_NCCREATE, WM_QUIT, WNDCLASSW,
+            TranslateMessage, UnregisterClassW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLIPBOARDUPDATE,
+            WM_NCCREATE, WM_QUIT, WNDCLASSW,
         },
     },
     core::w,
@@ -24,15 +23,9 @@ use super::clipboard::{
     capture_update,
 };
 
-pub(super) const WM_CLIPBOARD_LISTENER_SHUTDOWN: u32 = WM_APP + 1;
-
 pub(super) struct ListenerState {
     pub events: EventSender,
     pub product_write: ProductWriteOwnership,
-}
-
-pub(super) struct ListenerReady {
-    pub thread_id: u32,
 }
 
 pub(super) fn run_message_loop(
@@ -118,9 +111,7 @@ unsafe fn run_message_loop_inner(
             cleanup,
         ));
     }
-    let _ = ready.send(Ok(ListenerReady {
-        thread_id: unsafe { GetCurrentThreadId() },
-    }));
+    let _ = ready.send(Ok(()));
 
     let mut message = MSG::default();
     let loop_result = 'message_loop: loop {
@@ -139,18 +130,16 @@ unsafe fn run_message_loop_inner(
             if message.message == WM_QUIT {
                 break 'message_loop Ok(());
             }
-            if message.message == WM_CLIPBOARD_LISTENER_SHUTDOWN {
-                match shutdown.try_recv() {
-                    Ok(()) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                        break 'message_loop Ok(());
-                    }
-                    Err(std::sync::mpsc::TryRecvError::Empty) => continue,
-                }
-            }
             unsafe {
                 let _ = TranslateMessage(&message);
                 DispatchMessageW(&message);
             }
+        }
+        match shutdown.try_recv() {
+            Ok(()) | Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                break 'message_loop Ok(());
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
         }
     };
     let cleanup = unsafe {
@@ -189,7 +178,6 @@ unsafe fn window_proc_inner(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LP
             }
             LRESULT(0)
         }
-        WM_CLIPBOARD_LISTENER_SHUTDOWN => LRESULT(0),
         _ => unsafe { DefWindowProcW(hwnd, message, wparam, lparam) },
     }
 }
@@ -278,19 +266,12 @@ pub(super) struct WakeAndJoinResult<WakeError, ThreadError> {
 pub(super) fn wake_and_join<WakeError, ThreadError>(
     mut signal: impl FnMut() -> Result<(), WakeError>,
     mut control: impl FnMut() -> Result<(), WakeError>,
-    is_thread_alive: impl FnOnce() -> bool,
-    mut post: impl FnMut() -> Result<(), WakeError>,
     join: impl FnOnce() -> Result<(), ThreadError>,
 ) -> WakeAndJoinResult<WakeError, ThreadError> {
     let mut failures = Vec::new();
     if let Err(error) = signal() {
         failures.push(error);
         if let Err(error) = control() {
-            failures.push(error);
-        }
-        if is_thread_alive()
-            && let Err(error) = post()
-        {
             failures.push(error);
         }
     }
@@ -313,7 +294,12 @@ fn clone_listener_error(error: &ClipboardListenerError) -> ClipboardListenerErro
             ClipboardListenerError::UnexpectedThreadExit
         }
         ClipboardListenerError::ThreadPanicked => ClipboardListenerError::ThreadPanicked,
-        ClipboardListenerError::ReadyTimeout => ClipboardListenerError::ReadyTimeout,
+        ClipboardListenerError::InitializationTimeout => {
+            ClipboardListenerError::InitializationTimeout
+        }
+        ClipboardListenerError::InitializationCleanupPending => {
+            ClipboardListenerError::InitializationCleanupPending
+        }
         ClipboardListenerError::Cleanup(failures) => {
             ClipboardListenerError::Cleanup(failures.clone())
         }
@@ -339,7 +325,6 @@ fn clone_shutdown_failure(
 
     match failure {
         ShutdownFailure::ControlDisconnected => ShutdownFailure::ControlDisconnected,
-        ShutdownFailure::PostMessage(error) => ShutdownFailure::PostMessage(error.clone()),
         ShutdownFailure::Signal(error) => ShutdownFailure::Signal(error.clone()),
         ShutdownFailure::CloseEvent(error) => ShutdownFailure::CloseEvent(error.clone()),
     }
@@ -352,7 +337,7 @@ mod tests {
     use super::{cleanup_in_order, wake_and_join};
 
     #[test]
-    fn successful_event_signal_skips_thread_message_fallback_and_joins() {
+    fn successful_event_signal_skips_control_fallback_and_joins() {
         let calls = RefCell::new(Vec::new());
         let result = wake_and_join(
             || {
@@ -361,14 +346,6 @@ mod tests {
             },
             || {
                 calls.borrow_mut().push("control");
-                Ok(())
-            },
-            || {
-                calls.borrow_mut().push("alive");
-                true
-            },
-            || {
-                calls.borrow_mut().push("post");
                 Ok(())
             },
             || {
@@ -383,7 +360,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_event_signal_uses_live_thread_message_fallback_then_joins() {
+    fn failed_event_signal_attempts_control_then_joins() {
         let calls = RefCell::new(Vec::new());
         let result = wake_and_join(
             || {
@@ -395,55 +372,14 @@ mod tests {
                 Err("control")
             },
             || {
-                calls.borrow_mut().push("alive");
-                true
-            },
-            || {
-                calls.borrow_mut().push("post");
-                Err("post")
-            },
-            || {
                 calls.borrow_mut().push("join");
                 Ok::<(), ()>(())
             },
         );
 
-        assert_eq!(result.failures, ["signal", "control", "post"]);
+        assert_eq!(result.failures, ["signal", "control"]);
         assert!(result.thread.is_ok());
-        assert_eq!(
-            *calls.borrow(),
-            ["signal", "control", "alive", "post", "join"]
-        );
-    }
-
-    #[test]
-    fn failed_event_signal_skips_post_for_finished_thread() {
-        let calls = RefCell::new(Vec::new());
-        let result = wake_and_join(
-            || {
-                calls.borrow_mut().push("signal");
-                Err("signal")
-            },
-            || {
-                calls.borrow_mut().push("control");
-                Ok(())
-            },
-            || {
-                calls.borrow_mut().push("alive");
-                false
-            },
-            || {
-                calls.borrow_mut().push("post");
-                Ok(())
-            },
-            || {
-                calls.borrow_mut().push("join");
-                Ok::<(), ()>(())
-            },
-        );
-
-        assert_eq!(result.failures, ["signal"]);
-        assert_eq!(*calls.borrow(), ["signal", "control", "alive", "join"]);
+        assert_eq!(*calls.borrow(), ["signal", "control", "join"]);
     }
 
     #[test]

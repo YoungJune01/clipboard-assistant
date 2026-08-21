@@ -25,16 +25,15 @@ use windows::core::{PCWSTR, w};
 
 use crate::domain::{CapturedClipboard, ClipboardRepresentation, ContentIdentity, SourceIdentity};
 
-use super::message_loop::{
-    ListenerReady, ListenerState, WM_CLIPBOARD_LISTENER_SHUTDOWN, run_message_loop, wake_and_join,
-};
+use super::message_loop::{ListenerState, run_message_loop, wake_and_join};
 
 const CF_UNICODETEXT_FORMAT: u32 = 13;
 const CF_DIBV5_FORMAT: u32 = 17;
 const MAX_PENDING_PRODUCT_WRITE_EVENTS: usize = 32;
 const MAX_TEXT_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
 const MAX_IMAGE_PAYLOAD_BYTES: usize = 256 * 1024 * 1024;
-const LISTENER_BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(3);
+const LISTENER_INITIALIZATION_TIMEOUT: Duration = Duration::from_secs(3);
+const LISTENER_INITIALIZATION_CLEANUP_GRACE: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClipboardEvent {
@@ -43,11 +42,10 @@ pub struct ClipboardEvent {
 }
 
 pub struct ClipboardListener {
-    listener_thread_id: u32,
     events: Sender<ClipboardEvent>,
     product_write: Arc<Mutex<ProductWriteState>>,
     shutdown: Sender<()>,
-    shutdown_event_value: Option<isize>,
+    shutdown_event: Option<ShutdownEvent>,
     thread: Option<JoinHandle<Result<(), ClipboardListenerError>>>,
 }
 
@@ -55,87 +53,52 @@ impl ClipboardListener {
     pub fn start(events: Sender<ClipboardEvent>) -> Result<Self, ClipboardListenerError> {
         let product_write = Arc::new(Mutex::new(ProductWriteState::Idle));
         let thread_product_write = Arc::clone(&product_write);
-        let (bootstrap_sender, bootstrap_receiver) = sync_channel(0);
         let (ready_sender, ready_receiver) = sync_channel(1);
+        let (completion_sender, completion_receiver) = sync_channel(1);
         let (shutdown_sender, shutdown_receiver) = std::sync::mpsc::channel();
-        let shutdown_event = unsafe { CreateEventW(None, true, false, PCWSTR::null()) }
-            .map_err(ClipboardListenerError::Windows)?;
-        let thread_shutdown_event = shutdown_event.0 as isize;
+        let shutdown_event = ShutdownEvent::create()?;
+        let thread_shutdown_event = shutdown_event.clone();
         let thread_events = events.clone();
         let thread = match thread::Builder::new()
             .name("clipboard-listener".to_owned())
             .spawn(move || {
-                bootstrap_listener_thread(bootstrap_sender, || {
-                    run_message_loop(
-                        thread_events,
-                        thread_product_write,
-                        ready_sender,
-                        shutdown_receiver,
-                        HANDLE(thread_shutdown_event as *mut std::ffi::c_void),
-                    )
-                })
+                let result = run_message_loop(
+                    thread_events,
+                    thread_product_write,
+                    ready_sender,
+                    shutdown_receiver,
+                    thread_shutdown_event.handle(),
+                );
+                let _ = completion_sender.send(());
+                result
             }) {
             Ok(thread) => thread,
-            Err(error) => {
-                unsafe {
-                    let _ = CloseHandle(shutdown_event);
-                }
-                return Err(ClipboardListenerError::ThreadSpawn(error));
-            }
+            Err(error) => return Err(ClipboardListenerError::ThreadSpawn(error)),
         };
 
         let thread = std::cell::RefCell::new(Some(thread));
-        orchestrate_listener_start(
-            move || {
+        orchestrate_listener_initialization(
+            || classify_ready_wait(ready_receiver.recv_timeout(LISTENER_INITIALIZATION_TIMEOUT)),
+            || shutdown_event.signal(),
+            || {
                 classify_ready_wait(
-                    bootstrap_receiver
-                        .recv_timeout(LISTENER_BOOTSTRAP_TIMEOUT)
-                        .map(Ok),
+                    completion_receiver.recv_timeout(LISTENER_INITIALIZATION_CLEANUP_GRACE),
                 )
             },
-            || unsafe { SetEvent(shutdown_event) }.map_err(ShutdownFailure::Signal),
             || {
                 join_listener_thread(
                     thread
                         .borrow_mut()
                         .take()
-                        .expect("startup thread must be available for cleanup"),
+                        .expect("initialization thread must be available for join"),
                 )
             },
-            || close_shutdown_event(shutdown_event),
         )?;
-        let listener_ready =
-            match ready_receiver.recv() {
-                Ok(Ok(listener_ready)) => listener_ready,
-                Ok(Err(error)) => {
-                    let joined =
-                        join_listener_thread(thread.borrow_mut().take().expect(
-                            "startup thread must be available after initialization failure",
-                        ));
-                    let close = close_shutdown_event(shutdown_event);
-                    return Err(combine_startup_failure(error, joined, close));
-                }
-                Err(_) => {
-                    let joined = join_listener_thread(
-                        thread
-                            .borrow_mut()
-                            .take()
-                            .expect("startup thread must be available after initialization exit"),
-                    );
-                    let close = close_shutdown_event(shutdown_event);
-                    return Err(combine_startup_failure(
-                        ClipboardListenerError::UnexpectedThreadExit,
-                        joined,
-                        close,
-                    ));
-                }
-            };
         Ok(Self {
-            listener_thread_id: listener_ready.thread_id,
             events,
             product_write,
             shutdown: shutdown_sender,
-            shutdown_event_value: Some(shutdown_event.0 as isize),
+            shutdown_event: Some(shutdown_event),
             thread: thread.into_inner(),
         })
     }
@@ -166,13 +129,10 @@ impl ClipboardListener {
         let Some(thread) = self.thread.take() else {
             return Ok(());
         };
-        let thread = std::cell::RefCell::new(Some(thread));
-        let listener_thread_id = self.listener_thread_id;
-        let event_value = self.shutdown_event_value;
+        let event = self.shutdown_event.as_ref().cloned();
         let attempt = wake_and_join(
-            || match event_value {
-                Some(value) => unsafe { SetEvent(HANDLE(value as *mut std::ffi::c_void)) }
-                    .map_err(ShutdownFailure::Signal),
+            || match &event {
+                Some(event) => event.signal(),
                 None => Ok(()),
             },
             || {
@@ -180,35 +140,10 @@ impl ClipboardListener {
                     .send(())
                     .map_err(|_| ShutdownFailure::ControlDisconnected)
             },
-            || {
-                !thread
-                    .borrow()
-                    .as_ref()
-                    .expect("shutdown thread must be available before join")
-                    .is_finished()
-            },
-            || unsafe {
-                windows::Win32::UI::WindowsAndMessaging::PostThreadMessageW(
-                    listener_thread_id,
-                    WM_CLIPBOARD_LISTENER_SHUTDOWN,
-                    Default::default(),
-                    Default::default(),
-                )
-                .map_err(ShutdownFailure::PostMessage)
-            },
-            || {
-                join_listener_thread(
-                    thread
-                        .borrow_mut()
-                        .take()
-                        .expect("shutdown thread must be available for join"),
-                )
-            },
+            || join_listener_thread(thread),
         );
-        let close = self
-            .shutdown_event_value
-            .take()
-            .map(|value| close_shutdown_event(HANDLE(value as *mut std::ffi::c_void)));
+        drop(event);
+        let close = self.shutdown_event.take().map(ShutdownEvent::close);
         combine_shutdown_result(attempt.failures, attempt.thread, close)
     }
 }
@@ -226,7 +161,8 @@ pub enum ClipboardListenerError {
     ProductWriteAlreadyInProgress,
     UnexpectedThreadExit,
     ThreadPanicked,
-    ReadyTimeout,
+    InitializationTimeout,
+    InitializationCleanupPending,
     Cleanup(Vec<CleanupFailure>),
     OperationAndCleanup {
         operation: Box<ClipboardListenerError>,
@@ -248,7 +184,6 @@ pub enum CleanupFailure {
 #[derive(Debug)]
 pub enum ShutdownFailure {
     ControlDisconnected,
-    PostMessage(windows::core::Error),
     Signal(windows::core::Error),
     CloseEvent(windows::core::Error),
 }
@@ -267,9 +202,12 @@ impl fmt::Display for ClipboardListenerError {
                 formatter.write_str("clipboard listener exited before ready")
             }
             Self::ThreadPanicked => formatter.write_str("clipboard listener thread panicked"),
-            Self::ReadyTimeout => {
-                formatter.write_str("clipboard listener thread bootstrap timed out")
+            Self::InitializationTimeout => {
+                formatter.write_str("clipboard listener initialization timed out")
             }
+            Self::InitializationCleanupPending => formatter.write_str(
+                "clipboard listener initialization timed out; background cleanup pending",
+            ),
             Self::Cleanup(failures) => write!(
                 formatter,
                 "clipboard listener cleanup failed in {} stage(s)",
@@ -305,7 +243,8 @@ impl Error for ClipboardListenerError {
             Self::ProductWriteAlreadyInProgress
             | Self::UnexpectedThreadExit
             | Self::ThreadPanicked
-            | Self::ReadyTimeout
+            | Self::InitializationTimeout
+            | Self::InitializationCleanupPending
             | Self::Cleanup(_)
             | Self::Shutdown { thread: None, .. } => None,
         }
@@ -342,27 +281,63 @@ fn join_listener_thread(
     }
 }
 
-fn close_shutdown_event(event: HANDLE) -> Result<(), ShutdownFailure> {
-    unsafe { CloseHandle(event) }.map_err(ShutdownFailure::CloseEvent)
+#[derive(Clone)]
+struct ShutdownEvent(Arc<ShutdownEventInner>);
+
+struct ShutdownEventInner {
+    value: isize,
 }
 
-fn combine_startup_failure(
-    startup: ClipboardListenerError,
-    joined: Result<(), ClipboardListenerError>,
-    close: Result<(), ShutdownFailure>,
-) -> ClipboardListenerError {
-    combine_startup_shutdown(startup, Vec::new(), joined, close)
+impl ShutdownEvent {
+    fn create() -> Result<Self, ClipboardListenerError> {
+        let event = unsafe { CreateEventW(None, true, false, PCWSTR::null()) }
+            .map_err(ClipboardListenerError::Windows)?;
+        Ok(Self(Arc::new(ShutdownEventInner {
+            value: event.0 as isize,
+        })))
+    }
+
+    fn handle(&self) -> HANDLE {
+        HANDLE(self.0.value as *mut std::ffi::c_void)
+    }
+
+    fn signal(&self) -> Result<(), ShutdownFailure> {
+        unsafe { SetEvent(self.handle()) }.map_err(ShutdownFailure::Signal)
+    }
+
+    fn close(self) -> Result<(), ShutdownFailure> {
+        match Arc::try_unwrap(self.0) {
+            Ok(mut event) => event.close(),
+            Err(event) => {
+                drop(event);
+                Ok(())
+            }
+        }
+    }
+}
+
+impl Drop for ShutdownEventInner {
+    fn drop(&mut self) {
+        let _ = self.close();
+    }
+}
+
+impl ShutdownEventInner {
+    fn close(&mut self) -> Result<(), ShutdownFailure> {
+        if self.value == 0 {
+            return Ok(());
+        }
+        let handle = HANDLE(self.value as *mut std::ffi::c_void);
+        self.value = 0;
+        unsafe { CloseHandle(handle).map_err(ShutdownFailure::CloseEvent) }
+    }
 }
 
 fn combine_startup_shutdown(
     startup: ClipboardListenerError,
-    mut failures: Vec<ShutdownFailure>,
+    failures: Vec<ShutdownFailure>,
     joined: Result<(), ClipboardListenerError>,
-    close: Result<(), ShutdownFailure>,
 ) -> ClipboardListenerError {
-    if let Err(error) = close {
-        failures.push(error);
-    }
     let thread = joined
         .err()
         .filter(|error| !same_error_kind(error, &startup));
@@ -870,43 +845,49 @@ fn classify_ready_wait<T>(result: Result<T, RecvTimeoutError>) -> ReadyWait<T> {
     }
 }
 
-fn orchestrate_listener_start<T>(
+fn orchestrate_listener_initialization<T>(
     wait: impl FnOnce() -> ReadyWait<Result<T, ClipboardListenerError>>,
     signal: impl FnOnce() -> Result<(), ShutdownFailure>,
+    wait_completion: impl FnOnce() -> ReadyWait<()>,
     join: impl FnOnce() -> Result<(), ClipboardListenerError>,
-    close: impl FnOnce() -> Result<(), ShutdownFailure>,
 ) -> Result<T, ClipboardListenerError> {
     let startup = match wait() {
         ReadyWait::Ready(Ok(value)) => return Ok(value),
-        ReadyWait::Ready(Err(error)) => (error, false),
-        ReadyWait::Timeout => (ClipboardListenerError::ReadyTimeout, true),
-        ReadyWait::Disconnected => (ClipboardListenerError::UnexpectedThreadExit, true),
+        ReadyWait::Ready(Err(error)) => {
+            return Err(combine_startup_shutdown(error, Vec::new(), join()));
+        }
+        ReadyWait::Disconnected => {
+            return Err(combine_startup_shutdown(
+                ClipboardListenerError::UnexpectedThreadExit,
+                Vec::new(),
+                join(),
+            ));
+        }
+        ReadyWait::Timeout => ClipboardListenerError::InitializationTimeout,
     };
     let mut failures = Vec::new();
-    if startup.1
-        && let Err(error) = signal()
-    {
+    if let Err(error) = signal() {
         failures.push(error);
     }
-    let joined = join();
-    let closed = close();
-    if startup.1 {
-        Err(combine_startup_shutdown(
-            startup.0, failures, joined, closed,
-        ))
-    } else {
-        Err(combine_startup_failure(startup.0, joined, closed))
+    match wait_completion() {
+        ReadyWait::Ready(()) | ReadyWait::Disconnected => {
+            Err(combine_startup_shutdown(startup, failures, join()))
+        }
+        ReadyWait::Timeout => {
+            // Windows initialization calls are not safely cancellable. The listener thread owns
+            // its event clone, observes the already-signaled event once the call returns, and
+            // performs thread-affine cleanup before releasing the final handle reference.
+            let pending = ClipboardListenerError::InitializationCleanupPending;
+            if failures.is_empty() {
+                Err(pending)
+            } else {
+                Err(ClipboardListenerError::Shutdown {
+                    failures,
+                    thread: Some(Box::new(pending)),
+                })
+            }
+        }
     }
-}
-
-fn bootstrap_listener_thread<T>(
-    bootstrap: std::sync::mpsc::SyncSender<()>,
-    initialize: impl FnOnce() -> Result<T, ClipboardListenerError>,
-) -> Result<T, ClipboardListenerError> {
-    bootstrap
-        .send(())
-        .map_err(|_| ClipboardListenerError::UnexpectedThreadExit)?;
-    initialize()
 }
 
 pub(super) fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -917,8 +898,7 @@ pub(super) fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, 
 
 pub(super) type EventSender = Sender<ClipboardEvent>;
 pub(super) type ProductWriteOwnership = Arc<Mutex<ProductWriteState>>;
-pub(super) type ReadySender =
-    std::sync::mpsc::SyncSender<Result<ListenerReady, ClipboardListenerError>>;
+pub(super) type ReadySender = std::sync::mpsc::SyncSender<Result<(), ClipboardListenerError>>;
 pub(super) type ShutdownReceiver = std::sync::mpsc::Receiver<()>;
 
 #[cfg(test)]
@@ -933,10 +913,10 @@ mod tests {
     use super::{
         ClipboardEvent, ClipboardListenerError, ClipboardPayloadKind, ClipboardReadError,
         MAX_IMAGE_PAYLOAD_BYTES, MAX_PENDING_PRODUCT_WRITE_EVENTS, MAX_TEXT_PAYLOAD_BYTES,
-        ProductWriteGuard, ProductWriteState, ReadyWait, ShutdownFailure,
-        bootstrap_listener_thread, classify_format_read, classify_global_unlock,
-        classify_payload_size, classify_registered_format, combine_clipboard_operation_and_close,
-        decode_unicode_text, orchestrate_listener_start, route_event,
+        ProductWriteGuard, ProductWriteState, ReadyWait, ShutdownFailure, classify_format_read,
+        classify_global_unlock, classify_payload_size, classify_registered_format,
+        combine_clipboard_operation_and_close, decode_unicode_text,
+        orchestrate_listener_initialization, route_event,
     };
     use crate::domain::{CapturedClipboard, ContentIdentity, SourceIdentity};
 
@@ -1130,214 +1110,132 @@ mod tests {
     }
 
     #[test]
-    fn closed_bootstrap_receiver_prevents_listener_initialization() {
-        let (sender, receiver) = mpsc::sync_channel(0);
-        drop(receiver);
-        let initialized = RefCell::new(false);
-
-        let result = bootstrap_listener_thread(sender, || {
-            *initialized.borrow_mut() = true;
-            Ok(())
-        });
-
-        assert!(matches!(
-            result,
-            Err(ClipboardListenerError::UnexpectedThreadExit)
-        ));
-        assert!(!*initialized.borrow());
-    }
-
-    #[test]
-    fn bootstrap_wait_timeout_drops_receiver_before_join() {
-        let (sender, receiver) = mpsc::sync_channel(0);
-        let (gate_sender, gate_receiver) = mpsc::channel();
-        let thread = std::thread::spawn(move || {
-            gate_receiver.recv().unwrap();
-            bootstrap_listener_thread(sender, || Ok(()))
-        });
-
-        let wait = receiver.recv_timeout(std::time::Duration::ZERO);
-        drop(receiver);
-        gate_sender.send(()).unwrap();
-
-        assert!(matches!(wait, Err(mpsc::RecvTimeoutError::Timeout)));
-        assert!(matches!(
-            thread.join().unwrap(),
-            Err(ClipboardListenerError::UnexpectedThreadExit)
-        ));
-    }
-
-    #[test]
-    fn ready_success_does_not_run_startup_cleanup() {
+    fn blocked_initializer_returns_after_initialization_deadline() {
         let calls = RefCell::new(Vec::new());
-        let outcome = orchestrate_listener_start::<isize>(
-            || ReadyWait::Ready(Ok(41)),
-            || {
-                calls.borrow_mut().push("signal");
-                Ok(())
-            },
-            || {
-                calls.borrow_mut().push("join");
-                Ok(())
-            },
-            || {
-                calls.borrow_mut().push("close");
-                Ok(())
-            },
-        );
-
-        assert_eq!(outcome.unwrap(), 41);
-        assert!(calls.borrow().is_empty());
-    }
-
-    #[test]
-    fn ready_timeout_signals_joins_and_closes_in_order() {
-        let calls = RefCell::new(Vec::new());
-        let outcome = orchestrate_listener_start::<isize>(
+        let outcome = orchestrate_listener_initialization::<isize>(
             || ReadyWait::Timeout,
             || {
                 calls.borrow_mut().push("signal");
                 Ok(())
             },
             || {
-                calls.borrow_mut().push("join");
-                Ok(())
-            },
-            || {
-                calls.borrow_mut().push("close");
-                Ok(())
-            },
-        );
-
-        assert!(matches!(outcome, Err(ClipboardListenerError::ReadyTimeout)));
-        assert_eq!(*calls.borrow(), ["signal", "join", "close"]);
-    }
-
-    #[test]
-    fn ready_disconnect_runs_the_same_startup_cleanup() {
-        let calls = RefCell::new(Vec::new());
-        let outcome = orchestrate_listener_start::<isize>(
-            || ReadyWait::Disconnected,
-            || {
-                calls.borrow_mut().push("signal");
-                Ok(())
+                calls.borrow_mut().push("completion_wait");
+                ReadyWait::Timeout
             },
             || {
                 calls.borrow_mut().push("join");
-                Ok(())
-            },
-            || {
-                calls.borrow_mut().push("close");
                 Ok(())
             },
         );
 
         assert!(matches!(
             outcome,
-            Err(ClipboardListenerError::UnexpectedThreadExit)
+            Err(ClipboardListenerError::InitializationCleanupPending)
         ));
-        assert_eq!(*calls.borrow(), ["signal", "join", "close"]);
+        assert_eq!(*calls.borrow(), ["signal", "completion_wait"]);
     }
 
     #[test]
-    fn startup_cleanup_attempts_all_stages_and_aggregates_failures() {
+    fn blocked_initializer_wait_is_bounded_by_the_production_deadline() {
+        let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
+        let (completion_sender, completion_receiver) = mpsc::sync_channel(1);
+        let (release_sender, release_receiver) = mpsc::channel();
+        let initializer = std::thread::spawn(move || {
+            release_receiver.recv().unwrap();
+            let _ = ready_sender.send(Ok::<(), ClipboardListenerError>(()));
+            let _ = completion_sender.send(());
+        });
+        let started = std::time::Instant::now();
+        let outcome = orchestrate_listener_initialization(
+            || {
+                super::classify_ready_wait(
+                    ready_receiver.recv_timeout(std::time::Duration::from_millis(10)),
+                )
+            },
+            || Ok(()),
+            || {
+                super::classify_ready_wait(
+                    completion_receiver.recv_timeout(std::time::Duration::from_millis(10)),
+                )
+            },
+            || panic!("a blocked initializer must not be joined after the cleanup grace period"),
+        );
+
+        assert!(matches!(
+            outcome,
+            Err(ClipboardListenerError::InitializationCleanupPending)
+        ));
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        release_sender.send(()).unwrap();
+        initializer.join().unwrap();
+    }
+
+    #[test]
+    fn pending_cleanup_preserves_signal_failure_without_attempting_join() {
+        let outcome = orchestrate_listener_initialization::<()>(
+            || ReadyWait::Timeout,
+            || Err(ShutdownFailure::Signal(windows::core::Error::from_win32())),
+            || ReadyWait::Timeout,
+            || panic!("a blocked initializer must not be joined after the cleanup grace period"),
+        );
+
+        let ClipboardListenerError::Shutdown { failures, thread } = outcome.unwrap_err() else {
+            panic!("expected pending cleanup with the signal failure preserved");
+        };
+        assert!(matches!(failures.as_slice(), [ShutdownFailure::Signal(_)]));
+        assert!(matches!(
+            thread.as_deref(),
+            Some(ClipboardListenerError::InitializationCleanupPending)
+        ));
+    }
+
+    #[test]
+    fn initialization_timeout_joins_when_thread_exits_during_grace_period() {
         let calls = RefCell::new(Vec::new());
-        let outcome = orchestrate_listener_start::<isize>(
+        let outcome = orchestrate_listener_initialization::<isize>(
             || ReadyWait::Timeout,
             || {
                 calls.borrow_mut().push("signal");
-                Err(ShutdownFailure::Signal(windows_error(5)))
+                Ok(())
+            },
+            || {
+                calls.borrow_mut().push("completion_wait");
+                ReadyWait::Ready(())
             },
             || {
                 calls.borrow_mut().push("join");
-                Err(ClipboardListenerError::ThreadPanicked)
-            },
-            || {
-                calls.borrow_mut().push("close");
-                Err(ShutdownFailure::CloseEvent(windows_error(6)))
+                Ok(())
             },
         );
 
-        assert_eq!(*calls.borrow(), ["signal", "join", "close"]);
-        match outcome.unwrap_err() {
-            ClipboardListenerError::Shutdown { failures, thread } => {
-                assert!(matches!(
-                    failures.as_slice(),
-                    [ShutdownFailure::Signal(_), ShutdownFailure::CloseEvent(_)]
-                ));
-                assert!(matches!(
-                    thread.as_deref(),
-                    Some(ClipboardListenerError::ThreadPanicked)
-                ));
-            }
-            error => panic!("expected aggregated startup shutdown error, got {error}"),
-        }
+        assert!(matches!(
+            outcome,
+            Err(ClipboardListenerError::InitializationTimeout)
+        ));
+        assert_eq!(*calls.borrow(), ["signal", "completion_wait", "join"]);
     }
 
     #[test]
-    fn each_startup_cleanup_failure_is_preserved_without_skipping_later_stages() {
-        for failing_stage in ["signal", "join", "close"] {
-            let calls = RefCell::new(Vec::new());
-            let outcome = orchestrate_listener_start::<isize>(
-                || ReadyWait::Timeout,
-                || {
-                    calls.borrow_mut().push("signal");
-                    if failing_stage == "signal" {
-                        Err(ShutdownFailure::Signal(windows_error(5)))
-                    } else {
-                        Ok(())
-                    }
-                },
-                || {
-                    calls.borrow_mut().push("join");
-                    if failing_stage == "join" {
-                        Err(ClipboardListenerError::ThreadPanicked)
-                    } else {
-                        Ok(())
-                    }
-                },
-                || {
-                    calls.borrow_mut().push("close");
-                    if failing_stage == "close" {
-                        Err(ShutdownFailure::CloseEvent(windows_error(6)))
-                    } else {
-                        Ok(())
-                    }
-                },
-            );
+    fn initialization_success_skips_timeout_cleanup() {
+        let calls = RefCell::new(Vec::new());
+        let outcome = orchestrate_listener_initialization(
+            || ReadyWait::Ready(Ok::<_, ClipboardListenerError>(41isize)),
+            || {
+                calls.borrow_mut().push("signal");
+                Ok(())
+            },
+            || {
+                calls.borrow_mut().push("completion_wait");
+                ReadyWait::Ready(())
+            },
+            || {
+                calls.borrow_mut().push("join");
+                Ok(())
+            },
+        );
 
-            assert_eq!(*calls.borrow(), ["signal", "join", "close"]);
-            let ClipboardListenerError::Shutdown { failures, thread } = outcome.unwrap_err() else {
-                panic!("expected aggregated shutdown error for {failing_stage}");
-            };
-            match failing_stage {
-                "signal" => {
-                    assert!(matches!(failures.as_slice(), [ShutdownFailure::Signal(_)]));
-                    assert!(matches!(
-                        thread.as_deref(),
-                        Some(ClipboardListenerError::ReadyTimeout)
-                    ));
-                }
-                "join" => {
-                    assert!(failures.is_empty());
-                    assert!(matches!(
-                        thread.as_deref(),
-                        Some(ClipboardListenerError::ThreadPanicked)
-                    ));
-                }
-                "close" => {
-                    assert!(matches!(
-                        failures.as_slice(),
-                        [ShutdownFailure::CloseEvent(_)]
-                    ));
-                    assert!(matches!(
-                        thread.as_deref(),
-                        Some(ClipboardListenerError::ReadyTimeout)
-                    ));
-                }
-                _ => unreachable!(),
-            }
-        }
+        assert_eq!(outcome.unwrap(), 41);
+        assert!(calls.borrow().is_empty());
     }
 
     #[test]
@@ -1376,10 +1274,6 @@ mod tests {
             combine_clipboard_operation_and_close::<(), &str, &str>(Err("read"), Err("close"))
                 .unwrap_err();
         assert_eq!(error, (Some("read"), Some("close")));
-    }
-
-    fn windows_error(code: u32) -> windows::core::Error {
-        windows::core::Error::from_hresult(windows::core::HRESULT::from_win32(code))
     }
 
     fn event(sequence_number: u32) -> ClipboardEvent {
