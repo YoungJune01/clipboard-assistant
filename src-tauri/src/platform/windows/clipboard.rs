@@ -5,7 +5,7 @@ use std::{
     mem::size_of,
     ptr,
     sync::{
-        Arc, Mutex,
+        Arc, Condvar, Mutex,
         atomic::{AtomicU64, Ordering},
         mpsc::{RecvTimeoutError, Sender, sync_channel},
     },
@@ -38,6 +38,7 @@ const CF_DIBV5_FORMAT: u32 = 17;
 const MAX_TEXT_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
 const MAX_IMAGE_PAYLOAD_BYTES: usize = 256 * 1024 * 1024;
 const PRODUCT_WRITE_TRANSACTION_TIMEOUT: Duration = Duration::from_secs(2);
+const PRODUCT_WRITE_PENDING_BYTES: usize = 16 * 1024 * 1024;
 const LISTENER_INITIALIZATION_TIMEOUT: Duration = Duration::from_secs(3);
 const LISTENER_INITIALIZATION_CLEANUP_GRACE: Duration = Duration::from_secs(1);
 static NEXT_PRODUCT_WRITE_TRANSACTION: AtomicU64 = AtomicU64::new(1);
@@ -49,7 +50,7 @@ pub struct ClipboardEvent {
 }
 
 pub struct ClipboardListener {
-    events: Sender<ClipboardEvent>,
+    events: EventSender,
     product_write: Arc<Mutex<ProductWriteState>>,
     shutdown: Sender<()>,
     shutdown_event: Option<ShutdownEvent>,
@@ -58,12 +59,13 @@ pub struct ClipboardListener {
 
 #[derive(Clone)]
 pub struct ClipboardPublisher {
-    events: Sender<ClipboardEvent>,
+    events: EventSender,
     product_write: Arc<Mutex<ProductWriteState>>,
 }
 
 impl ClipboardListener {
-    pub fn start(events: Sender<ClipboardEvent>) -> Result<Self, ClipboardListenerError> {
+    pub fn start(events: impl Into<EventSender>) -> Result<Self, ClipboardListenerError> {
+        let events = events.into();
         let product_write = Arc::new(Mutex::new(ProductWriteState::Idle));
         let thread_product_write = Arc::clone(&product_write);
         let (ready_sender, ready_receiver) = sync_channel(1);
@@ -182,10 +184,11 @@ impl ClipboardPublisher {
 
 fn begin_product_write_transaction(
     product_write: Arc<Mutex<ProductWriteState>>,
-    events: Sender<ClipboardEvent>,
+    events: impl Into<EventSender>,
     baseline: u32,
     timeout: Duration,
 ) -> Result<ProductWriteGuard, ClipboardListenerError> {
+    let events = events.into();
     begin_product_write_transaction_with_spawner(
         product_write,
         events,
@@ -197,17 +200,18 @@ fn begin_product_write_transaction(
 
 fn begin_product_write_transaction_with_spawner(
     product_write: Arc<Mutex<ProductWriteState>>,
-    events: Sender<ClipboardEvent>,
+    events: impl Into<EventSender>,
     baseline: u32,
     timeout: Duration,
     spawn_timeout: impl FnOnce(
         Arc<Mutex<ProductWriteState>>,
-        Sender<ClipboardEvent>,
+        EventSender,
         u64,
         Duration,
         std::sync::mpsc::Receiver<()>,
     ) -> Result<JoinHandle<()>, ClipboardListenerError>,
 ) -> Result<ProductWriteGuard, ClipboardListenerError> {
+    let events = events.into();
     let mut state = lock_unpoisoned(&product_write);
     if !matches!(*state, ProductWriteState::Idle) {
         return Err(ClipboardListenerError::ProductWriteAlreadyInProgress);
@@ -792,21 +796,43 @@ pub(super) fn capture_update(state: &ListenerState) {
 
 fn route_event(
     state: &Mutex<ProductWriteState>,
-    events: &Sender<ClipboardEvent>,
+    events: &impl ClipboardEventSink,
     event: ClipboardEvent,
 ) {
     let mut state = lock_unpoisoned(state);
     match &mut *state {
-        ProductWriteState::Armed { pending, .. } => pending.push_back(event),
+        ProductWriteState::Armed {
+            pending,
+            pending_bytes,
+            pending_budget,
+            ..
+        } => {
+            let event_bytes = clipboard_event_bytes(&event);
+            if pending_bytes
+                .checked_add(event_bytes)
+                .is_some_and(|bytes| bytes <= *pending_budget)
+            {
+                *pending_bytes += event_bytes;
+                pending.push_back(event);
+            } else {
+                let previous = std::mem::replace(&mut *state, ProductWriteState::Idle);
+                if let ProductWriteState::Armed { pending, .. } = previous {
+                    for pending_event in pending {
+                        let _ = events.send_event(pending_event);
+                    }
+                }
+                let _ = events.send_event(event);
+            }
+        }
         ProductWriteState::Expected { sequence } if *sequence == event.sequence_number => {
             *state = ProductWriteState::Idle;
         }
         ProductWriteState::Expected { .. } => {
             *state = ProductWriteState::Idle;
-            let _ = events.send(event);
+            let _ = events.send_event(event);
         }
         ProductWriteState::Idle => {
-            let _ = events.send(event);
+            let _ = events.send_event(event);
         }
     }
 }
@@ -818,6 +844,8 @@ pub(super) enum ProductWriteState {
         transaction_id: u64,
         baseline: u32,
         pending: VecDeque<ClipboardEvent>,
+        pending_bytes: usize,
+        pending_budget: usize,
     },
     Expected {
         sequence: u32,
@@ -826,10 +854,16 @@ pub(super) enum ProductWriteState {
 
 impl ProductWriteState {
     fn armed(baseline: u32) -> Self {
+        Self::armed_with_budget(baseline, PRODUCT_WRITE_PENDING_BYTES)
+    }
+
+    fn armed_with_budget(baseline: u32, pending_budget: usize) -> Self {
         Self::Armed {
             transaction_id: NEXT_PRODUCT_WRITE_TRANSACTION.fetch_add(1, Ordering::Relaxed),
             baseline,
             pending: VecDeque::new(),
+            pending_bytes: 0,
+            pending_budget,
         }
     }
 
@@ -843,7 +877,7 @@ impl ProductWriteState {
 
 pub struct ProductWriteGuard {
     state: Arc<Mutex<ProductWriteState>>,
-    events: Sender<ClipboardEvent>,
+    events: EventSender,
     transaction_id: u64,
     cancel_timeout: Option<std::sync::mpsc::SyncSender<()>>,
     timeout_thread: Option<JoinHandle<()>>,
@@ -925,7 +959,7 @@ impl Drop for ProductWriteGuard {
 
 fn spawn_product_write_timeout(
     state: Arc<Mutex<ProductWriteState>>,
-    events: Sender<ClipboardEvent>,
+    events: EventSender,
     transaction_id: u64,
     timeout: Duration,
     cancelled: std::sync::mpsc::Receiver<()>,
@@ -943,7 +977,7 @@ fn spawn_product_write_timeout(
 
 fn cancel_product_write(
     state: &Mutex<ProductWriteState>,
-    events: &Sender<ClipboardEvent>,
+    events: &impl ClipboardEventSink,
     transaction_id: u64,
 ) {
     let mut state = lock_unpoisoned(state);
@@ -954,7 +988,7 @@ fn cancel_product_write(
         std::mem::replace(&mut *state, ProductWriteState::Idle)
     {
         for event in pending {
-            let _ = events.send(event);
+            let _ = events.send_event(event);
         }
     }
 }
@@ -1366,10 +1400,113 @@ pub(super) fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, 
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-pub(super) type EventSender = Sender<ClipboardEvent>;
+#[derive(Clone)]
+pub struct EventSender(EventSenderKind);
+
+#[derive(Clone)]
+enum EventSenderKind {
+    Queue(Sender<ClipboardEvent>),
+    Latest(Arc<LatestClipboardEventSlot>),
+}
+
+struct LatestClipboardEventSlot {
+    event: Mutex<Option<ClipboardEvent>>,
+    changed: Condvar,
+}
+
+pub struct LatestClipboardEventReceiver {
+    slot: Arc<LatestClipboardEventSlot>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClipboardEventSendError;
+
+impl EventSender {
+    pub fn send(&self, event: ClipboardEvent) -> Result<(), ClipboardEventSendError> {
+        match &self.0 {
+            EventSenderKind::Queue(sender) => {
+                sender.send(event).map_err(|_| ClipboardEventSendError)
+            }
+            EventSenderKind::Latest(slot) => {
+                *lock_unpoisoned(&slot.event) = Some(event);
+                slot.changed.notify_one();
+                Ok(())
+            }
+        }
+    }
+}
+
+trait ClipboardEventSink {
+    fn send_event(&self, event: ClipboardEvent) -> Result<(), ClipboardEventSendError>;
+}
+
+impl ClipboardEventSink for EventSender {
+    fn send_event(&self, event: ClipboardEvent) -> Result<(), ClipboardEventSendError> {
+        self.send(event)
+    }
+}
+
+impl ClipboardEventSink for Sender<ClipboardEvent> {
+    fn send_event(&self, event: ClipboardEvent) -> Result<(), ClipboardEventSendError> {
+        self.send(event).map_err(|_| ClipboardEventSendError)
+    }
+}
+
+impl From<Sender<ClipboardEvent>> for EventSender {
+    fn from(sender: Sender<ClipboardEvent>) -> Self {
+        Self(EventSenderKind::Queue(sender))
+    }
+}
+
+pub fn latest_clipboard_event_channel() -> (EventSender, LatestClipboardEventReceiver) {
+    let slot = Arc::new(LatestClipboardEventSlot {
+        event: Mutex::new(None),
+        changed: Condvar::new(),
+    });
+    (
+        EventSender(EventSenderKind::Latest(Arc::clone(&slot))),
+        LatestClipboardEventReceiver { slot },
+    )
+}
+
+impl LatestClipboardEventReceiver {
+    pub fn recv_timeout(&self, timeout: Duration) -> Result<ClipboardEvent, RecvTimeoutError> {
+        let event = lock_unpoisoned(&self.slot.event);
+        let (mut event, wait) = self
+            .slot
+            .changed
+            .wait_timeout_while(event, timeout, |event| event.is_none())
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        event.take().ok_or(if wait.timed_out() {
+            RecvTimeoutError::Timeout
+        } else {
+            RecvTimeoutError::Disconnected
+        })
+    }
+
+    pub fn try_recv(&self) -> Result<ClipboardEvent, std::sync::mpsc::TryRecvError> {
+        lock_unpoisoned(&self.slot.event)
+            .take()
+            .ok_or(std::sync::mpsc::TryRecvError::Empty)
+    }
+}
 pub(super) type ProductWriteOwnership = Arc<Mutex<ProductWriteState>>;
 pub(super) type ReadySender = std::sync::mpsc::SyncSender<Result<(), ClipboardListenerError>>;
 pub(super) type ShutdownReceiver = std::sync::mpsc::Receiver<()>;
+
+fn clipboard_event_bytes(event: &ClipboardEvent) -> usize {
+    event
+        .captured
+        .representations
+        .iter()
+        .map(|representation| match representation {
+            ClipboardRepresentation::UnicodeText { text } => text.len(),
+            ClipboardRepresentation::Png { bytes } | ClipboardRepresentation::DibV5 { bytes } => {
+                bytes.len()
+            }
+        })
+        .sum()
+}
 
 #[cfg(test)]
 mod tests {
@@ -1383,11 +1520,12 @@ mod tests {
 
     use super::{
         ClipboardEvent, ClipboardListenerError, ClipboardPayloadKind, ClipboardReadError,
-        ClipboardWriteError, MAX_IMAGE_PAYLOAD_BYTES, MAX_TEXT_PAYLOAD_BYTES, ProductWriteGuard,
-        ProductWriteState, ReadyWait, ShutdownFailure, begin_product_write_transaction,
-        begin_product_write_transaction_with_spawner, classify_format_read, classify_global_unlock,
-        classify_payload_size, classify_registered_format, combine_clipboard_operation_and_close,
-        decode_unicode_text, finish_product_write, orchestrate_listener_initialization,
+        ClipboardWriteError, EventSender, MAX_IMAGE_PAYLOAD_BYTES, MAX_TEXT_PAYLOAD_BYTES,
+        ProductWriteGuard, ProductWriteState, ReadyWait, ShutdownFailure,
+        begin_product_write_transaction, begin_product_write_transaction_with_spawner,
+        classify_format_read, classify_global_unlock, classify_payload_size,
+        classify_registered_format, combine_clipboard_operation_and_close, decode_unicode_text,
+        finish_product_write, latest_clipboard_event_channel, orchestrate_listener_initialization,
         route_event, validate_representations,
     };
     use crate::domain::{
@@ -1514,6 +1652,43 @@ mod tests {
             .map(|event| event.sequence_number)
             .collect();
         assert_eq!(observed, (82..=117).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn pending_byte_budget_cancels_and_replays_every_event_in_order() {
+        let (events, receiver) = mpsc::channel();
+        let state = Arc::new(Mutex::new(ProductWriteState::armed_with_budget(80, 9)));
+
+        route_event(&state, &events, text_event(81, "1234"));
+        route_event(&state, &events, text_event(82, "5678"));
+        route_event(&state, &events, text_event(83, "90"));
+
+        assert!(matches!(*state.lock().unwrap(), ProductWriteState::Idle));
+        assert_eq!(
+            receiver
+                .try_iter()
+                .map(|event| event.sequence_number)
+                .collect::<Vec<_>>(),
+            [81, 82, 83]
+        );
+    }
+
+    #[test]
+    fn latest_event_mailbox_is_bounded_and_preserves_the_newest_capture() {
+        let (events, receiver) = latest_clipboard_event_channel();
+
+        events.send(text_event(91, &"a".repeat(1024))).unwrap();
+        events.send(text_event(92, &"b".repeat(1024))).unwrap();
+        events.send(text_event(93, &"c".repeat(1024))).unwrap();
+
+        assert_eq!(
+            receiver
+                .recv_timeout(Duration::from_millis(50))
+                .unwrap()
+                .sequence_number,
+            93
+        );
+        assert!(receiver.try_recv().is_err());
     }
 
     #[test]
@@ -1651,7 +1826,7 @@ mod tests {
 
     fn product_write_guard(
         state: Arc<Mutex<ProductWriteState>>,
-        events: mpsc::Sender<ClipboardEvent>,
+        events: impl Into<EventSender>,
     ) -> ProductWriteGuard {
         let transaction_id = state
             .lock()
@@ -1660,7 +1835,7 @@ mod tests {
             .expect("product write must be armed");
         ProductWriteGuard {
             state,
-            events,
+            events: events.into(),
             transaction_id,
             cancel_timeout: None,
             timeout_thread: None,
@@ -1914,6 +2089,20 @@ mod tests {
                 captured_at: Utc::now(),
                 source: SourceIdentity::default(),
                 representations: Vec::new(),
+            },
+        }
+    }
+
+    fn text_event(sequence_number: u32, text: &str) -> ClipboardEvent {
+        ClipboardEvent {
+            sequence_number,
+            captured: CapturedClipboard {
+                content_identity: ContentIdentity::new(format!("test:{sequence_number}")),
+                captured_at: Utc::now(),
+                source: SourceIdentity::default(),
+                representations: vec![ClipboardRepresentation::UnicodeText {
+                    text: text.to_owned(),
+                }],
             },
         }
     }

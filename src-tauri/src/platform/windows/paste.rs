@@ -20,8 +20,8 @@ use windows::Win32::{
         CloseHandle, ERROR_SUCCESS, FILETIME, GetLastError, HANDLE, HWND, SetLastError, WIN32_ERROR,
     },
     Security::{
-        GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, IsTokenRestricted,
-        TOKEN_MANDATORY_LABEL, TOKEN_QUERY, TokenIntegrityLevel, TokenIsAppContainer,
+        GetTokenInformation, IsTokenRestricted, IsValidSid, TOKEN_MANDATORY_LABEL, TOKEN_QUERY,
+        TokenIntegrityLevel, TokenIsAppContainer,
     },
     System::{
         RemoteDesktop::ProcessIdToSessionId,
@@ -1091,16 +1091,55 @@ fn token_security(process: HANDLE) -> Result<ProcessSecurity, WindowsPasteError>
 
 fn token_integrity(token: HANDLE) -> Result<u32, WindowsPasteError> {
     let buffer = token_information(token, TokenIntegrityLevel)?;
-    let label = unsafe { &*(buffer.as_ptr().cast::<TOKEN_MANDATORY_LABEL>()) };
+    parse_token_integrity(&buffer, |sid| unsafe { IsValidSid(sid).as_bool() })
+}
+
+fn parse_token_integrity(
+    buffer: &[u8],
+    is_valid_sid: impl FnOnce(windows::Win32::Security::PSID) -> bool,
+) -> Result<u32, WindowsPasteError> {
+    if buffer.len() < size_of::<TOKEN_MANDATORY_LABEL>() {
+        return Err(WindowsPasteError::TokenInformation);
+    }
+    let label =
+        unsafe { std::ptr::read_unaligned(buffer.as_ptr().cast::<TOKEN_MANDATORY_LABEL>()) };
     let sid = label.Label.Sid;
     if sid.0.is_null() {
         return Err(WindowsPasteError::TokenInformation);
     }
-    let count = unsafe { *GetSidSubAuthorityCount(sid) } as u32;
-    if count == 0 {
+    let start = buffer.as_ptr() as usize;
+    let end = start
+        .checked_add(buffer.len())
+        .ok_or(WindowsPasteError::TokenInformation)?;
+    let sid_start = sid.0 as usize;
+    let sid_header_end = sid_start
+        .checked_add(8)
+        .ok_or(WindowsPasteError::TokenInformation)?;
+    if sid_start < start || sid_header_end > end {
         return Err(WindowsPasteError::TokenInformation);
     }
-    Ok(unsafe { *GetSidSubAuthority(sid, count - 1) })
+    let count = usize::from(unsafe { std::ptr::read_unaligned((sid_start + 1) as *const u8) });
+    if count == 0 || count > 15 {
+        return Err(WindowsPasteError::TokenInformation);
+    }
+    let sid_len = 8usize
+        .checked_add(
+            count
+                .checked_mul(size_of::<u32>())
+                .ok_or(WindowsPasteError::TokenInformation)?,
+        )
+        .ok_or(WindowsPasteError::TokenInformation)?;
+    if sid_start
+        .checked_add(sid_len)
+        .is_none_or(|sid_end| sid_end > end)
+    {
+        return Err(WindowsPasteError::TokenInformation);
+    }
+    if !is_valid_sid(sid) {
+        return Err(WindowsPasteError::TokenInformation);
+    }
+    let integrity = sid_start + 8 + (count - 1) * size_of::<u32>();
+    Ok(unsafe { std::ptr::read_unaligned(integrity as *const u32) })
 }
 
 fn token_u32(
@@ -1154,17 +1193,22 @@ fn token_information(
     if needed == 0 {
         return Err(WindowsPasteError::TokenInformation);
     }
-    let mut buffer = vec![0u8; needed as usize];
+    let allocated = needed;
+    let mut buffer = vec![0u8; allocated as usize];
     unsafe {
         GetTokenInformation(
             token,
             class,
             Some(buffer.as_mut_ptr().cast()),
-            needed,
+            allocated,
             &mut needed,
         )
     }
     .map_err(|_| WindowsPasteError::TokenInformation)?;
+    if needed == 0 || needed > allocated {
+        return Err(WindowsPasteError::TokenInformation);
+    }
+    buffer.truncate(needed as usize);
     Ok(buffer)
 }
 
@@ -2026,6 +2070,50 @@ mod tests {
             classify_token_restrictions(false, WIN32_ERROR(5)),
             Err(WindowsPasteError::TokenInformation)
         );
+    }
+
+    #[test]
+    fn token_integrity_parser_rejects_short_and_invalid_sid_buffers() {
+        assert_eq!(
+            parse_token_integrity(&[0; 2], |_| true),
+            Err(WindowsPasteError::TokenInformation)
+        );
+
+        let invalid = token_integrity_buffer(0, 1, 0x2000);
+        assert_eq!(
+            parse_token_integrity(&invalid[1..], |_| false),
+            Err(WindowsPasteError::TokenInformation)
+        );
+    }
+
+    #[test]
+    fn token_integrity_parser_handles_misaligned_buffers_without_struct_references() {
+        let buffer = token_integrity_buffer(1, 1, 0x3000);
+
+        assert_eq!(parse_token_integrity(&buffer[1..], |_| true), Ok(0x3000));
+    }
+
+    fn token_integrity_buffer(prefix: usize, subauthority_count: u8, integrity: u32) -> Vec<u8> {
+        let label_size = size_of::<TOKEN_MANDATORY_LABEL>();
+        let sid_size = 8 + usize::from(subauthority_count) * size_of::<u32>();
+        let mut buffer = vec![0u8; prefix + label_size + sid_size];
+        let base = unsafe { buffer.as_mut_ptr().add(prefix) };
+        let sid = unsafe { base.add(label_size) };
+        unsafe {
+            sid.write(1);
+            sid.add(1).write(subauthority_count);
+            if subauthority_count > 0 {
+                sid.add(8).cast::<u32>().write_unaligned(integrity);
+            }
+            let label = TOKEN_MANDATORY_LABEL {
+                Label: windows::Win32::Security::SID_AND_ATTRIBUTES {
+                    Sid: windows::Win32::Security::PSID(sid.cast()),
+                    Attributes: 0,
+                },
+            };
+            base.cast::<TOKEN_MANDATORY_LABEL>().write_unaligned(label);
+        }
+        buffer
     }
 
     #[test]

@@ -66,7 +66,7 @@ impl Drop for ClipboardRuntime {
 
 #[cfg(windows)]
 fn spawn_clipboard_event_drain(
-    events: std::sync::mpsc::Receiver<platform::windows::clipboard::ClipboardEvent>,
+    events: platform::windows::clipboard::LatestClipboardEventReceiver,
     records: Arc<SessionRecordStore>,
     on_change: impl Fn() + Send + 'static,
 ) -> std::io::Result<(std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>)> {
@@ -96,7 +96,7 @@ mod runtime_tests {
     use super::spawn_clipboard_event_drain;
     use crate::{
         domain::{CapturedClipboard, ClipboardRepresentation, ContentIdentity, SourceIdentity},
-        platform::windows::clipboard::ClipboardEvent,
+        platform::windows::clipboard::{ClipboardEvent, latest_clipboard_event_channel},
         services::session_records::SessionRecordStore,
     };
     use chrono::Utc;
@@ -104,7 +104,7 @@ mod runtime_tests {
 
     #[test]
     fn clipboard_event_drain_stops_even_when_event_senders_remain_alive() {
-        let (events, receiver) = std::sync::mpsc::channel();
+        let (events, receiver) = latest_clipboard_event_channel();
         let retained_sender = events.clone();
         let (stop, thread) =
             spawn_clipboard_event_drain(receiver, Arc::new(SessionRecordStore::default()), || {})
@@ -127,7 +127,7 @@ mod runtime_tests {
 
     #[test]
     fn clipboard_event_drain_exposes_real_captures_to_the_session_store() {
-        let (events, receiver) = std::sync::mpsc::channel();
+        let (events, receiver) = latest_clipboard_event_channel();
         let records = Arc::new(SessionRecordStore::default());
         let (stop, thread) =
             spawn_clipboard_event_drain(receiver, Arc::clone(&records), || {}).unwrap();
@@ -247,7 +247,8 @@ pub fn run() {
             platform::windows::configure_quick_panel_style(panel.hwnd()?)?;
             let panel_controller = Arc::new(PanelController::new(panel));
             let session_records = Arc::new(SessionRecordStore::default());
-            let (clipboard_events, clipboard_receiver) = std::sync::mpsc::channel();
+            let (clipboard_events, clipboard_receiver) =
+                platform::windows::clipboard::latest_clipboard_event_channel();
             let listener =
                 platform::windows::clipboard::ClipboardListener::start(clipboard_events)?;
             let app_handle = app.handle().clone();

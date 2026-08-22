@@ -80,29 +80,54 @@ function QuickPanel({ commands }: { commands: AppCommands }) {
   const [query, setQuery] = useState("");
   const [status, setStatus] = useState<string | null>(null);
   const [statusIsError, setStatusIsError] = useState(false);
+  const [historyError, setHistoryError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  const mounted = useRef(true);
+  const refreshGeneration = useRef(0);
+  const noteRevisions = useRef(new Map<string, number>());
 
   const refresh = useCallback(async () => {
-    const next = await commands.listSessionRecords();
-    setRecords(next);
-    setSelectedId((current) =>
-      current && next.some((record) => record.id === current)
-        ? current
-        : (next[0]?.id ?? null),
-    );
-    setLoading(false);
+    const generation = ++refreshGeneration.current;
+    try {
+      const next = await commands.listSessionRecords();
+      if (!mounted.current || generation !== refreshGeneration.current) return;
+      setRecords(next);
+      setSelectedId((current) =>
+        current && next.some((record) => record.id === current)
+          ? current
+          : (next[0]?.id ?? null),
+      );
+      setHistoryError(null);
+    } catch {
+      if (!mounted.current || generation !== refreshGeneration.current) return;
+      setHistoryError("Clipboard history is unavailable");
+    } finally {
+      if (mounted.current && generation === refreshGeneration.current) {
+        setLoading(false);
+      }
+    }
   }, [commands]);
 
   useEffect(() => {
+    mounted.current = true;
     void refresh();
     let disposed = false;
     let unsubscribe: (() => void) | undefined;
-    void commands.subscribeRecordsChanged(() => void refresh()).then((stop) => {
-      if (disposed) stop();
-      else unsubscribe = stop;
-    });
+    void commands
+      .subscribeRecordsChanged(() => void refresh())
+      .then((stop) => {
+        if (disposed) stop();
+        else unsubscribe = stop;
+      })
+      .catch(() => {
+        if (!disposed && mounted.current) {
+          setHistoryError("Clipboard history is unavailable");
+        }
+      });
     return () => {
       disposed = true;
+      mounted.current = false;
+      refreshGeneration.current += 1;
       unsubscribe?.();
     };
   }, [commands, refresh]);
@@ -143,10 +168,26 @@ function QuickPanel({ commands }: { commands: AppCommands }) {
   };
 
   const saveNote = async (recordId: string, note: string) => {
-    const updated = await commands.updateRecordNote(recordId, note);
-    setRecords((current) =>
-      current.map((record) => (record.id === recordId ? updated : record)),
-    );
+    const revision = (noteRevisions.current.get(recordId) ?? 0) + 1;
+    noteRevisions.current.set(recordId, revision);
+    try {
+      const updated = await commands.updateRecordNote(recordId, note);
+      if (!mounted.current || noteRevisions.current.get(recordId) !== revision) {
+        return false;
+      }
+      setRecords((current) =>
+        current.map((record) => (record.id === recordId ? updated : record)),
+      );
+      setStatus((current) => current === "Note was not saved" ? null : current);
+      setStatusIsError(false);
+      return true;
+    } catch {
+      if (mounted.current && noteRevisions.current.get(recordId) === revision) {
+        setStatusIsError(true);
+        setStatus("Note was not saved");
+      }
+      return false;
+    }
   };
 
   return (
@@ -171,7 +212,7 @@ function QuickPanel({ commands }: { commands: AppCommands }) {
           <ClipboardItem key={record.id} record={record} index={index} selected={record.id === selectedId} onSelect={() => setSelectedId(record.id)} onPaste={() => void paste(record.id)} onSaveNote={(note) => saveNote(record.id, note)} />
         ))}
       </section>
-      {status && <div className={`outcome${statusIsError ? " error" : ""}`} role={statusIsError ? "alert" : "status"}>{status}</div>}
+      {(status ?? historyError) && <div className={`outcome${statusIsError || historyError ? " error" : ""}`} role={statusIsError || historyError ? "alert" : "status"}>{status ?? historyError}</div>}
       <footer className="quick-footer"><span>Enter to paste</span><span>Esc to close</span></footer>
     </main>
   );
@@ -183,11 +224,30 @@ function ClipboardItem({ record, index, selected, onSelect, onPaste, onSaveNote 
   selected: boolean;
   onSelect(): void;
   onPaste(): void;
-  onSaveNote(note: string): Promise<void>;
+  onSaveNote(note: string): Promise<boolean>;
 }) {
   const [note, setNote] = useState(record.note ?? "");
   const skipNextBlurSave = useRef(false);
-  useEffect(() => setNote(record.note ?? ""), [record.note]);
+  const noteRef = useRef(note);
+  const dirty = useRef(false);
+  useEffect(() => {
+    const saved = record.note ?? "";
+    if (!dirty.current || saved === noteRef.current) {
+      noteRef.current = saved;
+      setNote(saved);
+      dirty.current = false;
+    }
+  }, [record.note]);
+  const updateNote = (value: string) => {
+    const limited = limitUnicode(value, 200);
+    noteRef.current = limited;
+    dirty.current = limited !== (record.note ?? "");
+    setNote(limited);
+  };
+  const save = async (value: string) => {
+    const saved = await onSaveNote(value);
+    if (saved && noteRef.current === value) dirty.current = false;
+  };
   const description = record.text ?? (record.hasImage ? "Image clipboard item" : "Clipboard item");
   return (
     <article className={`clipboard-item${selected ? " selected" : ""}`} tabIndex={0} aria-selected={selected} onClick={onSelect} onDoubleClick={onPaste} onKeyDown={(event) => {
@@ -197,13 +257,13 @@ function ClipboardItem({ record, index, selected, onSelect, onPaste, onSaveNote 
       <div className="item-content">
         <div className="item-meta"><span>{record.sourceApplication ?? "Unknown app"}</span><time>{formatTime(record.capturedAt)}</time>{record.hasImage && <Image size={13} aria-label="Contains image" />}</div>
         <p className="item-text">{description}</p>
-        <input className="note-input" value={note} placeholder="Add a note" aria-label={`Note for ${description}`} onClick={(event) => event.stopPropagation()} onDoubleClick={(event) => event.stopPropagation()} onChange={(event) => setNote(limitUnicode(event.currentTarget.value, 200))} onKeyDown={(event) => {
+        <input className="note-input" value={note} placeholder="Add a note" aria-label={`Note for ${description}`} onClick={(event) => event.stopPropagation()} onDoubleClick={(event) => event.stopPropagation()} onChange={(event) => updateNote(event.currentTarget.value)} onKeyDown={(event) => {
           event.stopPropagation();
-          if (event.key === "Enter") { event.preventDefault(); skipNextBlurSave.current = true; void onSaveNote(note); event.currentTarget.blur(); }
-          if (event.key === "Escape") { skipNextBlurSave.current = true; setNote(record.note ?? ""); event.currentTarget.blur(); }
+          if (event.key === "Enter") { event.preventDefault(); skipNextBlurSave.current = true; void save(note); event.currentTarget.blur(); }
+          if (event.key === "Escape") { skipNextBlurSave.current = true; updateNote(record.note ?? ""); event.currentTarget.blur(); }
         }} onBlur={() => {
           if (skipNextBlurSave.current) { skipNextBlurSave.current = false; return; }
-          if (note !== (record.note ?? "")) void onSaveNote(note);
+          if (note !== (record.note ?? "")) void save(note);
         }} />
       </div>
     </article>
