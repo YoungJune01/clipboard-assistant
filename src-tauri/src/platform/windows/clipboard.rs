@@ -10,7 +10,7 @@ use std::{
         mpsc::{RecvTimeoutError, Sender, sync_channel},
     },
     thread::{self, JoinHandle},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use chrono::Utc;
@@ -163,36 +163,86 @@ impl ClipboardListener {
 
 impl ClipboardPublisher {
     pub fn begin_product_write(&self) -> Result<ProductWriteGuard, ClipboardListenerError> {
-        let baseline = unsafe { GetClipboardSequenceNumber() };
-        let mut state = lock_unpoisoned(&self.product_write);
-        let expired_pending = match &mut *state {
-            ProductWriteState::Armed {
-                pending, deadline, ..
-            } if Instant::now() >= *deadline => {
-                let pending = std::mem::take(pending);
-                *state = ProductWriteState::Idle;
-                pending
-            }
-            _ => VecDeque::new(),
-        };
-        if !matches!(*state, ProductWriteState::Idle) {
-            return Err(ClipboardListenerError::ProductWriteAlreadyInProgress);
-        }
-        let armed = ProductWriteState::armed(baseline);
-        let transaction_id = armed.transaction_id().expect("armed state has an id");
-        *state = armed;
-        drop(state);
-        for event in expired_pending {
-            let _ = self.events.send(event);
-        }
-        Ok(ProductWriteGuard {
-            state: Arc::clone(&self.product_write),
-            events: self.events.clone(),
-            transaction_id,
-            finished: false,
-        })
+        self.begin_product_write_with_timeout(PRODUCT_WRITE_TRANSACTION_TIMEOUT)
     }
 
+    fn begin_product_write_with_timeout(
+        &self,
+        timeout: Duration,
+    ) -> Result<ProductWriteGuard, ClipboardListenerError> {
+        let baseline = unsafe { GetClipboardSequenceNumber() };
+        begin_product_write_transaction(
+            Arc::clone(&self.product_write),
+            self.events.clone(),
+            baseline,
+            timeout,
+        )
+    }
+}
+
+fn begin_product_write_transaction(
+    product_write: Arc<Mutex<ProductWriteState>>,
+    events: Sender<ClipboardEvent>,
+    baseline: u32,
+    timeout: Duration,
+) -> Result<ProductWriteGuard, ClipboardListenerError> {
+    begin_product_write_transaction_with_spawner(
+        product_write,
+        events,
+        baseline,
+        timeout,
+        spawn_product_write_timeout,
+    )
+}
+
+fn begin_product_write_transaction_with_spawner(
+    product_write: Arc<Mutex<ProductWriteState>>,
+    events: Sender<ClipboardEvent>,
+    baseline: u32,
+    timeout: Duration,
+    spawn_timeout: impl FnOnce(
+        Arc<Mutex<ProductWriteState>>,
+        Sender<ClipboardEvent>,
+        u64,
+        Duration,
+        std::sync::mpsc::Receiver<()>,
+    ) -> Result<JoinHandle<()>, ClipboardListenerError>,
+) -> Result<ProductWriteGuard, ClipboardListenerError> {
+    let mut state = lock_unpoisoned(&product_write);
+    if !matches!(*state, ProductWriteState::Idle) {
+        return Err(ClipboardListenerError::ProductWriteAlreadyInProgress);
+    }
+    let armed = ProductWriteState::armed(baseline);
+    let transaction_id = armed.transaction_id().expect("armed state has an id");
+    *state = armed;
+    let (cancel_timeout, timeout_cancelled) = sync_channel(1);
+    let timeout_thread = match spawn_timeout(
+        Arc::clone(&product_write),
+        events.clone(),
+        transaction_id,
+        timeout,
+        timeout_cancelled,
+    ) {
+        Ok(thread) => thread,
+        Err(error) => {
+            if state.transaction_id() == Some(transaction_id) {
+                *state = ProductWriteState::Idle;
+            }
+            return Err(error);
+        }
+    };
+    drop(state);
+    Ok(ProductWriteGuard {
+        state: product_write,
+        events,
+        transaction_id,
+        cancel_timeout: Some(cancel_timeout),
+        timeout_thread: Some(timeout_thread),
+        finished: false,
+    })
+}
+
+impl ClipboardPublisher {
     pub fn publish(
         &self,
         representations: &[ClipboardRepresentation],
@@ -745,34 +795,19 @@ fn route_event(
     events: &Sender<ClipboardEvent>,
     event: ClipboardEvent,
 ) {
-    let events_to_send = {
-        let mut state = lock_unpoisoned(state);
-        match &mut *state {
-            ProductWriteState::Armed {
-                pending, deadline, ..
-            } if Instant::now() >= *deadline => {
-                let mut pending = std::mem::take(pending);
-                pending.push_back(event);
-                *state = ProductWriteState::Idle;
-                pending
-            }
-            ProductWriteState::Armed { pending, .. } => {
-                pending.push_back(event);
-                VecDeque::new()
-            }
-            ProductWriteState::Expected { sequence } if *sequence == event.sequence_number => {
-                *state = ProductWriteState::Idle;
-                VecDeque::new()
-            }
-            ProductWriteState::Expected { .. } => {
-                *state = ProductWriteState::Idle;
-                VecDeque::from([event])
-            }
-            ProductWriteState::Idle => VecDeque::from([event]),
+    let mut state = lock_unpoisoned(state);
+    match &mut *state {
+        ProductWriteState::Armed { pending, .. } => pending.push_back(event),
+        ProductWriteState::Expected { sequence } if *sequence == event.sequence_number => {
+            *state = ProductWriteState::Idle;
         }
-    };
-    for event in events_to_send {
-        let _ = events.send(event);
+        ProductWriteState::Expected { .. } => {
+            *state = ProductWriteState::Idle;
+            let _ = events.send(event);
+        }
+        ProductWriteState::Idle => {
+            let _ = events.send(event);
+        }
     }
 }
 
@@ -783,7 +818,6 @@ pub(super) enum ProductWriteState {
         transaction_id: u64,
         baseline: u32,
         pending: VecDeque<ClipboardEvent>,
-        deadline: Instant,
     },
     Expected {
         sequence: u32,
@@ -796,7 +830,6 @@ impl ProductWriteState {
             transaction_id: NEXT_PRODUCT_WRITE_TRANSACTION.fetch_add(1, Ordering::Relaxed),
             baseline,
             pending: VecDeque::new(),
-            deadline: Instant::now() + PRODUCT_WRITE_TRANSACTION_TIMEOUT,
         }
     }
 
@@ -812,11 +845,14 @@ pub struct ProductWriteGuard {
     state: Arc<Mutex<ProductWriteState>>,
     events: Sender<ClipboardEvent>,
     transaction_id: u64,
+    cancel_timeout: Option<std::sync::mpsc::SyncSender<()>>,
+    timeout_thread: Option<JoinHandle<()>>,
     finished: bool,
 }
 
 impl ProductWriteGuard {
     pub fn finish(mut self, owned_sequences: &[u32]) {
+        self.stop_timeout();
         let mut state = lock_unpoisoned(&self.state);
         if state.transaction_id() != Some(self.transaction_id) {
             self.finished = true;
@@ -848,7 +884,6 @@ impl ProductWriteGuard {
                     }
                     _ => *state = ProductWriteState::Idle,
                 }
-                drop(state);
                 for event in pending_to_send {
                     let _ = self.events.send(event);
                 }
@@ -866,18 +901,16 @@ impl ProductWriteGuard {
     }
 
     fn cancel_inner(&mut self) {
-        let pending = {
-            let mut state = lock_unpoisoned(&self.state);
-            if state.transaction_id() != Some(self.transaction_id) {
-                return;
-            }
-            match std::mem::replace(&mut *state, ProductWriteState::Idle) {
-                ProductWriteState::Armed { pending, .. } => pending,
-                _ => VecDeque::new(),
-            }
-        };
-        for event in pending {
-            let _ = self.events.send(event);
+        self.stop_timeout();
+        cancel_product_write(&self.state, &self.events, self.transaction_id);
+    }
+
+    fn stop_timeout(&mut self) {
+        if let Some(cancel) = self.cancel_timeout.take() {
+            let _ = cancel.send(());
+        }
+        if let Some(thread) = self.timeout_thread.take() {
+            let _ = thread.join();
         }
     }
 }
@@ -886,6 +919,42 @@ impl Drop for ProductWriteGuard {
     fn drop(&mut self) {
         if !self.finished {
             self.cancel_inner();
+        }
+    }
+}
+
+fn spawn_product_write_timeout(
+    state: Arc<Mutex<ProductWriteState>>,
+    events: Sender<ClipboardEvent>,
+    transaction_id: u64,
+    timeout: Duration,
+    cancelled: std::sync::mpsc::Receiver<()>,
+) -> Result<JoinHandle<()>, ClipboardListenerError> {
+    thread::Builder::new()
+        .name("clipboard-product-write-timeout".to_owned())
+        .spawn(move || match cancelled.recv_timeout(timeout) {
+            Err(RecvTimeoutError::Timeout) => {
+                cancel_product_write(&state, &events, transaction_id);
+            }
+            Ok(()) | Err(RecvTimeoutError::Disconnected) => {}
+        })
+        .map_err(ClipboardListenerError::ThreadSpawn)
+}
+
+fn cancel_product_write(
+    state: &Mutex<ProductWriteState>,
+    events: &Sender<ClipboardEvent>,
+    transaction_id: u64,
+) {
+    let mut state = lock_unpoisoned(state);
+    if state.transaction_id() != Some(transaction_id) {
+        return;
+    }
+    if let ProductWriteState::Armed { pending, .. } =
+        std::mem::replace(&mut *state, ProductWriteState::Idle)
+    {
+        for event in pending {
+            let _ = events.send(event);
         }
     }
 }
@@ -1306,9 +1375,8 @@ pub(super) type ShutdownReceiver = std::sync::mpsc::Receiver<()>;
 mod tests {
     use std::{
         cell::RefCell,
-        collections::VecDeque,
-        sync::{Arc, Mutex, mpsc},
-        time::{Duration, Instant},
+        sync::{Arc, Barrier, Mutex, mpsc},
+        time::Duration,
     };
 
     use chrono::Utc;
@@ -1316,10 +1384,11 @@ mod tests {
     use super::{
         ClipboardEvent, ClipboardListenerError, ClipboardPayloadKind, ClipboardReadError,
         ClipboardWriteError, MAX_IMAGE_PAYLOAD_BYTES, MAX_TEXT_PAYLOAD_BYTES, ProductWriteGuard,
-        ProductWriteState, ReadyWait, ShutdownFailure, classify_format_read,
-        classify_global_unlock, classify_payload_size, classify_registered_format,
-        combine_clipboard_operation_and_close, decode_unicode_text, finish_product_write,
-        orchestrate_listener_initialization, route_event, validate_representations,
+        ProductWriteState, ReadyWait, ShutdownFailure, begin_product_write_transaction,
+        begin_product_write_transaction_with_spawner, classify_format_read, classify_global_unlock,
+        classify_payload_size, classify_registered_format, combine_clipboard_operation_and_close,
+        decode_unicode_text, finish_product_write, orchestrate_listener_initialization,
+        route_event, validate_representations,
     };
     use crate::domain::{
         CapturedClipboard, ClipboardRepresentation, ContentIdentity, SourceIdentity,
@@ -1448,51 +1517,108 @@ mod tests {
     }
 
     #[test]
-    fn expired_owned_write_replays_all_pending_events_and_current_event_in_order() {
+    fn cancelling_and_routing_share_one_global_ordering_boundary() {
         let (events, receiver) = mpsc::channel();
         let state = Arc::new(Mutex::new(ProductWriteState::armed(120)));
-        {
-            let mut state = state.lock().unwrap();
-            let ProductWriteState::Armed {
-                pending, deadline, ..
-            } = &mut *state
-            else {
-                panic!("expected armed product write");
-            };
-            *pending = VecDeque::from([event(121), event(122)]);
-            *deadline = Instant::now() - Duration::from_millis(1);
-        }
-
-        route_event(&state, &events, event(123));
+        route_event(&state, &events, event(121));
+        let guard = product_write_guard(Arc::clone(&state), events.clone());
+        let locked = state.lock().unwrap();
+        let barrier = Arc::new(Barrier::new(2));
+        let route_thread = {
+            let state = Arc::clone(&state);
+            let events = events.clone();
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                route_event(&state, &events, event(122));
+            })
+        };
+        barrier.wait();
+        drop(locked);
+        guard.cancel();
+        route_thread.join().unwrap();
 
         assert_eq!(
             receiver
                 .try_iter()
                 .map(|event| event.sequence_number)
                 .collect::<Vec<_>>(),
-            [121, 122, 123]
+            [121, 122]
         );
+    }
+
+    #[test]
+    fn deadline_replays_pending_without_any_later_clipboard_operation() {
+        let (events, receiver) = mpsc::channel();
+        let state = Arc::new(Mutex::new(ProductWriteState::Idle));
+        let guard = begin_product_write_transaction(
+            Arc::clone(&state),
+            events.clone(),
+            120,
+            Duration::from_millis(20),
+        )
+        .unwrap();
+        route_event(&state, &events, event(121));
+
+        assert_eq!(
+            receiver
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .sequence_number,
+            121
+        );
+        assert!(matches!(*state.lock().unwrap(), ProductWriteState::Idle));
+        drop(guard);
+    }
+
+    #[test]
+    fn timeout_thread_spawn_failure_restores_idle_state() {
+        let (events, _receiver) = mpsc::channel();
+        let state = Arc::new(Mutex::new(ProductWriteState::Idle));
+
+        let result = begin_product_write_transaction_with_spawner(
+            Arc::clone(&state),
+            events,
+            120,
+            Duration::from_secs(1),
+            |_, _, _, _, _| {
+                Err(ClipboardListenerError::ThreadSpawn(std::io::Error::other(
+                    "forced timeout thread spawn failure",
+                )))
+            },
+        );
+
+        assert!(matches!(
+            result,
+            Err(ClipboardListenerError::ThreadSpawn(_))
+        ));
         assert!(matches!(*state.lock().unwrap(), ProductWriteState::Idle));
     }
 
     #[test]
-    fn expired_guard_cannot_cancel_a_newer_product_write_transaction() {
+    fn old_deadline_cannot_cancel_a_newer_product_write_transaction() {
         let (events, receiver) = mpsc::channel();
-        let state = Arc::new(Mutex::new(ProductWriteState::armed(120)));
-        let expired_guard = product_write_guard(Arc::clone(&state), events.clone());
-        {
-            let mut state = state.lock().unwrap();
-            let ProductWriteState::Armed { deadline, .. } = &mut *state else {
-                panic!("expected armed product write");
-            };
-            *deadline = Instant::now() - Duration::from_millis(1);
-        }
+        let state = Arc::new(Mutex::new(ProductWriteState::Idle));
+        let old_guard = begin_product_write_transaction(
+            Arc::clone(&state),
+            events.clone(),
+            120,
+            Duration::from_millis(20),
+        )
+        .unwrap();
+        let old_transaction_id = old_guard.transaction_id;
         route_event(&state, &events, event(121));
+        std::thread::sleep(Duration::from_millis(50));
 
-        *state.lock().unwrap() = ProductWriteState::armed(130);
-        let new_transaction_id = state.lock().unwrap().transaction_id().unwrap();
+        let new_guard = begin_product_write_transaction(
+            Arc::clone(&state),
+            events.clone(),
+            130,
+            Duration::from_secs(1),
+        )
+        .unwrap();
         route_event(&state, &events, event(131));
-        drop(expired_guard);
+        super::cancel_product_write(&state, &events, old_transaction_id);
 
         match &*state.lock().unwrap() {
             ProductWriteState::Armed {
@@ -1500,7 +1626,7 @@ mod tests {
                 pending,
                 ..
             } => {
-                assert_eq!(*transaction_id, new_transaction_id);
+                assert_eq!(*transaction_id, new_guard.transaction_id);
                 assert_eq!(
                     pending
                         .iter()
@@ -1512,7 +1638,8 @@ mod tests {
             state => panic!("expected newer armed state, got {state:?}"),
         }
 
-        product_write_guard(state, events).cancel();
+        drop(old_guard);
+        new_guard.cancel();
         assert_eq!(
             receiver
                 .try_iter()
@@ -1535,6 +1662,8 @@ mod tests {
             state,
             events,
             transaction_id,
+            cancel_timeout: None,
+            timeout_thread: None,
             finished: false,
         }
     }
