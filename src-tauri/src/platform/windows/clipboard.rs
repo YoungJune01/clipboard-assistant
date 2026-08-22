@@ -36,7 +36,8 @@ use super::message_loop::{ListenerState, run_message_loop, wake_and_join};
 const CF_UNICODETEXT_FORMAT: u32 = 13;
 const CF_DIBV5_FORMAT: u32 = 17;
 const MAX_TEXT_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
-const MAX_IMAGE_PAYLOAD_BYTES: usize = 256 * 1024 * 1024;
+const MAX_IMAGE_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
+const MAX_CAPTURE_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
 const PRODUCT_WRITE_TRANSACTION_TIMEOUT: Duration = Duration::from_secs(2);
 const PRODUCT_WRITE_PENDING_BYTES: usize = 16 * 1024 * 1024;
 const LISTENER_INITIALIZATION_TIMEOUT: Duration = Duration::from_secs(3);
@@ -212,6 +213,9 @@ fn begin_product_write_transaction_with_spawner(
     ) -> Result<JoinHandle<()>, ClipboardListenerError>,
 ) -> Result<ProductWriteGuard, ClipboardListenerError> {
     let events = events.into();
+    if events.has_pending_atomic_batch() {
+        return Err(ClipboardListenerError::ProductWriteAlreadyInProgress);
+    }
     let mut state = lock_unpoisoned(&product_write);
     if !matches!(*state, ProductWriteState::Idle) {
         return Err(ClipboardListenerError::ProductWriteAlreadyInProgress);
@@ -255,8 +259,7 @@ impl ClipboardPublisher {
         let ownership = self
             .begin_product_write()
             .map_err(ClipboardWriteError::Ownership)?;
-        let attempt = write_representations(representations);
-        finish_product_write(ownership, &attempt.owned_sequences);
+        let attempt = write_representations(representations, ownership);
         attempt.result
     }
 }
@@ -389,7 +392,6 @@ fn validate_representations(
 
 struct ClipboardWriteAttempt {
     result: Result<u32, ClipboardWriteError>,
-    owned_sequences: Vec<u32>,
 }
 
 fn finish_product_write(ownership: ProductWriteGuard, owned_sequences: &[u32]) {
@@ -400,21 +402,24 @@ fn finish_product_write(ownership: ProductWriteGuard, owned_sequences: &[u32]) {
     }
 }
 
-fn write_representations(representations: &[ClipboardRepresentation]) -> ClipboardWriteAttempt {
+fn write_representations(
+    representations: &[ClipboardRepresentation],
+    mut ownership: ProductWriteGuard,
+) -> ClipboardWriteAttempt {
     let clipboard = match ClipboardWriteGuard::open_with_retry() {
         Ok(clipboard) => clipboard,
         Err(error) => {
-            return ClipboardWriteAttempt {
-                result: Err(error),
-                owned_sequences: Vec::new(),
-            };
+            ownership.cancel();
+            return ClipboardWriteAttempt { result: Err(error) };
         }
     };
     let mut owned_sequences = Vec::new();
     let operation = (|| {
-        unsafe { EmptyClipboard() }
-            .map_err(|error| ClipboardWriteError::Windows(ClipboardWriteOperation::Empty, error))?;
-        record_owned_sequence(&mut owned_sequences);
+        ownership.perform_owned_change(&mut owned_sequences, || {
+            unsafe { EmptyClipboard() }.map_err(|error| {
+                ClipboardWriteError::Windows(ClipboardWriteOperation::Empty, error)
+            })
+        })?;
         let mut published = 0usize;
         for representation in representations {
             let (format, bytes) = match representation {
@@ -442,8 +447,9 @@ fn write_representations(representations: &[ClipboardRepresentation]) -> Clipboa
                 }
                 ClipboardRepresentation::DibV5 { bytes } => (CF_DIBV5_FORMAT, bytes.clone()),
             };
-            publish_global_bytes(format, &bytes)?;
-            record_owned_sequence(&mut owned_sequences);
+            ownership.perform_owned_change(&mut owned_sequences, || {
+                publish_global_bytes(format, &bytes)
+            })?;
             published += 1;
         }
         if published == 0 {
@@ -467,10 +473,8 @@ fn write_representations(representations: &[ClipboardRepresentation]) -> Clipboa
             close,
         }),
     };
-    ClipboardWriteAttempt {
-        result,
-        owned_sequences,
-    }
+    finish_product_write(ownership, &owned_sequences);
+    ClipboardWriteAttempt { result }
 }
 
 fn record_owned_sequence(owned_sequences: &mut Vec<u32>) {
@@ -805,9 +809,13 @@ fn route_event(
             pending,
             pending_bytes,
             pending_budget,
+            owned_sequences,
             ..
         } => {
             let event_bytes = clipboard_event_bytes(&event);
+            if owned_sequences.contains(&event.sequence_number) {
+                return;
+            }
             if pending_bytes
                 .checked_add(event_bytes)
                 .is_some_and(|bytes| bytes <= *pending_budget)
@@ -816,12 +824,18 @@ fn route_event(
                 pending.push_back(event);
             } else {
                 let previous = std::mem::replace(&mut *state, ProductWriteState::Idle);
-                if let ProductWriteState::Armed { pending, .. } = previous {
-                    for pending_event in pending {
-                        let _ = events.send_event(pending_event);
-                    }
-                }
-                let _ = events.send_event(event);
+                let ProductWriteState::Armed {
+                    pending,
+                    owned_sequences,
+                    ..
+                } = previous
+                else {
+                    unreachable!("matched armed product write state")
+                };
+                let mut batch: Vec<_> = pending.into_iter().collect();
+                batch.push(event);
+                batch.retain(|event| !owned_sequences.contains(&event.sequence_number));
+                let _ = events.send_batch(batch);
             }
         }
         ProductWriteState::Expected { sequence } if *sequence == event.sequence_number => {
@@ -846,6 +860,7 @@ pub(super) enum ProductWriteState {
         pending: VecDeque<ClipboardEvent>,
         pending_bytes: usize,
         pending_budget: usize,
+        owned_sequences: Vec<u32>,
     },
     Expected {
         sequence: u32,
@@ -864,6 +879,7 @@ impl ProductWriteState {
             pending: VecDeque::new(),
             pending_bytes: 0,
             pending_budget,
+            owned_sequences: Vec::new(),
         }
     }
 
@@ -885,6 +901,55 @@ pub struct ProductWriteGuard {
 }
 
 impl ProductWriteGuard {
+    #[cfg(test)]
+    fn note_owned_sequences(&mut self, sequences: &[u32]) {
+        let mut state = lock_unpoisoned(&self.state);
+        if let ProductWriteState::Armed {
+            transaction_id,
+            owned_sequences,
+            ..
+        } = &mut *state
+            && *transaction_id == self.transaction_id
+        {
+            for sequence in sequences {
+                if !owned_sequences.contains(sequence) {
+                    owned_sequences.push(*sequence);
+                }
+            }
+        }
+    }
+
+    fn perform_owned_change(
+        &mut self,
+        sequences: &mut Vec<u32>,
+        change: impl FnOnce() -> Result<(), ClipboardWriteError>,
+    ) -> Result<(), ClipboardWriteError> {
+        let mut state = lock_unpoisoned(&self.state);
+        let ProductWriteState::Armed {
+            transaction_id,
+            owned_sequences,
+            ..
+        } = &mut *state
+        else {
+            return Err(ClipboardWriteError::Ownership(
+                ClipboardListenerError::ProductWriteAlreadyInProgress,
+            ));
+        };
+        if *transaction_id != self.transaction_id {
+            return Err(ClipboardWriteError::Ownership(
+                ClipboardListenerError::ProductWriteAlreadyInProgress,
+            ));
+        }
+        change()?;
+        record_owned_sequence(sequences);
+        if let Some(sequence) = sequences.last().copied()
+            && !owned_sequences.contains(&sequence)
+        {
+            owned_sequences.push(sequence);
+        }
+        Ok(())
+    }
+
     pub fn finish(mut self, owned_sequences: &[u32]) {
         self.stop_timeout();
         let mut state = lock_unpoisoned(&self.state);
@@ -918,9 +983,7 @@ impl ProductWriteGuard {
                     }
                     _ => *state = ProductWriteState::Idle,
                 }
-                for event in pending_to_send {
-                    let _ = self.events.send(event);
-                }
+                let _ = self.events.send_batch(pending_to_send);
                 self.finished = true;
                 return;
             }
@@ -987,9 +1050,7 @@ fn cancel_product_write(
     if let ProductWriteState::Armed { pending, .. } =
         std::mem::replace(&mut *state, ProductWriteState::Idle)
     {
-        for event in pending {
-            let _ = events.send_event(event);
-        }
+        let _ = events.send_batch(pending.into_iter().collect());
     }
 }
 
@@ -1001,24 +1062,12 @@ fn read_supported_representations()
         unsafe { SetLastError(ERROR_SUCCESS) };
         let png_format = unsafe { RegisterClipboardFormatW(w!("PNG")) };
         let png_format = classify_registered_format(png_format, unsafe { GetLastError() }.0)?;
-        let mut representations = Vec::with_capacity(3);
-        if let Some(text) = read_unicode_text(CF_UNICODETEXT_FORMAT)? {
-            representations.push(ClipboardRepresentation::UnicodeText { text });
-        }
-        if let Some(bytes) = read_global_bytes(
+        let representations = read_bounded_representations(
+            &Win32ClipboardMemory,
             png_format,
-            MAX_IMAGE_PAYLOAD_BYTES,
-            ClipboardPayloadKind::Image,
-        )? {
-            representations.push(ClipboardRepresentation::Png { bytes });
-        }
-        if let Some(bytes) = read_global_bytes(
             CF_DIBV5_FORMAT,
-            MAX_IMAGE_PAYLOAD_BYTES,
-            ClipboardPayloadKind::Image,
-        )? {
-            representations.push(ClipboardRepresentation::DibV5 { bytes });
-        }
+            MAX_CAPTURE_PAYLOAD_BYTES,
+        )?;
         Ok((sequence_number, representations))
     })();
     combine_clipboard_operation_and_close(operation, clipboard.close())
@@ -1029,11 +1078,6 @@ fn read_supported_representations()
 enum ClipboardReadError {
     Windows(ClipboardReadOperation, windows::core::Error),
     InvalidUnicodeText(UnicodeTextError),
-    PayloadTooLarge {
-        kind: ClipboardPayloadKind,
-        size: usize,
-        limit: usize,
-    },
     OperationAndClose {
         operation: Box<ClipboardReadError>,
         close: windows::core::Error,
@@ -1047,10 +1091,6 @@ impl fmt::Display for ClipboardReadError {
             Self::InvalidUnicodeText(reason) => {
                 write!(formatter, "clipboard Unicode text is {reason}")
             }
-            Self::PayloadTooLarge { kind, size, limit } => write!(
-                formatter,
-                "clipboard {kind} payload size {size} exceeds the supported limit {limit}"
-            ),
             Self::OperationAndClose { operation, .. } => {
                 write!(formatter, "{operation}; closing clipboard also failed")
             }
@@ -1066,23 +1106,8 @@ impl Error for ClipboardReadError {
                 let _ = close;
                 Some(operation)
             }
-            Self::InvalidUnicodeText(_) | Self::PayloadTooLarge { .. } => None,
+            Self::InvalidUnicodeText(_) => None,
         }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ClipboardPayloadKind {
-    UnicodeText,
-    Image,
-}
-
-impl fmt::Display for ClipboardPayloadKind {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(match self {
-            Self::UnicodeText => "Unicode text",
-            Self::Image => "image",
-        })
     }
 }
 
@@ -1187,31 +1212,54 @@ impl Drop for ClipboardGuard {
     }
 }
 
-fn read_unicode_text(format: u32) -> Result<Option<String>, ClipboardReadError> {
-    read_global_bytes(
-        format,
-        MAX_TEXT_PAYLOAD_BYTES,
-        ClipboardPayloadKind::UnicodeText,
-    )?
-    .map(|bytes| decode_unicode_text(&bytes).map_err(ClipboardReadError::InvalidUnicodeText))
-    .transpose()
+trait ClipboardMemoryReader {
+    fn size(&self, format: u32) -> Result<Option<usize>, ClipboardReadError>;
+    fn copy(&self, format: u32, expected_size: usize) -> Result<Vec<u8>, ClipboardReadError>;
 }
 
-fn read_global_bytes(
-    format: u32,
-    max_bytes: usize,
-    kind: ClipboardPayloadKind,
-) -> Result<Option<Vec<u8>>, ClipboardReadError> {
-    if unsafe { IsClipboardFormatAvailable(format) }.is_err() {
-        return Ok(None);
+struct Win32ClipboardMemory;
+
+impl ClipboardMemoryReader for Win32ClipboardMemory {
+    fn size(&self, format: u32) -> Result<Option<usize>, ClipboardReadError> {
+        if unsafe { IsClipboardFormatAvailable(format) }.is_err() {
+            return Ok(None);
+        }
+        let handle = clipboard_data_handle(format)?;
+        global_memory_size(HGLOBAL(handle.0)).map(Some)
     }
-    let handle = classify_format_read(true, unsafe {
+
+    fn copy(&self, format: u32, expected_size: usize) -> Result<Vec<u8>, ClipboardReadError> {
+        let handle = clipboard_data_handle(format)?;
+        let memory = HGLOBAL(handle.0);
+        let actual_size = global_memory_size(memory)?;
+        if actual_size != expected_size {
+            return Err(ClipboardReadError::windows(
+                ClipboardReadOperation::GlobalSize,
+                windows::core::Error::from_win32(),
+            ));
+        }
+        let lock = GlobalMemoryLock::new(memory)?;
+        let bytes =
+            unsafe { std::slice::from_raw_parts(lock.pointer.cast::<u8>(), actual_size) }.to_vec();
+        lock.unlock()?;
+        Ok(bytes)
+    }
+}
+
+fn clipboard_data_handle(format: u32) -> Result<HANDLE, ClipboardReadError> {
+    classify_format_read(true, unsafe {
         GetClipboardData(format)
             .map_err(|error| ClipboardReadError::windows(ClipboardReadOperation::GetData, error))
     })?
-    .expect("available clipboard format must produce a classified read");
-    let memory = HGLOBAL(handle.0);
-    let lock = GlobalMemoryLock::new(memory)?;
+    .ok_or_else(|| {
+        ClipboardReadError::windows(
+            ClipboardReadOperation::GetData,
+            windows::core::Error::from_win32(),
+        )
+    })
+}
+
+fn global_memory_size(memory: HGLOBAL) -> Result<usize, ClipboardReadError> {
     let len = unsafe { GlobalSize(memory) };
     if len == 0 {
         return Err(ClipboardReadError::windows(
@@ -1219,22 +1267,44 @@ fn read_global_bytes(
             windows::core::Error::from_win32(),
         ));
     }
-    classify_payload_size(len, max_bytes, kind)?;
-    let bytes = unsafe { std::slice::from_raw_parts(lock.pointer.cast::<u8>(), len) }.to_vec();
-    lock.unlock()?;
-    Ok(Some(bytes))
+    Ok(len)
 }
 
-fn classify_payload_size(
-    size: usize,
-    limit: usize,
-    kind: ClipboardPayloadKind,
-) -> Result<(), ClipboardReadError> {
-    if size <= limit {
-        Ok(())
-    } else {
-        Err(ClipboardReadError::PayloadTooLarge { kind, size, limit })
+fn read_bounded_representations(
+    reader: &impl ClipboardMemoryReader,
+    png_format: u32,
+    dib_format: u32,
+    budget: usize,
+) -> Result<Vec<ClipboardRepresentation>, ClipboardReadError> {
+    let text_size = reader.size(CF_UNICODETEXT_FORMAT)?;
+    let png_size = reader.size(png_format)?;
+    let dib_size = reader.size(dib_format)?;
+    let mut remaining = budget;
+    let mut representations = Vec::with_capacity(2);
+
+    if let Some(size) =
+        text_size.filter(|size| *size <= MAX_TEXT_PAYLOAD_BYTES && *size <= remaining)
+    {
+        let bytes = reader.copy(CF_UNICODETEXT_FORMAT, size)?;
+        let text = decode_unicode_text(&bytes).map_err(ClipboardReadError::InvalidUnicodeText)?;
+        representations.push(ClipboardRepresentation::UnicodeText { text });
+        remaining -= size;
     }
+
+    let selected_image = [(png_format, png_size, true), (dib_format, dib_size, false)]
+        .into_iter()
+        .filter_map(|(format, size, png)| size.map(|size| (format, size, png)))
+        .filter(|(_, size, _)| *size <= MAX_IMAGE_PAYLOAD_BYTES && *size <= remaining)
+        .min_by_key(|(_, size, _)| *size);
+    if let Some((format, size, png)) = selected_image {
+        let bytes = reader.copy(format, size)?;
+        representations.push(if png {
+            ClipboardRepresentation::Png { bytes }
+        } else {
+            ClipboardRepresentation::DibV5 { bytes }
+        });
+    }
+    Ok(representations)
 }
 
 struct GlobalMemoryLock {
@@ -1410,8 +1480,20 @@ enum EventSenderKind {
 }
 
 struct LatestClipboardEventSlot {
-    event: Mutex<Option<ClipboardEvent>>,
+    batches: Mutex<VecDeque<ClipboardEventBatch>>,
     changed: Condvar,
+}
+
+#[derive(Debug)]
+pub struct ClipboardEventBatch {
+    events: Vec<ClipboardEvent>,
+    atomic: bool,
+}
+
+impl ClipboardEventBatch {
+    pub fn into_events(self) -> Vec<ClipboardEvent> {
+        self.events
+    }
 }
 
 pub struct LatestClipboardEventReceiver {
@@ -1422,13 +1504,47 @@ pub struct LatestClipboardEventReceiver {
 pub struct ClipboardEventSendError;
 
 impl EventSender {
-    pub fn send(&self, event: ClipboardEvent) -> Result<(), ClipboardEventSendError> {
+    fn has_pending_atomic_batch(&self) -> bool {
         match &self.0 {
-            EventSenderKind::Queue(sender) => {
-                sender.send(event).map_err(|_| ClipboardEventSendError)
-            }
+            EventSenderKind::Queue(_) => false,
+            EventSenderKind::Latest(slot) => lock_unpoisoned(&slot.batches)
+                .iter()
+                .any(|batch| batch.atomic),
+        }
+    }
+
+    pub fn send(&self, event: ClipboardEvent) -> Result<(), ClipboardEventSendError> {
+        self.send_inner(ClipboardEventBatch {
+            events: vec![event],
+            atomic: false,
+        })
+    }
+
+    fn send_batch(&self, events: Vec<ClipboardEvent>) -> Result<(), ClipboardEventSendError> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        self.send_inner(ClipboardEventBatch {
+            events,
+            atomic: true,
+        })
+    }
+
+    fn send_inner(&self, batch: ClipboardEventBatch) -> Result<(), ClipboardEventSendError> {
+        match &self.0 {
+            EventSenderKind::Queue(sender) => batch
+                .events
+                .into_iter()
+                .try_for_each(|event| sender.send(event).map_err(|_| ClipboardEventSendError)),
             EventSenderKind::Latest(slot) => {
-                *lock_unpoisoned(&slot.event) = Some(event);
+                let mut batches = lock_unpoisoned(&slot.batches);
+                if !batch.atomic && batches.back().is_some_and(|queued| !queued.atomic) {
+                    *batches.back_mut().expect("ordinary batch is present") = batch;
+                } else if batch.atomic && batches.iter().any(|queued| queued.atomic) {
+                    return Err(ClipboardEventSendError);
+                } else {
+                    batches.push_back(batch);
+                }
                 slot.changed.notify_one();
                 Ok(())
             }
@@ -1438,17 +1554,29 @@ impl EventSender {
 
 trait ClipboardEventSink {
     fn send_event(&self, event: ClipboardEvent) -> Result<(), ClipboardEventSendError>;
+
+    fn send_batch(&self, events: Vec<ClipboardEvent>) -> Result<(), ClipboardEventSendError>;
 }
 
 impl ClipboardEventSink for EventSender {
     fn send_event(&self, event: ClipboardEvent) -> Result<(), ClipboardEventSendError> {
         self.send(event)
     }
+
+    fn send_batch(&self, events: Vec<ClipboardEvent>) -> Result<(), ClipboardEventSendError> {
+        self.send_batch(events)
+    }
 }
 
 impl ClipboardEventSink for Sender<ClipboardEvent> {
     fn send_event(&self, event: ClipboardEvent) -> Result<(), ClipboardEventSendError> {
         self.send(event).map_err(|_| ClipboardEventSendError)
+    }
+
+    fn send_batch(&self, events: Vec<ClipboardEvent>) -> Result<(), ClipboardEventSendError> {
+        events
+            .into_iter()
+            .try_for_each(|event| self.send(event).map_err(|_| ClipboardEventSendError))
     }
 }
 
@@ -1460,7 +1588,7 @@ impl From<Sender<ClipboardEvent>> for EventSender {
 
 pub fn latest_clipboard_event_channel() -> (EventSender, LatestClipboardEventReceiver) {
     let slot = Arc::new(LatestClipboardEventSlot {
-        event: Mutex::new(None),
+        batches: Mutex::new(VecDeque::new()),
         changed: Condvar::new(),
     });
     (
@@ -1470,23 +1598,23 @@ pub fn latest_clipboard_event_channel() -> (EventSender, LatestClipboardEventRec
 }
 
 impl LatestClipboardEventReceiver {
-    pub fn recv_timeout(&self, timeout: Duration) -> Result<ClipboardEvent, RecvTimeoutError> {
-        let event = lock_unpoisoned(&self.slot.event);
-        let (mut event, wait) = self
+    pub fn recv_timeout(&self, timeout: Duration) -> Result<ClipboardEventBatch, RecvTimeoutError> {
+        let batches = lock_unpoisoned(&self.slot.batches);
+        let (mut batches, wait) = self
             .slot
             .changed
-            .wait_timeout_while(event, timeout, |event| event.is_none())
+            .wait_timeout_while(batches, timeout, |batches| batches.is_empty())
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        event.take().ok_or(if wait.timed_out() {
+        batches.pop_front().ok_or(if wait.timed_out() {
             RecvTimeoutError::Timeout
         } else {
             RecvTimeoutError::Disconnected
         })
     }
 
-    pub fn try_recv(&self) -> Result<ClipboardEvent, std::sync::mpsc::TryRecvError> {
-        lock_unpoisoned(&self.slot.event)
-            .take()
+    pub fn try_recv(&self) -> Result<ClipboardEventBatch, std::sync::mpsc::TryRecvError> {
+        lock_unpoisoned(&self.slot.batches)
+            .pop_front()
             .ok_or(std::sync::mpsc::TryRecvError::Empty)
     }
 }
@@ -1512,6 +1640,7 @@ fn clipboard_event_bytes(event: &ClipboardEvent) -> usize {
 mod tests {
     use std::{
         cell::RefCell,
+        collections::HashMap,
         sync::{Arc, Barrier, Mutex, mpsc},
         time::Duration,
     };
@@ -1519,18 +1648,19 @@ mod tests {
     use chrono::Utc;
 
     use super::{
-        ClipboardEvent, ClipboardListenerError, ClipboardPayloadKind, ClipboardReadError,
-        ClipboardWriteError, EventSender, MAX_IMAGE_PAYLOAD_BYTES, MAX_TEXT_PAYLOAD_BYTES,
-        ProductWriteGuard, ProductWriteState, ReadyWait, ShutdownFailure,
+        CF_UNICODETEXT_FORMAT, ClipboardEvent, ClipboardListenerError, ClipboardMemoryReader,
+        ClipboardReadError, ClipboardWriteError, EventSender, MAX_CAPTURE_PAYLOAD_BYTES,
+        MAX_IMAGE_PAYLOAD_BYTES, ProductWriteGuard, ProductWriteState, ReadyWait, ShutdownFailure,
         begin_product_write_transaction, begin_product_write_transaction_with_spawner,
-        classify_format_read, classify_global_unlock, classify_payload_size,
-        classify_registered_format, combine_clipboard_operation_and_close, decode_unicode_text,
-        finish_product_write, latest_clipboard_event_channel, orchestrate_listener_initialization,
-        route_event, validate_representations,
+        classify_format_read, classify_global_unlock, classify_registered_format,
+        combine_clipboard_operation_and_close, decode_unicode_text, finish_product_write,
+        latest_clipboard_event_channel, orchestrate_listener_initialization,
+        read_bounded_representations, route_event, validate_representations,
     };
     use crate::domain::{
         CapturedClipboard, ClipboardRepresentation, ContentIdentity, SourceIdentity,
     };
+    use crate::services::session_records::SessionRecordStore;
 
     #[test]
     fn finishing_owned_write_replays_interleaved_external_event() {
@@ -1655,8 +1785,8 @@ mod tests {
     }
 
     #[test]
-    fn pending_byte_budget_cancels_and_replays_every_event_in_order() {
-        let (events, receiver) = mpsc::channel();
+    fn pending_byte_budget_cancels_before_flushing_one_atomic_external_batch() {
+        let (events, receiver) = latest_clipboard_event_channel();
         let state = Arc::new(Mutex::new(ProductWriteState::armed_with_budget(80, 9)));
 
         route_event(&state, &events, text_event(81, "1234"));
@@ -1666,11 +1796,67 @@ mod tests {
         assert!(matches!(*state.lock().unwrap(), ProductWriteState::Idle));
         assert_eq!(
             receiver
-                .try_iter()
+                .recv_timeout(Duration::from_millis(50))
+                .unwrap()
+                .into_events()
+                .into_iter()
                 .map(|event| event.sequence_number)
                 .collect::<Vec<_>>(),
             [81, 82, 83]
         );
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn production_mailbox_keeps_external_order_and_suppresses_owned_sequences_on_overflow() {
+        let (events, receiver) = latest_clipboard_event_channel();
+        let records = SessionRecordStore::default();
+        let state = Arc::new(Mutex::new(ProductWriteState::armed_with_budget(90, 8)));
+        route_event(&state, &events, text_event(91, "one"));
+        {
+            let mut guard = product_write_guard(Arc::clone(&state), events.clone());
+            guard.note_owned_sequences(&[92]);
+            route_event(&state, &events, text_event(92, "owned"));
+            route_event(&state, &events, text_event(93, "three"));
+            route_event(&state, &events, text_event(94, "four"));
+            assert!(matches!(*state.lock().unwrap(), ProductWriteState::Idle));
+            guard.finish(&[92]);
+        }
+
+        let delivered: Vec<_> = std::iter::from_fn(|| receiver.try_recv().ok())
+            .flat_map(|batch| batch.into_events())
+            .collect();
+        let observed: Vec<_> = delivered
+            .iter()
+            .map(|event| event.sequence_number)
+            .collect();
+        for event in delivered {
+            records.capture(event.captured);
+        }
+        assert_eq!(observed, [91, 93, 94]);
+        let stored: Vec<_> = records
+            .list()
+            .into_iter()
+            .filter_map(|record| record.text)
+            .collect();
+        assert_eq!(stored, ["four", "three", "one"]);
+        assert!(!stored.iter().any(|text| text == "owned"));
+    }
+
+    #[test]
+    fn production_mailbox_holds_at_most_one_transaction_batch_and_one_latest_snapshot() {
+        let (events, receiver) = latest_clipboard_event_channel();
+        events
+            .send_batch(vec![text_event(101, "transaction")])
+            .unwrap();
+        events.send(text_event(102, "old latest")).unwrap();
+        events.send(text_event(103, "new latest")).unwrap();
+
+        let first = receiver.try_recv().unwrap().into_events();
+        let second = receiver.try_recv().unwrap().into_events();
+        assert_eq!(first[0].sequence_number, 101);
+        assert_eq!(second[0].sequence_number, 103);
+        assert!(receiver.try_recv().is_err());
     }
 
     #[test]
@@ -1685,6 +1871,7 @@ mod tests {
             receiver
                 .recv_timeout(Duration::from_millis(50))
                 .unwrap()
+                .into_events()[0]
                 .sequence_number,
             93
         );
@@ -1843,46 +2030,72 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct FakeClipboardMemory {
+        payloads: HashMap<u32, Vec<u8>>,
+        copies: RefCell<Vec<u32>>,
+    }
+
+    impl ClipboardMemoryReader for FakeClipboardMemory {
+        fn size(&self, format: u32) -> Result<Option<usize>, ClipboardReadError> {
+            Ok(self.payloads.get(&format).map(Vec::len))
+        }
+
+        fn copy(&self, format: u32, expected_size: usize) -> Result<Vec<u8>, ClipboardReadError> {
+            self.copies.borrow_mut().push(format);
+            let bytes = self.payloads.get(&format).cloned().unwrap();
+            assert_eq!(bytes.len(), expected_size);
+            Ok(bytes)
+        }
+    }
+
     #[test]
-    fn payload_limits_accept_boundary_and_reject_one_byte_over() {
+    fn capture_budget_skips_oversized_formats_before_copy() {
+        let reader = FakeClipboardMemory {
+            payloads: HashMap::from([(100, vec![0; MAX_CAPTURE_PAYLOAD_BYTES + 1])]),
+            ..Default::default()
+        };
+
+        let captured =
+            read_bounded_representations(&reader, 100, 101, MAX_CAPTURE_PAYLOAD_BYTES).unwrap();
+
+        assert!(captured.is_empty());
+        assert!(reader.copies.borrow().is_empty());
+    }
+
+    #[test]
+    fn capture_materializes_only_the_smaller_image_format() {
+        let reader = FakeClipboardMemory {
+            payloads: HashMap::from([(100, vec![1; 8]), (101, vec![2; 4])]),
+            ..Default::default()
+        };
+
+        let captured = read_bounded_representations(&reader, 100, 101, 32).unwrap();
+
         assert!(
-            classify_payload_size(
-                MAX_TEXT_PAYLOAD_BYTES,
-                MAX_TEXT_PAYLOAD_BYTES,
-                ClipboardPayloadKind::UnicodeText,
-            )
-            .is_ok()
+            matches!(captured.as_slice(), [ClipboardRepresentation::DibV5 { bytes }] if bytes.len() == 4)
         );
-        assert!(matches!(
-            classify_payload_size(
-                MAX_TEXT_PAYLOAD_BYTES + 1,
-                MAX_TEXT_PAYLOAD_BYTES,
-                ClipboardPayloadKind::UnicodeText,
-            ),
-            Err(ClipboardReadError::PayloadTooLarge {
-                kind: ClipboardPayloadKind::UnicodeText,
-                ..
-            })
-        ));
+        assert_eq!(&*reader.copies.borrow(), &[101]);
+    }
+
+    #[test]
+    fn capture_prioritizes_text_and_only_copies_an_image_that_fits_remaining_budget() {
+        let text = [b'a', 0, 0, 0].to_vec();
+        let reader = FakeClipboardMemory {
+            payloads: HashMap::from([
+                (CF_UNICODETEXT_FORMAT, text),
+                (100, vec![1; 7]),
+                (101, vec![2; 8]),
+            ]),
+            ..Default::default()
+        };
+
+        let captured = read_bounded_representations(&reader, 100, 101, 10).unwrap();
+
         assert!(
-            classify_payload_size(
-                MAX_IMAGE_PAYLOAD_BYTES,
-                MAX_IMAGE_PAYLOAD_BYTES,
-                ClipboardPayloadKind::Image,
-            )
-            .is_ok()
+            matches!(captured.as_slice(), [ClipboardRepresentation::UnicodeText { text }] if text == "a")
         );
-        assert!(matches!(
-            classify_payload_size(
-                MAX_IMAGE_PAYLOAD_BYTES + 1,
-                MAX_IMAGE_PAYLOAD_BYTES,
-                ClipboardPayloadKind::Image,
-            ),
-            Err(ClipboardReadError::PayloadTooLarge {
-                kind: ClipboardPayloadKind::Image,
-                ..
-            })
-        ));
+        assert_eq!(&*reader.copies.borrow(), &[CF_UNICODETEXT_FORMAT]);
     }
 
     #[test]

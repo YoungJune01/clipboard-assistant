@@ -79,9 +79,11 @@ fn spawn_clipboard_event_drain(
                     break;
                 }
                 match events.recv_timeout(std::time::Duration::from_millis(100)) {
-                    Ok(event) => {
-                        records.capture(event.captured);
-                        on_change();
+                    Ok(batch) => {
+                        for event in batch.into_events() {
+                            records.capture(event.captured);
+                            on_change();
+                        }
                     }
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                     Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
