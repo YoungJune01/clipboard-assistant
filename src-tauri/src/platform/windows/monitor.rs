@@ -233,7 +233,10 @@ fn query_snapshot_for_identity<A: MonitorApi>(
             return Ok(snapshot_from_monitor(api, monitor, details, pointer));
         }
     }
-    fallback_snapshot(api, Some(anchor))
+    match api.cursor_position() {
+        Some(pointer) => query_snapshot_for_pointer(api, pointer),
+        None => fallback_snapshot(api, None),
+    }
 }
 
 fn fallback_snapshot<A: MonitorApi>(
@@ -517,6 +520,106 @@ mod tests {
         assert_eq!(snapshot.pointer, PhysicalPoint { x: 1800, y: 999 });
         assert_eq!(snapshot.dpi, 144);
         assert_eq!(api.info_queries(), vec![1]);
+    }
+
+    #[test]
+    fn missing_owner_falls_back_to_current_pointer_monitor_before_primary() {
+        let api = FakeMonitorApi::new(
+            Some(PhysicalPoint { x: 4200, y: 500 }),
+            Some(3),
+            vec![
+                (
+                    2,
+                    MonitorDetails {
+                        identity: MonitorIdentity::from_static("B"),
+                        work_area: PhysicalRect {
+                            left: 0,
+                            top: 0,
+                            right: 1920,
+                            bottom: 1040,
+                        },
+                        primary: true,
+                    },
+                ),
+                (
+                    3,
+                    MonitorDetails {
+                        identity: MonitorIdentity::from_static("C"),
+                        work_area: PhysicalRect {
+                            left: 3840,
+                            top: 0,
+                            right: 5760,
+                            bottom: 1040,
+                        },
+                        primary: false,
+                    },
+                ),
+            ],
+            vec![(2, Some(96)), (3, Some(144)), (3, Some(144))],
+        );
+
+        let snapshot = query_snapshot_for_identity(
+            &api,
+            &MonitorIdentity::from_static("A"),
+            PhysicalPoint { x: 1800, y: 900 },
+        )
+        .expect("current pointer monitor fallback");
+
+        assert_eq!(snapshot.identity.as_str(), "C");
+        assert_eq!(snapshot.pointer, PhysicalPoint { x: 4200, y: 500 });
+        assert_eq!(snapshot.dpi, 144);
+        assert_eq!(api.info_queries(), vec![2, 3, 3]);
+        assert_eq!(api.enumeration_count(), 1);
+    }
+
+    #[test]
+    fn missing_owner_uses_primary_monitor_when_cursor_query_fails() {
+        let api = FakeMonitorApi::new(
+            None,
+            None,
+            vec![
+                (
+                    2,
+                    MonitorDetails {
+                        identity: MonitorIdentity::from_static("B"),
+                        work_area: PhysicalRect {
+                            left: 0,
+                            top: 0,
+                            right: 1920,
+                            bottom: 1040,
+                        },
+                        primary: true,
+                    },
+                ),
+                (
+                    3,
+                    MonitorDetails {
+                        identity: MonitorIdentity::from_static("C"),
+                        work_area: PhysicalRect {
+                            left: 3840,
+                            top: 0,
+                            right: 5760,
+                            bottom: 1040,
+                        },
+                        primary: false,
+                    },
+                ),
+            ],
+            vec![(2, Some(96)), (3, Some(144)), (2, Some(96))],
+        );
+
+        let snapshot = query_snapshot_for_identity(
+            &api,
+            &MonitorIdentity::from_static("A"),
+            PhysicalPoint { x: 1800, y: 900 },
+        )
+        .expect("primary monitor fallback");
+
+        assert_eq!(snapshot.identity.as_str(), "B");
+        assert_eq!(snapshot.pointer, PhysicalPoint { x: 960, y: 520 });
+        assert_eq!(snapshot.dpi, 96);
+        assert_eq!(api.info_queries(), vec![2, 3, 2]);
+        assert_eq!(api.enumeration_count(), 2);
     }
 
     struct FakeMonitorApi {
