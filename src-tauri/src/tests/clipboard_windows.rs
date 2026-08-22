@@ -96,11 +96,11 @@ fn listener_captures_text_suppresses_owned_sequence_and_resumes() {
     );
 
     let owned_text = unique_text("owned");
-    let ownership = listener
-        .begin_product_write()
-        .expect("begin product-owned clipboard write");
-    let owned_sequence = write_clipboard_text(&owned_text).expect("write product-owned text");
-    ownership.finish(owned_sequence);
+    let owned_sequence = listener
+        .publish(&[ClipboardRepresentation::UnicodeText {
+            text: owned_text.clone(),
+        }])
+        .expect("publish product-owned text");
     assert_no_sequence(&receiver, owned_sequence);
 
     let resumed_text = unique_text("resumed");

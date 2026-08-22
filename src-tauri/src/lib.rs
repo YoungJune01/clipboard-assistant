@@ -7,9 +7,108 @@ use std::sync::Arc;
 
 #[cfg(windows)]
 use services::panel::PanelController;
+#[cfg(windows)]
+use services::paste::{QuickPanelPasteCoordinator, SafePasteService};
 
 #[cfg(windows)]
 use tauri::Manager;
+
+#[cfg(windows)]
+type WindowsSafePasteService = SafePasteService<
+    platform::windows::paste::Win32PasteTarget,
+    platform::windows::clipboard::ClipboardPublisher,
+    Arc<PanelController>,
+    platform::windows::paste::Win32PasteInput,
+>;
+
+#[cfg(windows)]
+type WindowsQuickPanelCoordinator =
+    QuickPanelPasteCoordinator<Arc<PanelController>, WindowsSafePasteService>;
+
+#[cfg(windows)]
+struct ClipboardRuntime {
+    listener: std::sync::Mutex<Option<platform::windows::clipboard::ClipboardListener>>,
+    event_drain_stop: std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    event_drain: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+
+#[cfg(windows)]
+impl Drop for ClipboardRuntime {
+    fn drop(&mut self) {
+        let listener = self
+            .listener
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(listener) = listener {
+            let _ = listener.shutdown();
+        }
+        let stop = self
+            .event_drain_stop
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(stop) = stop {
+            let _ = stop.send(());
+        }
+        let drain = self
+            .event_drain
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(drain) = drain {
+            let _ = drain.join();
+        }
+    }
+}
+
+#[cfg(windows)]
+fn spawn_clipboard_event_drain(
+    events: std::sync::mpsc::Receiver<platform::windows::clipboard::ClipboardEvent>,
+) -> std::io::Result<(std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>)> {
+    let (stop, stopped) = std::sync::mpsc::channel();
+    let thread = std::thread::Builder::new()
+        .name("clipboard-event-drain".to_owned())
+        .spawn(move || {
+            loop {
+                if stopped.try_recv().is_ok() {
+                    break;
+                }
+                match events.recv_timeout(std::time::Duration::from_millis(100)) {
+                    Ok(_) => {}
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+            }
+        })?;
+    Ok((stop, thread))
+}
+
+#[cfg(all(test, windows))]
+mod runtime_tests {
+    use super::spawn_clipboard_event_drain;
+
+    #[test]
+    fn clipboard_event_drain_stops_even_when_event_senders_remain_alive() {
+        let (events, receiver) = std::sync::mpsc::channel();
+        let retained_sender = events.clone();
+        let (stop, thread) = spawn_clipboard_event_drain(receiver).unwrap();
+        let (joined, observed) = std::sync::mpsc::sync_channel(1);
+
+        stop.send(()).unwrap();
+        std::thread::spawn(move || {
+            let _retained_sender = retained_sender;
+            let _ = joined.send(thread.join());
+        });
+
+        assert!(
+            observed
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap()
+                .is_ok()
+        );
+    }
+}
 
 #[cfg(test)]
 mod tests;
@@ -22,20 +121,37 @@ fn greet(name: &str) -> String {
 
 #[cfg(windows)]
 #[tauri::command]
-fn show_quick_panel(controller: tauri::State<'_, Arc<PanelController>>) -> Result<(), String> {
-    controller.show().map_err(|error| error.to_string())
+fn show_quick_panel(
+    coordinator: tauri::State<'_, Arc<WindowsQuickPanelCoordinator>>,
+) -> Result<(), String> {
+    coordinator.show()
 }
 
 #[cfg(windows)]
 #[tauri::command]
-fn hide_quick_panel(controller: tauri::State<'_, Arc<PanelController>>) -> Result<(), String> {
-    controller.hide().map_err(|error| error.to_string())
+fn paste_selected(
+    representations: Vec<domain::ClipboardRepresentation>,
+    coordinator: tauri::State<'_, Arc<WindowsQuickPanelCoordinator>>,
+) -> Result<domain::PasteOutcome, String> {
+    coordinator
+        .paste(&representations)
+        .map_err(|error| error.to_string())
 }
 
 #[cfg(windows)]
 #[tauri::command]
-fn toggle_quick_panel(controller: tauri::State<'_, Arc<PanelController>>) -> Result<(), String> {
-    controller.toggle().map_err(|error| error.to_string())
+fn hide_quick_panel(
+    coordinator: tauri::State<'_, Arc<WindowsQuickPanelCoordinator>>,
+) -> Result<(), String> {
+    coordinator.hide()
+}
+
+#[cfg(windows)]
+#[tauri::command]
+fn toggle_quick_panel(
+    coordinator: tauri::State<'_, Arc<WindowsQuickPanelCoordinator>>,
+) -> Result<(), String> {
+    coordinator.toggle()
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -55,7 +171,27 @@ pub fn run() {
                 .get_webview_window("quick-panel")
                 .ok_or_else(|| "quick-panel window is missing".to_owned())?;
             platform::windows::configure_quick_panel_style(panel.hwnd()?)?;
-            app.manage(Arc::new(PanelController::new(panel)));
+            let panel_controller = Arc::new(PanelController::new(panel));
+            let (clipboard_events, clipboard_receiver) = std::sync::mpsc::channel();
+            let listener =
+                platform::windows::clipboard::ClipboardListener::start(clipboard_events)?;
+            let (event_drain_stop, event_drain) = spawn_clipboard_event_drain(clipboard_receiver)?;
+            let paste = SafePasteService::new(
+                platform::windows::paste::Win32PasteTarget,
+                listener.publisher(),
+                Arc::clone(&panel_controller),
+                platform::windows::paste::Win32PasteInput,
+            );
+            app.manage(Arc::clone(&panel_controller));
+            app.manage(Arc::new(QuickPanelPasteCoordinator::new(
+                panel_controller,
+                paste,
+            )));
+            app.manage(ClipboardRuntime {
+                listener: std::sync::Mutex::new(Some(listener)),
+                event_drain_stop: std::sync::Mutex::new(Some(event_drain_stop)),
+                event_drain: std::sync::Mutex::new(Some(event_drain)),
+            });
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -63,15 +199,20 @@ pub fn run() {
                 return;
             }
             let controller = window.state::<Arc<PanelController>>();
+            let coordinator = window.state::<Arc<WindowsQuickPanelCoordinator>>();
             match event {
                 tauri::WindowEvent::Focused(focused) => {
-                    let _ = controller.on_focus_changed(*focused);
+                    let result = controller.on_focus_changed(*focused);
+                    if !focused && (result.is_err() || !controller.is_visible()) {
+                        coordinator.clear_target();
+                    }
                 }
                 tauri::WindowEvent::ScaleFactorChanged { .. } => {
                     let _ = controller.reposition_if_visible();
                 }
                 tauri::WindowEvent::Destroyed => {
                     let _ = controller.hide();
+                    coordinator.clear_target();
                 }
                 _ => {}
             }
@@ -80,7 +221,8 @@ pub fn run() {
             greet,
             show_quick_panel,
             hide_quick_panel,
-            toggle_quick_panel
+            toggle_quick_panel,
+            paste_selected
         ]);
     #[cfg(not(windows))]
     let builder = builder.invoke_handler(tauri::generate_handler![greet]);

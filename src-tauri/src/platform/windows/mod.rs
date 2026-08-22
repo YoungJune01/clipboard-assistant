@@ -2,6 +2,7 @@ pub mod activation;
 pub mod clipboard;
 mod message_loop;
 pub mod monitor;
+pub mod paste;
 
 use windows::Win32::{
     Foundation::{GetLastError, HWND, WIN32_ERROR},

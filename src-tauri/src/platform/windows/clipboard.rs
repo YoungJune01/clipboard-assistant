@@ -1,6 +1,8 @@
 use std::{
     error::Error,
     fmt,
+    mem::size_of,
+    ptr,
     sync::{
         Arc, Mutex,
         mpsc::{RecvTimeoutError, Sender, sync_channel},
@@ -11,13 +13,15 @@ use std::{
 
 use chrono::Utc;
 use windows::Win32::{
-    Foundation::{CloseHandle, ERROR_SUCCESS, GetLastError, HANDLE, HGLOBAL, SetLastError},
+    Foundation::{
+        CloseHandle, ERROR_SUCCESS, GetLastError, GlobalFree, HANDLE, HGLOBAL, SetLastError,
+    },
     System::{
         DataExchange::{
-            CloseClipboard, GetClipboardData, GetClipboardSequenceNumber,
-            IsClipboardFormatAvailable, OpenClipboard, RegisterClipboardFormatW,
+            CloseClipboard, EmptyClipboard, GetClipboardData, GetClipboardSequenceNumber,
+            IsClipboardFormatAvailable, OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
         },
-        Memory::{GlobalLock, GlobalSize, GlobalUnlock},
+        Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock},
         Threading::{CreateEventW, SetEvent},
     },
 };
@@ -47,6 +51,12 @@ pub struct ClipboardListener {
     shutdown: Sender<()>,
     shutdown_event: Option<ShutdownEvent>,
     thread: Option<JoinHandle<Result<(), ClipboardListenerError>>>,
+}
+
+#[derive(Clone)]
+pub struct ClipboardPublisher {
+    events: Sender<ClipboardEvent>,
+    product_write: Arc<Mutex<ProductWriteState>>,
 }
 
 impl ClipboardListener {
@@ -104,21 +114,21 @@ impl ClipboardListener {
     }
 
     pub fn begin_product_write(&self) -> Result<ProductWriteGuard, ClipboardListenerError> {
-        let baseline = unsafe { GetClipboardSequenceNumber() };
-        let mut state = lock_unpoisoned(&self.product_write);
-        if !matches!(*state, ProductWriteState::Idle) {
-            return Err(ClipboardListenerError::ProductWriteAlreadyInProgress);
-        }
-        *state = ProductWriteState::Armed {
-            baseline,
-            pending: Vec::new(),
-        };
-        drop(state);
-        Ok(ProductWriteGuard {
-            state: Arc::clone(&self.product_write),
+        self.publisher().begin_product_write()
+    }
+
+    pub fn publisher(&self) -> ClipboardPublisher {
+        ClipboardPublisher {
             events: self.events.clone(),
-            finished: false,
-        })
+            product_write: Arc::clone(&self.product_write),
+        }
+    }
+
+    pub fn publish(
+        &self,
+        representations: &[ClipboardRepresentation],
+    ) -> Result<u32, ClipboardWriteError> {
+        self.publisher().publish(representations)
     }
 
     pub fn shutdown(mut self) -> Result<(), ClipboardListenerError> {
@@ -148,9 +158,313 @@ impl ClipboardListener {
     }
 }
 
+impl ClipboardPublisher {
+    pub fn begin_product_write(&self) -> Result<ProductWriteGuard, ClipboardListenerError> {
+        let baseline = unsafe { GetClipboardSequenceNumber() };
+        let mut state = lock_unpoisoned(&self.product_write);
+        if !matches!(*state, ProductWriteState::Idle) {
+            return Err(ClipboardListenerError::ProductWriteAlreadyInProgress);
+        }
+        *state = ProductWriteState::Armed {
+            baseline,
+            pending: Vec::new(),
+        };
+        drop(state);
+        Ok(ProductWriteGuard {
+            state: Arc::clone(&self.product_write),
+            events: self.events.clone(),
+            finished: false,
+        })
+    }
+
+    pub fn publish(
+        &self,
+        representations: &[ClipboardRepresentation],
+    ) -> Result<u32, ClipboardWriteError> {
+        validate_representations(representations)?;
+        let ownership = self
+            .begin_product_write()
+            .map_err(ClipboardWriteError::Ownership)?;
+        let attempt = write_representations(representations);
+        finish_product_write(ownership, attempt.changed_sequence);
+        attempt.result
+    }
+}
+
+impl crate::services::paste::PasteClipboard for ClipboardPublisher {
+    type Error = ClipboardWriteError;
+
+    fn publish(&self, representations: &[ClipboardRepresentation]) -> Result<u32, Self::Error> {
+        ClipboardPublisher::publish(self, representations)
+    }
+}
+
 impl Drop for ClipboardListener {
     fn drop(&mut self) {
         let _ = self.stop();
+    }
+}
+
+#[derive(Debug)]
+pub enum ClipboardWriteError {
+    Ownership(ClipboardListenerError),
+    Empty,
+    UnsupportedRepresentation,
+    DuplicateRepresentation,
+    PayloadTooLarge,
+    Windows(ClipboardWriteOperation, windows::core::Error),
+    OperationAndClose {
+        operation: Box<ClipboardWriteError>,
+        close: windows::core::Error,
+    },
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum ClipboardWriteOperation {
+    Open,
+    Empty,
+    RegisterPng,
+    Allocate,
+    Lock,
+    Unlock,
+    Publish,
+    Close,
+}
+
+impl fmt::Display for ClipboardWriteError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Ownership(_) => formatter.write_str("clipboard write ownership is unavailable"),
+            Self::Empty => formatter.write_str("no clipboard representation was selected"),
+            Self::UnsupportedRepresentation => {
+                formatter.write_str("the selected clipboard representation is unsupported")
+            }
+            Self::DuplicateRepresentation => {
+                formatter.write_str("a clipboard representation kind was selected more than once")
+            }
+            Self::PayloadTooLarge => {
+                formatter.write_str("the selected clipboard representation exceeds its size limit")
+            }
+            Self::Windows(operation, _) => write!(formatter, "clipboard {operation} failed"),
+            Self::OperationAndClose { operation, .. } => {
+                write!(formatter, "{operation}; closing clipboard also failed")
+            }
+        }
+    }
+}
+
+impl fmt::Display for ClipboardWriteOperation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Open => "open for writing",
+            Self::Empty => "clear before writing",
+            Self::RegisterPng => "PNG format registration",
+            Self::Allocate => "payload allocation",
+            Self::Lock => "payload lock",
+            Self::Unlock => "payload unlock",
+            Self::Publish => "data publication",
+            Self::Close => "close after writing",
+        })
+    }
+}
+
+impl Error for ClipboardWriteError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Ownership(error) => Some(error),
+            Self::Windows(_, error) => Some(error),
+            Self::OperationAndClose { operation, close } => {
+                let _ = close;
+                Some(operation)
+            }
+            Self::Empty
+            | Self::UnsupportedRepresentation
+            | Self::DuplicateRepresentation
+            | Self::PayloadTooLarge => None,
+        }
+    }
+}
+
+fn validate_representations(
+    representations: &[ClipboardRepresentation],
+) -> Result<(), ClipboardWriteError> {
+    if representations.is_empty() {
+        return Err(ClipboardWriteError::Empty);
+    }
+    for (index, representation) in representations.iter().enumerate() {
+        if representations[..index]
+            .iter()
+            .any(|existing| existing.has_same_kind(representation))
+        {
+            return Err(ClipboardWriteError::DuplicateRepresentation);
+        }
+        let (size, limit) = match representation {
+            ClipboardRepresentation::UnicodeText { text } => (
+                text.encode_utf16()
+                    .count()
+                    .saturating_add(1)
+                    .saturating_mul(size_of::<u16>()),
+                MAX_TEXT_PAYLOAD_BYTES,
+            ),
+            ClipboardRepresentation::Png { bytes } | ClipboardRepresentation::DibV5 { bytes } => {
+                (bytes.len(), MAX_IMAGE_PAYLOAD_BYTES)
+            }
+        };
+        if size > limit {
+            return Err(ClipboardWriteError::PayloadTooLarge);
+        }
+    }
+    Ok(())
+}
+
+struct ClipboardWriteAttempt {
+    result: Result<u32, ClipboardWriteError>,
+    changed_sequence: Option<u32>,
+}
+
+fn finish_product_write(ownership: ProductWriteGuard, changed_sequence: Option<u32>) {
+    if let Some(sequence) = changed_sequence {
+        ownership.finish(sequence);
+    }
+}
+
+fn write_representations(representations: &[ClipboardRepresentation]) -> ClipboardWriteAttempt {
+    let clipboard = match ClipboardWriteGuard::open_with_retry() {
+        Ok(clipboard) => clipboard,
+        Err(error) => {
+            return ClipboardWriteAttempt {
+                result: Err(error),
+                changed_sequence: None,
+            };
+        }
+    };
+    let mut changed_sequence = None;
+    let operation = (|| {
+        unsafe { EmptyClipboard() }
+            .map_err(|error| ClipboardWriteError::Windows(ClipboardWriteOperation::Empty, error))?;
+        changed_sequence = Some(unsafe { GetClipboardSequenceNumber() });
+        let mut published = 0usize;
+        for representation in representations {
+            let (format, bytes) = match representation {
+                ClipboardRepresentation::UnicodeText { text } => {
+                    let wide: Vec<u16> = text.encode_utf16().chain([0]).collect();
+                    let bytes = unsafe {
+                        std::slice::from_raw_parts(
+                            wide.as_ptr().cast::<u8>(),
+                            wide.len() * size_of::<u16>(),
+                        )
+                    }
+                    .to_vec();
+                    (CF_UNICODETEXT_FORMAT, bytes)
+                }
+                ClipboardRepresentation::Png { bytes } => {
+                    unsafe { SetLastError(ERROR_SUCCESS) };
+                    let format = unsafe { RegisterClipboardFormatW(w!("PNG")) };
+                    if format == 0 {
+                        return Err(ClipboardWriteError::Windows(
+                            ClipboardWriteOperation::RegisterPng,
+                            windows::core::Error::from_win32(),
+                        ));
+                    }
+                    (format, bytes.clone())
+                }
+                ClipboardRepresentation::DibV5 { bytes } => (CF_DIBV5_FORMAT, bytes.clone()),
+            };
+            publish_global_bytes(format, &bytes)?;
+            changed_sequence = Some(unsafe { GetClipboardSequenceNumber() });
+            published += 1;
+        }
+        if published == 0 {
+            Err(ClipboardWriteError::UnsupportedRepresentation)
+        } else {
+            Ok(unsafe { GetClipboardSequenceNumber() })
+        }
+    })();
+    let close = clipboard.close();
+    let result = match (operation, close) {
+        (Ok(_), Ok(())) => Ok(changed_sequence.expect("a successful write changed the clipboard")),
+        (Err(operation), Ok(())) => Err(operation),
+        (Ok(_), Err(close)) => Err(ClipboardWriteError::Windows(
+            ClipboardWriteOperation::Close,
+            close,
+        )),
+        (Err(operation), Err(close)) => Err(ClipboardWriteError::OperationAndClose {
+            operation: Box::new(operation),
+            close,
+        }),
+    };
+    ClipboardWriteAttempt {
+        result,
+        changed_sequence,
+    }
+}
+
+fn publish_global_bytes(format: u32, bytes: &[u8]) -> Result<(), ClipboardWriteError> {
+    let memory = unsafe { GlobalAlloc(GMEM_MOVEABLE, bytes.len().max(1)) }
+        .map_err(|error| ClipboardWriteError::Windows(ClipboardWriteOperation::Allocate, error))?;
+    let pointer = unsafe { GlobalLock(memory) }.cast::<u8>();
+    if pointer.is_null() {
+        let _ = unsafe { GlobalFree(Some(memory)) };
+        return Err(ClipboardWriteError::Windows(
+            ClipboardWriteOperation::Lock,
+            windows::core::Error::from_win32(),
+        ));
+    }
+    if !bytes.is_empty() {
+        unsafe { ptr::copy_nonoverlapping(bytes.as_ptr(), pointer, bytes.len()) };
+    }
+    if let Err(error) = global_unlock(memory) {
+        let _ = unsafe { GlobalFree(Some(memory)) };
+        return Err(ClipboardWriteError::Windows(
+            ClipboardWriteOperation::Unlock,
+            error,
+        ));
+    }
+    if let Err(error) = unsafe { SetClipboardData(format, Some(HANDLE(memory.0))) } {
+        let _ = unsafe { GlobalFree(Some(memory)) };
+        Err(ClipboardWriteError::Windows(
+            ClipboardWriteOperation::Publish,
+            error,
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+struct ClipboardWriteGuard(bool);
+
+impl ClipboardWriteGuard {
+    fn open_with_retry() -> Result<Self, ClipboardWriteError> {
+        const DELAYS_MS: [u64; 5] = [5, 10, 20, 40, 80];
+        let mut last_error = match unsafe { OpenClipboard(None) } {
+            Ok(()) => return Ok(Self(true)),
+            Err(error) => error,
+        };
+        for delay in DELAYS_MS {
+            thread::sleep(Duration::from_millis(delay));
+            match unsafe { OpenClipboard(None) } {
+                Ok(()) => return Ok(Self(true)),
+                Err(error) => last_error = error,
+            }
+        }
+        Err(ClipboardWriteError::Windows(
+            ClipboardWriteOperation::Open,
+            last_error,
+        ))
+    }
+
+    fn close(mut self) -> windows::core::Result<()> {
+        let result = unsafe { CloseClipboard() };
+        self.0 = result.is_err();
+        result
+    }
+}
+
+impl Drop for ClipboardWriteGuard {
+    fn drop(&mut self) {
+        if self.0 {
+            let _ = unsafe { CloseClipboard() };
+        }
     }
 }
 
@@ -912,13 +1226,16 @@ mod tests {
 
     use super::{
         ClipboardEvent, ClipboardListenerError, ClipboardPayloadKind, ClipboardReadError,
-        MAX_IMAGE_PAYLOAD_BYTES, MAX_PENDING_PRODUCT_WRITE_EVENTS, MAX_TEXT_PAYLOAD_BYTES,
-        ProductWriteGuard, ProductWriteState, ReadyWait, ShutdownFailure, classify_format_read,
-        classify_global_unlock, classify_payload_size, classify_registered_format,
-        combine_clipboard_operation_and_close, decode_unicode_text,
-        orchestrate_listener_initialization, route_event,
+        ClipboardWriteError, MAX_IMAGE_PAYLOAD_BYTES, MAX_PENDING_PRODUCT_WRITE_EVENTS,
+        MAX_TEXT_PAYLOAD_BYTES, ProductWriteGuard, ProductWriteState, ReadyWait, ShutdownFailure,
+        classify_format_read, classify_global_unlock, classify_payload_size,
+        classify_registered_format, combine_clipboard_operation_and_close, decode_unicode_text,
+        finish_product_write, orchestrate_listener_initialization, route_event,
+        validate_representations,
     };
-    use crate::domain::{CapturedClipboard, ContentIdentity, SourceIdentity};
+    use crate::domain::{
+        CapturedClipboard, ClipboardRepresentation, ContentIdentity, SourceIdentity,
+    };
 
     #[test]
     fn finishing_owned_write_replays_interleaved_external_event() {
@@ -997,6 +1314,29 @@ mod tests {
 
         route_event(&state, &events, event(66));
         assert_eq!(receiver.recv().unwrap().sequence_number, 66);
+    }
+
+    #[test]
+    fn failed_write_after_clipboard_change_still_suppresses_owned_sequence() {
+        let (events, receiver) = mpsc::channel();
+        let state = Arc::new(Mutex::new(ProductWriteState::Armed {
+            baseline: 65,
+            pending: Vec::new(),
+        }));
+        route_event(&state, &events, event(66));
+
+        finish_product_write(
+            ProductWriteGuard {
+                state: Arc::clone(&state),
+                events: events.clone(),
+                finished: false,
+            },
+            Some(66),
+        );
+
+        assert!(receiver.try_recv().is_err());
+        route_event(&state, &events, event(67));
+        assert_eq!(receiver.recv().unwrap().sequence_number, 67);
     }
 
     #[test]
@@ -1106,6 +1446,35 @@ mod tests {
                 kind: ClipboardPayloadKind::Image,
                 ..
             })
+        ));
+    }
+
+    #[test]
+    fn paste_publication_rejects_duplicate_kinds_before_touching_clipboard() {
+        let representations = [
+            ClipboardRepresentation::UnicodeText {
+                text: "first".to_owned(),
+            },
+            ClipboardRepresentation::UnicodeText {
+                text: "second".to_owned(),
+            },
+        ];
+
+        assert!(matches!(
+            validate_representations(&representations),
+            Err(ClipboardWriteError::DuplicateRepresentation)
+        ));
+    }
+
+    #[test]
+    fn paste_publication_enforces_capture_payload_limits() {
+        let oversized = ClipboardRepresentation::Png {
+            bytes: vec![0; MAX_IMAGE_PAYLOAD_BYTES + 1],
+        };
+
+        assert!(matches!(
+            validate_representations(&[oversized]),
+            Err(ClipboardWriteError::PayloadTooLarge)
         ));
     }
 

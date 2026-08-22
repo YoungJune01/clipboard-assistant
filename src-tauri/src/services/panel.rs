@@ -443,6 +443,10 @@ impl PanelController {
         self.service.enter_focus_domain()
     }
 
+    pub fn is_visible(&self) -> bool {
+        self.service.is_visible()
+    }
+
     fn schedule_reposition(self: &Arc<Self>) {
         let controller = Arc::downgrade(self);
         let window = self.service.window.0.clone();
