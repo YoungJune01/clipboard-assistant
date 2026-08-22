@@ -460,9 +460,8 @@ impl Fixture {
                 window: Window(100),
                 focused_control: Some(Window(101)),
                 identity: identity(),
-                window_generation: 1,
+                lifecycle_token: crate::domain::TargetToken::from_platform_value(1),
                 focused_control_instance_id: Some(2),
-                focused_control_generation: Some(3),
             })]))),
             inspections: Arc::new(Mutex::new(inspections.into_iter().collect())),
             restore_results: Arc::new(Mutex::new(VecDeque::new())),
@@ -507,9 +506,8 @@ impl Fixture {
             window: Window(100),
             focused_control: Some(Window(101)),
             identity,
-            window_generation: 1,
+            lifecycle_token: crate::domain::TargetToken::from_platform_value(1),
             focused_control_instance_id: Some(2),
-            focused_control_generation: Some(3),
         })]);
         self
     }
@@ -593,6 +591,8 @@ impl PasteTarget for FakeTarget {
             .pop_front()
             .unwrap_or(Ok(true))
     }
+
+    fn release_lifecycle(&self, _target: &TargetSnapshot<Self::Window>) {}
 }
 
 #[derive(Clone)]

@@ -6,10 +6,11 @@ use std::{
     ptr,
     sync::{
         Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
         mpsc::{RecvTimeoutError, Sender, sync_channel},
     },
     thread::{self, JoinHandle},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use chrono::Utc;
@@ -34,11 +35,12 @@ use super::message_loop::{ListenerState, run_message_loop, wake_and_join};
 
 const CF_UNICODETEXT_FORMAT: u32 = 13;
 const CF_DIBV5_FORMAT: u32 = 17;
-const MAX_PENDING_PRODUCT_WRITE_EVENTS: usize = 32;
 const MAX_TEXT_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
 const MAX_IMAGE_PAYLOAD_BYTES: usize = 256 * 1024 * 1024;
+const PRODUCT_WRITE_TRANSACTION_TIMEOUT: Duration = Duration::from_secs(2);
 const LISTENER_INITIALIZATION_TIMEOUT: Duration = Duration::from_secs(3);
 const LISTENER_INITIALIZATION_CLEANUP_GRACE: Duration = Duration::from_secs(1);
+static NEXT_PRODUCT_WRITE_TRANSACTION: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClipboardEvent {
@@ -163,17 +165,30 @@ impl ClipboardPublisher {
     pub fn begin_product_write(&self) -> Result<ProductWriteGuard, ClipboardListenerError> {
         let baseline = unsafe { GetClipboardSequenceNumber() };
         let mut state = lock_unpoisoned(&self.product_write);
+        let expired_pending = match &mut *state {
+            ProductWriteState::Armed {
+                pending, deadline, ..
+            } if Instant::now() >= *deadline => {
+                let pending = std::mem::take(pending);
+                *state = ProductWriteState::Idle;
+                pending
+            }
+            _ => VecDeque::new(),
+        };
         if !matches!(*state, ProductWriteState::Idle) {
             return Err(ClipboardListenerError::ProductWriteAlreadyInProgress);
         }
-        *state = ProductWriteState::Armed {
-            baseline,
-            pending: VecDeque::new(),
-        };
+        let armed = ProductWriteState::armed(baseline);
+        let transaction_id = armed.transaction_id().expect("armed state has an id");
+        *state = armed;
         drop(state);
+        for event in expired_pending {
+            let _ = self.events.send(event);
+        }
         Ok(ProductWriteGuard {
             state: Arc::clone(&self.product_write),
             events: self.events.clone(),
+            transaction_id,
             finished: false,
         })
     }
@@ -730,28 +745,33 @@ fn route_event(
     events: &Sender<ClipboardEvent>,
     event: ClipboardEvent,
 ) {
-    let event_to_send = {
+    let events_to_send = {
         let mut state = lock_unpoisoned(state);
         match &mut *state {
-            ProductWriteState::Armed { pending, .. } => {
-                if pending.len() == MAX_PENDING_PRODUCT_WRITE_EVENTS {
-                    pending.pop_front();
-                }
+            ProductWriteState::Armed {
+                pending, deadline, ..
+            } if Instant::now() >= *deadline => {
+                let mut pending = std::mem::take(pending);
                 pending.push_back(event);
-                None
+                *state = ProductWriteState::Idle;
+                pending
+            }
+            ProductWriteState::Armed { pending, .. } => {
+                pending.push_back(event);
+                VecDeque::new()
             }
             ProductWriteState::Expected { sequence } if *sequence == event.sequence_number => {
                 *state = ProductWriteState::Idle;
-                None
+                VecDeque::new()
             }
             ProductWriteState::Expected { .. } => {
                 *state = ProductWriteState::Idle;
-                Some(event)
+                VecDeque::from([event])
             }
-            ProductWriteState::Idle => Some(event),
+            ProductWriteState::Idle => VecDeque::from([event]),
         }
     };
-    if let Some(event) = event_to_send {
+    for event in events_to_send {
         let _ = events.send(event);
     }
 }
@@ -760,26 +780,53 @@ fn route_event(
 pub(super) enum ProductWriteState {
     Idle,
     Armed {
+        transaction_id: u64,
         baseline: u32,
         pending: VecDeque<ClipboardEvent>,
+        deadline: Instant,
     },
     Expected {
         sequence: u32,
     },
 }
 
+impl ProductWriteState {
+    fn armed(baseline: u32) -> Self {
+        Self::Armed {
+            transaction_id: NEXT_PRODUCT_WRITE_TRANSACTION.fetch_add(1, Ordering::Relaxed),
+            baseline,
+            pending: VecDeque::new(),
+            deadline: Instant::now() + PRODUCT_WRITE_TRANSACTION_TIMEOUT,
+        }
+    }
+
+    fn transaction_id(&self) -> Option<u64> {
+        match self {
+            Self::Armed { transaction_id, .. } => Some(*transaction_id),
+            _ => None,
+        }
+    }
+}
+
 pub struct ProductWriteGuard {
     state: Arc<Mutex<ProductWriteState>>,
     events: Sender<ClipboardEvent>,
+    transaction_id: u64,
     finished: bool,
 }
 
 impl ProductWriteGuard {
     pub fn finish(mut self, owned_sequences: &[u32]) {
         let mut state = lock_unpoisoned(&self.state);
+        if state.transaction_id() != Some(self.transaction_id) {
+            self.finished = true;
+            return;
+        }
         let previous = std::mem::replace(&mut *state, ProductWriteState::Idle);
         *state = match previous {
-            ProductWriteState::Armed { baseline, pending } => {
+            ProductWriteState::Armed {
+                baseline, pending, ..
+            } => {
                 let owned_sequences: Vec<_> = owned_sequences
                     .iter()
                     .copied()
@@ -821,6 +868,9 @@ impl ProductWriteGuard {
     fn cancel_inner(&mut self) {
         let pending = {
             let mut state = lock_unpoisoned(&self.state);
+            if state.transaction_id() != Some(self.transaction_id) {
+                return;
+            }
             match std::mem::replace(&mut *state, ProductWriteState::Idle) {
                 ProductWriteState::Armed { pending, .. } => pending,
                 _ => VecDeque::new(),
@@ -1258,18 +1308,18 @@ mod tests {
         cell::RefCell,
         collections::VecDeque,
         sync::{Arc, Mutex, mpsc},
+        time::{Duration, Instant},
     };
 
     use chrono::Utc;
 
     use super::{
         ClipboardEvent, ClipboardListenerError, ClipboardPayloadKind, ClipboardReadError,
-        ClipboardWriteError, MAX_IMAGE_PAYLOAD_BYTES, MAX_PENDING_PRODUCT_WRITE_EVENTS,
-        MAX_TEXT_PAYLOAD_BYTES, ProductWriteGuard, ProductWriteState, ReadyWait, ShutdownFailure,
-        classify_format_read, classify_global_unlock, classify_payload_size,
-        classify_registered_format, combine_clipboard_operation_and_close, decode_unicode_text,
-        finish_product_write, orchestrate_listener_initialization, route_event,
-        validate_representations,
+        ClipboardWriteError, MAX_IMAGE_PAYLOAD_BYTES, MAX_TEXT_PAYLOAD_BYTES, ProductWriteGuard,
+        ProductWriteState, ReadyWait, ShutdownFailure, classify_format_read,
+        classify_global_unlock, classify_payload_size, classify_registered_format,
+        combine_clipboard_operation_and_close, decode_unicode_text, finish_product_write,
+        orchestrate_listener_initialization, route_event, validate_representations,
     };
     use crate::domain::{
         CapturedClipboard, ClipboardRepresentation, ContentIdentity, SourceIdentity,
@@ -1278,19 +1328,11 @@ mod tests {
     #[test]
     fn finishing_owned_write_replays_interleaved_external_event() {
         let (events, receiver) = mpsc::channel();
-        let state = Arc::new(Mutex::new(ProductWriteState::Armed {
-            baseline: 40,
-            pending: VecDeque::new(),
-        }));
+        let state = Arc::new(Mutex::new(ProductWriteState::armed(40)));
         route_event(&state, &events, event(41));
         route_event(&state, &events, event(42));
 
-        ProductWriteGuard {
-            state,
-            events,
-            finished: false,
-        }
-        .finish(&[42]);
+        product_write_guard(state, events).finish(&[42]);
 
         assert_eq!(receiver.recv().unwrap().sequence_number, 41);
         assert!(receiver.try_recv().is_err());
@@ -1299,17 +1341,9 @@ mod tests {
     #[test]
     fn notification_after_finish_is_suppressed_once() {
         let (events, receiver) = mpsc::channel();
-        let state = Arc::new(Mutex::new(ProductWriteState::Armed {
-            baseline: 50,
-            pending: VecDeque::new(),
-        }));
+        let state = Arc::new(Mutex::new(ProductWriteState::armed(50)));
 
-        ProductWriteGuard {
-            state: Arc::clone(&state),
-            events: events.clone(),
-            finished: false,
-        }
-        .finish(&[51]);
+        product_write_guard(Arc::clone(&state), events.clone()).finish(&[51]);
 
         route_event(&state, &events, event(51));
         assert!(receiver.try_recv().is_err());
@@ -1320,17 +1354,10 @@ mod tests {
     #[test]
     fn open_clipboard_failure_cancels_ownership_and_replays_pending_external_events() {
         let (events, receiver) = mpsc::channel();
-        let state = Arc::new(Mutex::new(ProductWriteState::Armed {
-            baseline: 60,
-            pending: VecDeque::new(),
-        }));
+        let state = Arc::new(Mutex::new(ProductWriteState::armed(60)));
         route_event(&state, &events, event(61));
 
-        drop(ProductWriteGuard {
-            state,
-            events,
-            finished: false,
-        });
+        drop(product_write_guard(state, events));
 
         assert_eq!(receiver.recv().unwrap().sequence_number, 61);
         assert!(receiver.try_recv().is_err());
@@ -1339,21 +1366,11 @@ mod tests {
     #[test]
     fn empty_clipboard_failure_replays_every_pending_external_event() {
         let (events, receiver) = mpsc::channel();
-        let state = Arc::new(Mutex::new(ProductWriteState::Armed {
-            baseline: 70,
-            pending: VecDeque::new(),
-        }));
+        let state = Arc::new(Mutex::new(ProductWriteState::armed(70)));
         route_event(&state, &events, event(71));
         route_event(&state, &events, event(72));
 
-        finish_product_write(
-            ProductWriteGuard {
-                state,
-                events,
-                finished: false,
-            },
-            &[],
-        );
+        finish_product_write(product_write_guard(state, events), &[]);
 
         assert_eq!(
             receiver
@@ -1367,17 +1384,9 @@ mod tests {
     #[test]
     fn unchanged_baseline_does_not_suppress_next_external_event() {
         let (events, receiver) = mpsc::channel();
-        let state = Arc::new(Mutex::new(ProductWriteState::Armed {
-            baseline: 65,
-            pending: VecDeque::new(),
-        }));
+        let state = Arc::new(Mutex::new(ProductWriteState::armed(65)));
 
-        ProductWriteGuard {
-            state: Arc::clone(&state),
-            events: events.clone(),
-            finished: false,
-        }
-        .finish(&[65]);
+        product_write_guard(Arc::clone(&state), events.clone()).finish(&[65]);
 
         route_event(&state, &events, event(66));
         assert_eq!(receiver.recv().unwrap().sequence_number, 66);
@@ -1386,18 +1395,11 @@ mod tests {
     #[test]
     fn close_clipboard_failure_after_owned_change_suppresses_only_the_owned_sequence() {
         let (events, receiver) = mpsc::channel();
-        let state = Arc::new(Mutex::new(ProductWriteState::Armed {
-            baseline: 65,
-            pending: VecDeque::new(),
-        }));
+        let state = Arc::new(Mutex::new(ProductWriteState::armed(65)));
         route_event(&state, &events, event(66));
 
         finish_product_write(
-            ProductWriteGuard {
-                state: Arc::clone(&state),
-                events: events.clone(),
-                finished: false,
-            },
+            product_write_guard(Arc::clone(&state), events.clone()),
             &[66],
         );
 
@@ -1407,68 +1409,134 @@ mod tests {
     }
 
     #[test]
-    fn owned_write_pending_overflow_preserves_the_latest_external_state() {
+    fn cancelling_owned_write_replays_more_than_32_external_events_without_loss() {
         let (events, receiver) = mpsc::channel();
-        let state = Arc::new(Mutex::new(ProductWriteState::Armed {
-            baseline: 70,
-            pending: VecDeque::new(),
-        }));
-        let event_count = MAX_PENDING_PRODUCT_WRITE_EVENTS + 5;
+        let state = Arc::new(Mutex::new(ProductWriteState::armed(70)));
+        let event_count = 37;
 
         for offset in 1..=event_count {
             route_event(&state, &events, event(70 + offset as u32));
         }
 
-        let pending_len = match &*state.lock().unwrap() {
-            ProductWriteState::Armed { pending, .. } => pending.len(),
-            state => panic!("expected armed state, got {state:?}"),
-        };
-        assert_eq!(pending_len, MAX_PENDING_PRODUCT_WRITE_EVENTS);
-
-        ProductWriteGuard {
-            state,
-            events,
-            finished: false,
-        }
-        .finish(&[70 + event_count as u32]);
+        product_write_guard(state, events).cancel();
 
         let observed: Vec<_> = receiver
             .try_iter()
             .map(|event| event.sequence_number)
             .collect();
-        assert_eq!(observed.last().copied(), Some(70 + event_count as u32 - 1));
+        assert_eq!(observed, (71..=70 + event_count as u32).collect::<Vec<_>>());
     }
 
     #[test]
-    fn overflow_never_publishes_product_sequence_and_keeps_latest_external_event() {
+    fn successful_owned_write_suppresses_only_product_event_after_more_than_32_events() {
         let (events, receiver) = mpsc::channel();
-        let state = Arc::new(Mutex::new(ProductWriteState::Armed {
-            baseline: 80,
-            pending: VecDeque::new(),
-        }));
+        let state = Arc::new(Mutex::new(ProductWriteState::armed(80)));
         let product_sequence = 81;
         route_event(&state, &events, event(product_sequence));
-        for offset in 2..=MAX_PENDING_PRODUCT_WRITE_EVENTS + 5 {
+        for offset in 2..=37 {
             route_event(&state, &events, event(80 + offset as u32));
         }
 
         assert!(receiver.try_recv().is_err());
-        ProductWriteGuard {
-            state,
-            events,
-            finished: false,
-        }
-        .finish(&[product_sequence]);
+        product_write_guard(state, events).finish(&[product_sequence]);
 
         let observed: Vec<_> = receiver
             .try_iter()
             .map(|event| event.sequence_number)
             .collect();
-        assert!(!observed.contains(&product_sequence));
+        assert_eq!(observed, (82..=117).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn expired_owned_write_replays_all_pending_events_and_current_event_in_order() {
+        let (events, receiver) = mpsc::channel();
+        let state = Arc::new(Mutex::new(ProductWriteState::armed(120)));
+        {
+            let mut state = state.lock().unwrap();
+            let ProductWriteState::Armed {
+                pending, deadline, ..
+            } = &mut *state
+            else {
+                panic!("expected armed product write");
+            };
+            *pending = VecDeque::from([event(121), event(122)]);
+            *deadline = Instant::now() - Duration::from_millis(1);
+        }
+
+        route_event(&state, &events, event(123));
+
         assert_eq!(
-            observed.last().copied(),
-            Some(80 + (MAX_PENDING_PRODUCT_WRITE_EVENTS + 5) as u32)
+            receiver
+                .try_iter()
+                .map(|event| event.sequence_number)
+                .collect::<Vec<_>>(),
+            [121, 122, 123]
         );
+        assert!(matches!(*state.lock().unwrap(), ProductWriteState::Idle));
+    }
+
+    #[test]
+    fn expired_guard_cannot_cancel_a_newer_product_write_transaction() {
+        let (events, receiver) = mpsc::channel();
+        let state = Arc::new(Mutex::new(ProductWriteState::armed(120)));
+        let expired_guard = product_write_guard(Arc::clone(&state), events.clone());
+        {
+            let mut state = state.lock().unwrap();
+            let ProductWriteState::Armed { deadline, .. } = &mut *state else {
+                panic!("expected armed product write");
+            };
+            *deadline = Instant::now() - Duration::from_millis(1);
+        }
+        route_event(&state, &events, event(121));
+
+        *state.lock().unwrap() = ProductWriteState::armed(130);
+        let new_transaction_id = state.lock().unwrap().transaction_id().unwrap();
+        route_event(&state, &events, event(131));
+        drop(expired_guard);
+
+        match &*state.lock().unwrap() {
+            ProductWriteState::Armed {
+                transaction_id,
+                pending,
+                ..
+            } => {
+                assert_eq!(*transaction_id, new_transaction_id);
+                assert_eq!(
+                    pending
+                        .iter()
+                        .map(|event| event.sequence_number)
+                        .collect::<Vec<_>>(),
+                    [131]
+                );
+            }
+            state => panic!("expected newer armed state, got {state:?}"),
+        }
+
+        product_write_guard(state, events).cancel();
+        assert_eq!(
+            receiver
+                .try_iter()
+                .map(|event| event.sequence_number)
+                .collect::<Vec<_>>(),
+            [121, 131]
+        );
+    }
+
+    fn product_write_guard(
+        state: Arc<Mutex<ProductWriteState>>,
+        events: mpsc::Sender<ClipboardEvent>,
+    ) -> ProductWriteGuard {
+        let transaction_id = state
+            .lock()
+            .unwrap()
+            .transaction_id()
+            .expect("product write must be armed");
+        ProductWriteGuard {
+            state,
+            events,
+            transaction_id,
+            finished: false,
+        }
     }
 
     #[test]

@@ -1,14 +1,24 @@
 use std::{
+    cell::RefCell,
+    collections::HashMap,
     collections::hash_map::DefaultHasher,
     error::Error,
     fmt,
     hash::{Hash, Hasher},
     mem::{size_of, zeroed},
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicBool, AtomicIsize, AtomicU8, AtomicUsize, Ordering},
+        mpsc::{self, Receiver, Sender},
+    },
+    thread::{self, JoinHandle},
+    time::Duration,
 };
 
 use windows::Win32::{
-    Foundation::{CloseHandle, ERROR_SUCCESS, FILETIME, GetLastError, HANDLE, HWND, SetLastError},
+    Foundation::{
+        CloseHandle, ERROR_SUCCESS, FILETIME, GetLastError, HANDLE, HWND, SetLastError, WIN32_ERROR,
+    },
     Security::{
         GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, IsTokenRestricted,
         TOKEN_MANDATORY_LABEL, TOKEN_QUERY, TokenIntegrityLevel, TokenIsAppContainer,
@@ -25,18 +35,22 @@ use windows::Win32::{
         },
     },
     UI::{
+        Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent},
         Input::KeyboardAndMouse::{
             GetAsyncKeyState, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP,
             SendInput, SetFocus, VIRTUAL_KEY, VK_CONTROL, VK_V,
         },
         WindowsAndMessaging::{
-            GA_ROOT, GCW_ATOM, GUITHREADINFO, GWLP_HINSTANCE, GWLP_USERDATA, GWLP_WNDPROC,
-            GetAncestor, GetClassLongPtrW, GetForegroundWindow, GetGUIThreadInfo, GetPropW,
-            GetWindowLongPtrW, GetWindowThreadProcessId, IsWindow, SetPropW,
+            CHILDID_SELF, DispatchMessageW, EVENT_OBJECT_DESTROY, GA_ROOT, GCW_ATOM, GUITHREADINFO,
+            GWLP_HINSTANCE, GWLP_USERDATA, GWLP_WNDPROC, GetAncestor, GetClassLongPtrW,
+            GetForegroundWindow, GetGUIThreadInfo, GetWindowLongPtrW, GetWindowThreadProcessId,
+            IsWindow, MSG, OBJID_WINDOW, PM_NOREMOVE, PM_REMOVE, PeekMessageW, PostThreadMessageW,
+            WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_APP,
         },
     },
 };
 
+use crate::domain::TargetToken;
 use crate::services::paste::{PasteInput, PasteTarget, TargetIdentity, TargetSnapshot};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -111,40 +125,56 @@ impl PasteTarget for Win32PasteTarget {
         }
         let root = unsafe { GetAncestor(foreground, GA_ROOT) };
         let window = if root.0.is_null() { foreground } else { root };
-        let (window_generation, identity) = capture_with_lifecycle_proof(
-            || establish_window_generation(window),
-            || inspect_window(window),
-            || read_window_generation(window),
-        )?;
-        let focused_control = focused_control(identity.thread_id)?
-            .filter(|focused| *focused != window)
-            .map(WindowsWindow::from_hwnd);
-        let (focused_control_instance_id, focused_control_generation) = match focused_control {
-            Some(control) => {
-                let (generation, instance_id) = capture_with_lifecycle_proof(
-                    || establish_window_generation(control.hwnd()),
-                    || {
-                        if window_process_thread(control.hwnd())?
-                            != (identity.process_id, identity.thread_id)
-                        {
-                            return Err(WindowsPasteError::LifecycleProof);
-                        }
-                        window_instance_id(control.hwnd())
-                    },
-                    || read_window_generation(control.hwnd()),
-                )?;
-                (Some(instance_id), Some(generation))
+        let (process_id, thread_id) = window_process_thread(window)?;
+        let observer = Win32LifecycleObserver::new(process_id, thread_id);
+        let (lifecycle_token, captured) = capture_with_observer(&observer, || {
+            if foreground_root() != Some(window) {
+                return Err(WindowsPasteError::LifecycleProof);
             }
-            None => (None, None),
-        };
-        Ok(TargetSnapshot {
+            let identity = inspect_window(window)?;
+            if (identity.process_id, identity.thread_id) != (process_id, thread_id) {
+                return Err(WindowsPasteError::LifecycleProof);
+            }
+            let focused = focused_control(thread_id)?.ok_or(WindowsPasteError::LifecycleProof)?;
+            let focused_control_instance_id = if focused == window {
+                None
+            } else {
+                if window_process_thread(focused)? != (process_id, thread_id) {
+                    return Err(WindowsPasteError::LifecycleProof);
+                }
+                Some(window_instance_id(focused)?)
+            };
+            if inspect_window(window)? != identity
+                || foreground_root() != Some(window)
+                || focused_control(thread_id)? != Some(focused)
+            {
+                return Err(WindowsPasteError::LifecycleProof);
+            }
+            Ok(ObservedCapture {
+                top: window,
+                focus: Some(focused),
+                value: (identity, focused, focused_control_instance_id),
+            })
+        })?;
+        let (identity, focused, focused_control_instance_id) = captured;
+        let snapshot = TargetSnapshot {
             window: WindowsWindow::from_hwnd(window),
-            focused_control,
+            focused_control: (focused != window).then(|| WindowsWindow::from_hwnd(focused)),
             identity,
-            window_generation,
+            lifecycle_token,
             focused_control_instance_id,
-            focused_control_generation,
-        })
+        };
+        retain_validated_capture(
+            snapshot,
+            lifecycle_token,
+            |snapshot| {
+                Ok(lifecycle_valid(snapshot)?
+                    && inspect_window(window)? == identity
+                    && foreground_root() == Some(window)
+                    && focused_control(thread_id)? == Some(focused))
+            },
+            release_lifecycle,
+        )
     }
 
     fn inspect(&self, window: Self::Window) -> Result<TargetIdentity, Self::Error> {
@@ -176,9 +206,9 @@ impl PasteTarget for Win32PasteTarget {
         }
         if let Some(control) = target.focused_control {
             restore_focus_control(
+                target,
                 control,
                 target.focused_control_instance_id,
-                target.focused_control_generation,
                 target.identity.process_id,
                 target.identity.thread_id,
             )?;
@@ -207,81 +237,453 @@ impl PasteTarget for Win32PasteTarget {
     fn lifecycle_valid(&self, target: &TargetSnapshot<Self::Window>) -> Result<bool, Self::Error> {
         lifecycle_valid(target)
     }
+
+    fn release_lifecycle(&self, target: &TargetSnapshot<Self::Window>) {
+        release_lifecycle(target.lifecycle_token);
+    }
 }
 
-static NEXT_WINDOW_GENERATION: AtomicUsize = AtomicUsize::new(1);
-const WINDOW_GENERATION_PROPERTY: windows::core::PCWSTR =
-    windows::core::w!("ClipboardAssistant.WindowGeneration");
-const WINDOW_GENERATION_OWNER_PROPERTY: windows::core::PCWSTR =
-    windows::core::w!("ClipboardAssistant.WindowGenerationOwner");
+const LIFECYCLE_CAPTURING: u8 = 0;
+const LIFECYCLE_ACTIVE: u8 = 1;
+const LIFECYCLE_RELEASED: u8 = 2;
+const LIFECYCLE_STOP_MESSAGE: u32 = WM_APP + 0x31;
+const LIFECYCLE_SYNC_MESSAGE: u32 = WM_APP + 0x32;
+const LIFECYCLE_SYNC_TIMEOUT: Duration = Duration::from_secs(1);
 
-fn establish_window_generation(window: HWND) -> Result<usize, WindowsPasteError> {
-    let generation = NEXT_WINDOW_GENERATION
-        .fetch_add(1, Ordering::Relaxed)
-        .max(1);
-    let owner = unsafe { GetCurrentProcessId() } as usize;
-    unsafe {
-        SetPropW(
-            window,
-            WINDOW_GENERATION_OWNER_PROPERTY,
-            Some(HANDLE(owner as *mut _)),
+static NEXT_LIFECYCLE_TOKEN: AtomicUsize = AtomicUsize::new(1);
+static LIFECYCLE_REGISTRY: OnceLock<Mutex<HashMap<usize, LifecycleEntry>>> = OnceLock::new();
+
+thread_local! {
+    static THREAD_LIFECYCLE_STATE: RefCell<Option<Arc<LifecycleState>>> = const { RefCell::new(None) };
+}
+
+struct LifecycleState {
+    phase: AtomicU8,
+    top: AtomicIsize,
+    focus: AtomicIsize,
+    invalid: AtomicBool,
+    alive: AtomicBool,
+    stop: AtomicBool,
+}
+
+impl LifecycleState {
+    fn new() -> Self {
+        Self {
+            phase: AtomicU8::new(LIFECYCLE_CAPTURING),
+            top: AtomicIsize::new(0),
+            focus: AtomicIsize::new(0),
+            invalid: AtomicBool::new(false),
+            alive: AtomicBool::new(false),
+            stop: AtomicBool::new(false),
+        }
+    }
+
+    fn activate(&self, top: HWND, focus: Option<HWND>) -> Result<(), WindowsPasteError> {
+        self.top.store(top.0 as isize, Ordering::Release);
+        self.focus.store(
+            focus.map_or(0, |window| window.0 as isize),
+            Ordering::Release,
+        );
+        if self.invalid.load(Ordering::Acquire) || !self.alive.load(Ordering::Acquire) {
+            return Err(WindowsPasteError::LifecycleProof);
+        }
+        self.phase.store(LIFECYCLE_ACTIVE, Ordering::Release);
+        if self.invalid.load(Ordering::Acquire) || !self.alive.load(Ordering::Acquire) {
+            Err(WindowsPasteError::LifecycleProof)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn valid_for(&self, top: HWND, focus: HWND) -> bool {
+        self.phase.load(Ordering::Acquire) == LIFECYCLE_ACTIVE
+            && self.alive.load(Ordering::Acquire)
+            && !self.invalid.load(Ordering::Acquire)
+            && self.top.load(Ordering::Acquire) == top.0 as isize
+            && self.focus.load(Ordering::Acquire) == focus.0 as isize
+    }
+}
+
+struct LifecycleEntry {
+    state: Arc<LifecycleState>,
+    observer_thread_id: u32,
+    sync: Receiver<()>,
+    thread: JoinHandle<()>,
+}
+
+struct PendingLifecycleObserver {
+    state: Arc<LifecycleState>,
+    observer_thread_id: u32,
+    sync: Option<Receiver<()>>,
+    thread: Option<JoinHandle<()>>,
+    handed_off: bool,
+}
+
+impl PendingLifecycleObserver {
+    fn start(process_id: u32, thread_id: u32) -> Result<Self, WindowsPasteError> {
+        let state = Arc::new(LifecycleState::new());
+        let thread_state = Arc::clone(&state);
+        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        let (sync_tx, sync_rx) = mpsc::channel();
+        let thread = thread::Builder::new()
+            .name("paste-lifecycle-observer".into())
+            .spawn(move || {
+                lifecycle_observer_thread(process_id, thread_id, thread_state, ready_tx, sync_tx)
+            })
+            .map_err(|_| WindowsPasteError::LifecycleProof)?;
+        match ready_rx.recv() {
+            Ok(Ok(observer_thread_id)) => Ok(Self {
+                state,
+                observer_thread_id,
+                sync: Some(sync_rx),
+                thread: Some(thread),
+                handed_off: false,
+            }),
+            _ => {
+                let _ = thread.join();
+                Err(WindowsPasteError::LifecycleProof)
+            }
+        }
+    }
+
+    fn activate(
+        mut self,
+        top: HWND,
+        focus: Option<HWND>,
+    ) -> Result<TargetToken, WindowsPasteError> {
+        self.state.top.store(top.0 as isize, Ordering::Release);
+        self.state.focus.store(
+            focus.map_or(0, |window| window.0 as isize),
+            Ordering::Release,
+        );
+        unsafe {
+            PostThreadMessageW(
+                self.observer_thread_id,
+                LIFECYCLE_SYNC_MESSAGE,
+                Default::default(),
+                Default::default(),
+            )
+        }
+        .map_err(|_| WindowsPasteError::LifecycleProof)?;
+        self.sync
+            .as_ref()
+            .ok_or(WindowsPasteError::LifecycleProof)?
+            .recv_timeout(LIFECYCLE_SYNC_TIMEOUT)
+            .map_err(|_| WindowsPasteError::LifecycleProof)?;
+        self.state.activate(top, focus)?;
+        let token = NEXT_LIFECYCLE_TOKEN.fetch_add(1, Ordering::Relaxed).max(1);
+        let thread = self
+            .thread
+            .take()
+            .ok_or(WindowsPasteError::LifecycleProof)?;
+        lifecycle_registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                token,
+                LifecycleEntry {
+                    state: Arc::clone(&self.state),
+                    observer_thread_id: self.observer_thread_id,
+                    sync: self.sync.take().ok_or(WindowsPasteError::LifecycleProof)?,
+                    thread,
+                },
+            );
+        self.handed_off = true;
+        Ok(TargetToken::from_platform_value(token))
+    }
+
+    fn stop(&mut self) {
+        if self.handed_off {
+            return;
+        }
+        self.state
+            .phase
+            .store(LIFECYCLE_RELEASED, Ordering::Release);
+        self.state.invalid.store(true, Ordering::Release);
+        self.state.stop.store(true, Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            let _ = unsafe {
+                PostThreadMessageW(
+                    self.observer_thread_id,
+                    LIFECYCLE_STOP_MESSAGE,
+                    Default::default(),
+                    Default::default(),
+                )
+            };
+            let _ = thread.join();
+        }
+    }
+}
+
+impl Drop for PendingLifecycleObserver {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+struct OwnedWinEventHook(HWINEVENTHOOK);
+
+impl Drop for OwnedWinEventHook {
+    fn drop(&mut self) {
+        let _ = unsafe { UnhookWinEvent(self.0) };
+    }
+}
+
+fn lifecycle_observer_thread(
+    process_id: u32,
+    thread_id: u32,
+    state: Arc<LifecycleState>,
+    ready: mpsc::SyncSender<Result<u32, WindowsPasteError>>,
+    sync: Sender<()>,
+) {
+    let mut message = MSG::default();
+    let _ = unsafe { PeekMessageW(&mut message, None, 0, 0, PM_NOREMOVE) };
+    THREAD_LIFECYCLE_STATE.with(|slot| *slot.borrow_mut() = Some(Arc::clone(&state)));
+    let hook = unsafe {
+        SetWinEventHook(
+            EVENT_OBJECT_DESTROY,
+            EVENT_OBJECT_DESTROY,
+            None,
+            Some(lifecycle_event_callback),
+            process_id,
+            thread_id,
+            WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
         )
+    };
+    if hook.0.is_null() {
+        THREAD_LIFECYCLE_STATE.with(|slot| slot.borrow_mut().take());
+        let _ = ready.send(Err(WindowsPasteError::LifecycleProof));
+        return;
     }
-    .map_err(|_| WindowsPasteError::LifecycleProof)?;
-    unsafe {
-        SetPropW(
-            window,
-            WINDOW_GENERATION_PROPERTY,
-            Some(HANDLE(generation as *mut _)),
-        )
-    }
-    .map_err(|_| WindowsPasteError::LifecycleProof)?;
-    if read_window_generation(window) == Some(generation) {
-        Ok(generation)
+    let _hook = OwnedWinEventHook(hook);
+    state.alive.store(true, Ordering::Release);
+    if ready.send(Ok(unsafe { GetCurrentThreadId() })).is_err() {
+        state.invalid.store(true, Ordering::Release);
     } else {
-        Err(WindowsPasteError::LifecycleProof)
+        while !state.stop.load(Ordering::Acquire) {
+            let mut processed = false;
+            while unsafe { PeekMessageW(&mut message, None, 0, 0, PM_REMOVE) }.as_bool() {
+                processed = true;
+                if message.message == LIFECYCLE_STOP_MESSAGE {
+                    state.stop.store(true, Ordering::Release);
+                    break;
+                }
+                if message.message == LIFECYCLE_SYNC_MESSAGE {
+                    if sync.send(()).is_err() {
+                        state.invalid.store(true, Ordering::Release);
+                        state.stop.store(true, Ordering::Release);
+                        break;
+                    }
+                } else {
+                    unsafe { DispatchMessageW(&message) };
+                }
+            }
+            if !processed {
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+    state.alive.store(false, Ordering::Release);
+    state.invalid.store(true, Ordering::Release);
+    THREAD_LIFECYCLE_STATE.with(|slot| slot.borrow_mut().take());
+}
+
+unsafe extern "system" fn lifecycle_event_callback(
+    _hook: HWINEVENTHOOK,
+    event: u32,
+    window: HWND,
+    object_id: i32,
+    child_id: i32,
+    _event_thread: u32,
+    _event_time: u32,
+) {
+    if event != EVENT_OBJECT_DESTROY
+        || object_id != OBJID_WINDOW.0
+        || child_id != CHILDID_SELF as i32
+    {
+        return;
+    }
+    THREAD_LIFECYCLE_STATE.with(|slot| {
+        let state = slot.borrow();
+        let Some(state) = state.as_ref() else {
+            return;
+        };
+        let phase = state.phase.load(Ordering::Acquire);
+        if phase == LIFECYCLE_CAPTURING
+            || (phase == LIFECYCLE_ACTIVE
+                && [
+                    state.top.load(Ordering::Acquire),
+                    state.focus.load(Ordering::Acquire),
+                ]
+                .contains(&(window.0 as isize)))
+        {
+            state.invalid.store(true, Ordering::Release);
+        }
+    });
+}
+
+struct ObservedCapture<W, T> {
+    top: W,
+    focus: Option<W>,
+    value: T,
+}
+
+trait LifecycleObserver<W: Copy> {
+    fn observe(&self) -> Result<(), WindowsPasteError>;
+    fn activate(&self, top: W, focus: Option<W>) -> Result<TargetToken, WindowsPasteError>;
+    fn cancel(&self);
+}
+
+struct Win32LifecycleObserver {
+    process_id: u32,
+    thread_id: u32,
+    pending: Mutex<Option<PendingLifecycleObserver>>,
+}
+
+impl Win32LifecycleObserver {
+    fn new(process_id: u32, thread_id: u32) -> Self {
+        Self {
+            process_id,
+            thread_id,
+            pending: Mutex::new(None),
+        }
     }
 }
 
-fn capture_with_lifecycle_proof<T>(
-    install_generation: impl FnOnce() -> Result<usize, WindowsPasteError>,
-    inspect: impl FnOnce() -> Result<T, WindowsPasteError>,
-    read_generation: impl FnOnce() -> Option<usize>,
-) -> Result<(usize, T), WindowsPasteError> {
-    let generation = install_generation()?;
-    let value = inspect()?;
-    if read_generation() == Some(generation) {
-        Ok((generation, value))
-    } else {
-        Err(WindowsPasteError::LifecycleProof)
+impl LifecycleObserver<HWND> for Win32LifecycleObserver {
+    fn observe(&self) -> Result<(), WindowsPasteError> {
+        let observer = PendingLifecycleObserver::start(self.process_id, self.thread_id)?;
+        *self
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(observer);
+        Ok(())
+    }
+
+    fn activate(&self, top: HWND, focus: Option<HWND>) -> Result<TargetToken, WindowsPasteError> {
+        self.pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .ok_or(WindowsPasteError::LifecycleProof)?
+            .activate(top, focus)
+    }
+
+    fn cancel(&self) {
+        self.pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
     }
 }
 
-fn read_window_generation(window: HWND) -> Option<usize> {
-    let owner = unsafe { GetPropW(window, WINDOW_GENERATION_OWNER_PROPERTY) };
-    if owner.0 as usize != unsafe { GetCurrentProcessId() } as usize {
-        return None;
+fn capture_with_observer<W: Copy, T>(
+    observer: &impl LifecycleObserver<W>,
+    capture: impl FnOnce() -> Result<ObservedCapture<W, T>, WindowsPasteError>,
+) -> Result<(TargetToken, T), WindowsPasteError> {
+    observer.observe()?;
+    let captured = match capture() {
+        Ok(captured) => captured,
+        Err(error) => {
+            observer.cancel();
+            return Err(error);
+        }
+    };
+    match observer.activate(captured.top, captured.focus) {
+        Ok(token) => Ok((token, captured.value)),
+        Err(error) => {
+            observer.cancel();
+            Err(error)
+        }
     }
-    let value = unsafe { GetPropW(window, WINDOW_GENERATION_PROPERTY) };
-    (!value.0.is_null()).then_some(value.0 as usize)
+}
+
+fn retain_validated_capture<T>(
+    captured: T,
+    token: TargetToken,
+    validate: impl FnOnce(&T) -> Result<bool, WindowsPasteError>,
+    release: impl FnOnce(TargetToken),
+) -> Result<T, WindowsPasteError> {
+    match validate(&captured) {
+        Ok(true) => Ok(captured),
+        Ok(false) => {
+            release(token);
+            Err(WindowsPasteError::LifecycleProof)
+        }
+        Err(error) => {
+            release(token);
+            Err(error)
+        }
+    }
+}
+
+fn lifecycle_registry() -> &'static Mutex<HashMap<usize, LifecycleEntry>> {
+    LIFECYCLE_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn lifecycle_valid(target: &TargetSnapshot<WindowsWindow>) -> Result<bool, WindowsPasteError> {
-    if read_window_generation(target.window.hwnd()) != Some(target.window_generation) {
+    let focus = target.focused_control.unwrap_or(target.window);
+    let registry = lifecycle_registry()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(entry) = registry.get(&target.lifecycle_token.platform_value()) else {
+        return Ok(false);
+    };
+    if unsafe {
+        PostThreadMessageW(
+            entry.observer_thread_id,
+            LIFECYCLE_SYNC_MESSAGE,
+            Default::default(),
+            Default::default(),
+        )
+    }
+    .is_err()
+        || entry.sync.recv_timeout(LIFECYCLE_SYNC_TIMEOUT).is_err()
+    {
+        entry.state.invalid.store(true, Ordering::Release);
         return Ok(false);
     }
-    match (
-        target.focused_control,
-        target.focused_control_instance_id,
-        target.focused_control_generation,
-    ) {
-        (None, None, None) => Ok(true),
-        (Some(control), Some(instance), Some(generation)) => {
-            Ok(read_window_generation(control.hwnd()) == Some(generation)
-                && window_instance_id(control.hwnd())? == instance)
-        }
+    if !entry.state.valid_for(target.window.hwnd(), focus.hwnd()) {
+        return Ok(false);
+    }
+    match (target.focused_control, target.focused_control_instance_id) {
+        (None, None) => Ok(true),
+        (Some(control), Some(instance)) => Ok(window_instance_id(control.hwnd())? == instance),
         _ => Ok(false),
     }
+}
+
+fn release_lifecycle(token: TargetToken) {
+    let entry = lifecycle_registry()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(&token.platform_value());
+    if let Some(entry) = entry {
+        entry
+            .state
+            .phase
+            .store(LIFECYCLE_RELEASED, Ordering::Release);
+        entry.state.invalid.store(true, Ordering::Release);
+        entry.state.stop.store(true, Ordering::Release);
+        let _ = unsafe {
+            PostThreadMessageW(
+                entry.observer_thread_id,
+                LIFECYCLE_STOP_MESSAGE,
+                Default::default(),
+                Default::default(),
+            )
+        };
+        let _ = entry.thread.join();
+    }
+}
+
+fn foreground_root() -> Option<HWND> {
+    let foreground = unsafe { GetForegroundWindow() };
+    if foreground.0.is_null() {
+        return None;
+    }
+    let root = unsafe { GetAncestor(foreground, GA_ROOT) };
+    Some(if root.0.is_null() { foreground } else { root })
 }
 
 fn inspect_window(window: HWND) -> Result<TargetIdentity, WindowsPasteError> {
@@ -349,21 +751,19 @@ fn focused_control(thread_id: u32) -> Result<Option<HWND>, WindowsPasteError> {
 }
 
 fn restore_focus_control(
+    target: &TargetSnapshot<WindowsWindow>,
     control: WindowsWindow,
     expected_instance_id: Option<u64>,
-    expected_generation: Option<usize>,
     process_id: u32,
     thread_id: u32,
 ) -> Result<(), WindowsPasteError> {
     let control = control.hwnd();
-    let (Some(expected_instance_id), Some(expected_generation)) =
-        (expected_instance_id, expected_generation)
-    else {
+    let Some(expected_instance_id) = expected_instance_id else {
         return Err(WindowsPasteError::LifecycleProof);
     };
     if !unsafe { IsWindow(Some(control)) }.as_bool()
         || window_process_thread(control)? != (process_id, thread_id)
-        || read_window_generation(control) != Some(expected_generation)
+        || !lifecycle_valid(target)?
         || window_instance_id(control)? != expected_instance_id
     {
         return Err(WindowsPasteError::FocusRestore);
@@ -374,9 +774,7 @@ fn restore_focus_control(
     if current_thread != thread_id && !attached {
         return Err(WindowsPasteError::FocusRestore);
     }
-    if read_window_generation(control) != Some(expected_generation)
-        || window_instance_id(control)? != expected_instance_id
-    {
+    if !lifecycle_valid(target)? || window_instance_id(control)? != expected_instance_id {
         if attached {
             let _ = unsafe { AttachThreadInput(current_thread, thread_id, false) };
         }
@@ -388,7 +786,7 @@ fn restore_focus_control(
     if !detached {
         return Err(WindowsPasteError::FocusRestore);
     }
-    if read_window_generation(control) == Some(expected_generation)
+    if lifecycle_valid(target)?
         && window_instance_id(control)? == expected_instance_id
         && focused_control(thread_id)? == Some(control)
     {
@@ -416,7 +814,7 @@ fn token_security(process: HANDLE) -> Result<ProcessSecurity, WindowsPasteError>
     let token = OwnedHandle(token);
     Ok(ProcessSecurity {
         integrity_level: token_integrity(token.0)?,
-        restricted: token_restricted(token.0),
+        restricted: token_restricted(token.0)?,
         app_container: token_u32(token.0, TokenIsAppContainer)? != 0,
     })
 }
@@ -458,8 +856,23 @@ fn token_u32(
     }
 }
 
-fn token_restricted(token: HANDLE) -> bool {
-    unsafe { IsTokenRestricted(token) }.is_ok()
+fn token_restricted(token: HANDLE) -> Result<bool, WindowsPasteError> {
+    unsafe { SetLastError(ERROR_SUCCESS) };
+    let restricted = unsafe { IsTokenRestricted(token) };
+    classify_token_restrictions(restricted.is_ok(), unsafe { GetLastError() })
+}
+
+fn classify_token_restrictions(
+    restricted: bool,
+    last_error: WIN32_ERROR,
+) -> Result<bool, WindowsPasteError> {
+    if restricted {
+        Ok(true)
+    } else if last_error == ERROR_SUCCESS {
+        Ok(false)
+    } else {
+        Err(WindowsPasteError::TokenInformation)
+    }
 }
 
 fn token_information(
@@ -590,6 +1003,7 @@ trait InputApi {
 
     fn foreground(&self) -> Self::Window;
     fn target_valid(&self, target: &TargetSnapshot<Self::Window>) -> bool;
+    fn focused_window(&self, thread_id: u32) -> Option<Self::Window>;
     fn key_down(&self, key: PasteKey) -> bool;
     fn send(&self, key: PasteKey, key_up: bool) -> bool;
 }
@@ -638,7 +1052,10 @@ fn target_matches<A: InputApi>(
     target: &TargetSnapshot<A::Window>,
     expected: A::Window,
 ) -> bool {
-    api.foreground() == expected && api.target_valid(target)
+    api.foreground() == expected
+        && api.target_valid(target)
+        && api.focused_window(target.identity.thread_id)
+            == Some(target.focused_control.unwrap_or(target.window))
 }
 
 fn release_pressed<A: InputApi>(
@@ -677,6 +1094,13 @@ impl InputApi for Win32InputApi {
             && lifecycle_valid(target).ok() == Some(true)
     }
 
+    fn focused_window(&self, thread_id: u32) -> Option<Self::Window> {
+        focused_control(thread_id)
+            .ok()
+            .flatten()
+            .map(WindowsWindow::from_hwnd)
+    }
+
     fn send(&self, key: PasteKey, key_up: bool) -> bool {
         let input = INPUT {
             r#type: INPUT_KEYBOARD,
@@ -710,26 +1134,92 @@ mod tests {
     use super::*;
 
     #[test]
-    fn stable_capture_installs_generation_before_inspection_and_rejects_reuse_during_inspection() {
-        use std::cell::Cell;
+    fn capture_requires_an_active_observer_before_inspection_and_rejects_capture_race() {
+        let observer = FakeLifecycleObserver::new();
+        observer.destroy_during_capture.lock().unwrap().push_back(7);
 
-        let generation = Cell::new(None);
-        let inspected_after_install = Cell::new(false);
-        let result = capture_with_lifecycle_proof(
-            || {
-                generation.set(Some(41));
-                Ok(41)
-            },
-            || {
-                inspected_after_install.set(generation.get() == Some(41));
-                generation.set(Some(42));
-                Ok(7)
-            },
-            || generation.get(),
-        );
+        let result = capture_with_observer(&observer, || {
+            observer.order.lock().unwrap().push("capture");
+            observer.capture_event();
+            Ok(ObservedCapture {
+                top: 7,
+                focus: Some(8),
+                value: (),
+            })
+        });
 
-        assert!(inspected_after_install.get());
         assert_eq!(result, Err(WindowsPasteError::LifecycleProof));
+        assert_eq!(*observer.order.lock().unwrap(), ["observe", "capture"]);
+    }
+
+    #[test]
+    fn lifecycle_observer_rejects_destroyed_or_reused_windows_and_cleans_up_tokens() {
+        let observer = FakeLifecycleObserver::new();
+        let (token, ()) = capture_with_observer(&observer, || {
+            Ok(ObservedCapture {
+                top: 7,
+                focus: Some(8),
+                value: (),
+            })
+        })
+        .unwrap();
+        assert!(observer.is_valid(&token));
+
+        observer.destroy(8);
+        assert!(!observer.is_valid(&token));
+
+        observer.release(token);
+        assert!(!observer.is_valid(&token));
+    }
+
+    #[test]
+    fn lifecycle_hook_failure_is_conservative() {
+        let observer = FakeLifecycleObserver::new();
+        *observer.install_ok.lock().unwrap() = false;
+
+        assert_eq!(
+            capture_with_observer(&observer, || Ok(ObservedCapture {
+                top: 7,
+                focus: Some(8),
+                value: (),
+            })),
+            Err(WindowsPasteError::LifecycleProof)
+        );
+    }
+
+    #[test]
+    fn handed_off_observer_drop_does_not_invalidate_registered_lifecycle() {
+        let state = Arc::new(LifecycleState::new());
+        state.phase.store(LIFECYCLE_ACTIVE, Ordering::Release);
+        state.alive.store(true, Ordering::Release);
+        drop(PendingLifecycleObserver {
+            state: Arc::clone(&state),
+            observer_thread_id: 0,
+            sync: None,
+            thread: None,
+            handed_off: true,
+        });
+
+        assert_eq!(state.phase.load(Ordering::Acquire), LIFECYCLE_ACTIVE);
+        assert!(state.alive.load(Ordering::Acquire));
+        assert!(!state.invalid.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn final_capture_validation_error_releases_lifecycle_token() {
+        let released = Mutex::new(Vec::new());
+        let token = TargetToken::from_platform_value(41);
+
+        assert_eq!(
+            retain_validated_capture(
+                7,
+                token,
+                |_| Err(WindowsPasteError::WindowIdentity),
+                |token| released.lock().unwrap().push(token.platform_value()),
+            ),
+            Err(WindowsPasteError::WindowIdentity)
+        );
+        assert_eq!(*released.lock().unwrap(), [41]);
     }
 
     #[test]
@@ -846,6 +1336,56 @@ mod tests {
     }
 
     #[test]
+    fn focus_change_before_first_key_down_sends_no_input() {
+        let api = FakeInputApi::new([]);
+        *api.focuses.lock().unwrap() = VecDeque::from([Some(8), Some(9)]);
+
+        assert_eq!(
+            send_ctrl_v(&api, &fake_target()),
+            Err(WindowsPasteError::ForegroundChanged)
+        );
+        assert!(api.events.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn focus_change_before_later_key_down_releases_owned_control() {
+        let api = FakeInputApi::new([true, true]);
+        *api.focuses.lock().unwrap() = VecDeque::from([Some(8), Some(8), Some(8), Some(9)]);
+
+        assert_eq!(
+            send_ctrl_v(&api, &fake_target()),
+            Err(WindowsPasteError::ForegroundChanged)
+        );
+        assert_eq!(
+            *api.events.lock().unwrap(),
+            [(PasteKey::Control, false), (PasteKey::Control, true)]
+        );
+    }
+
+    #[test]
+    fn top_level_focus_is_required_when_capture_has_no_independent_child() {
+        let api = FakeInputApi::new([]);
+        let target = fake_top_level_focus_target();
+        *api.focuses.lock().unwrap() = VecDeque::from([Some(7), None]);
+
+        assert_eq!(
+            send_ctrl_v(&api, &target),
+            Err(WindowsPasteError::ForegroundChanged)
+        );
+        assert!(api.events.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn token_restriction_query_distinguishes_all_three_results() {
+        assert_eq!(classify_token_restrictions(false, ERROR_SUCCESS), Ok(false));
+        assert_eq!(classify_token_restrictions(true, ERROR_SUCCESS), Ok(true));
+        assert_eq!(
+            classify_token_restrictions(false, WIN32_ERROR(5)),
+            Err(WindowsPasteError::TokenInformation)
+        );
+    }
+
+    #[test]
     fn production_input_source_contains_no_alt_activation_path() {
         let source = include_str!("paste.rs");
         let forbidden = ["VK_", "MENU"].concat();
@@ -868,7 +1408,7 @@ mod tests {
             .expect("open current process token");
         let token = OwnedHandle(token);
         assert!(token_integrity(token.0).expect("query current integrity") > 0);
-        let _ = token_restricted(token.0);
+        let _ = token_restricted(token.0).expect("query current token restrictions");
         let _ = token_u32(token.0, TokenIsAppContainer).expect("query current app container");
         assert!(input_desktop_identity().is_ok());
     }
@@ -889,6 +1429,7 @@ mod tests {
         held: Mutex<[bool; 2]>,
         results: Mutex<VecDeque<bool>>,
         validity: Mutex<VecDeque<bool>>,
+        focuses: Mutex<VecDeque<Option<i32>>>,
         events: Mutex<Vec<(PasteKey, bool)>>,
     }
 
@@ -899,6 +1440,7 @@ mod tests {
                 held: Mutex::new([false, false]),
                 results: Mutex::new(results.into_iter().collect()),
                 validity: Mutex::new(VecDeque::from([true])),
+                focuses: Mutex::new(VecDeque::from([Some(8)])),
                 events: Mutex::new(Vec::new()),
             }
         }
@@ -932,6 +1474,15 @@ mod tests {
             }
         }
 
+        fn focused_window(&self, _thread_id: u32) -> Option<Self::Window> {
+            let mut values = self.focuses.lock().unwrap();
+            if values.len() > 1 {
+                values.pop_front().unwrap()
+            } else {
+                *values.front().unwrap()
+            }
+        }
+
         fn send(&self, key: PasteKey, key_up: bool) -> bool {
             self.events.lock().unwrap().push((key, key_up));
             self.results.lock().unwrap().pop_front().unwrap_or(true)
@@ -953,9 +1504,108 @@ mod tests {
                 restricted: false,
                 app_container: false,
             },
-            window_generation: 10,
+            lifecycle_token: TargetToken::from_platform_value(10),
             focused_control_instance_id: Some(11),
-            focused_control_generation: Some(12),
+        }
+    }
+
+    fn fake_top_level_focus_target() -> TargetSnapshot<i32> {
+        TargetSnapshot {
+            focused_control: None,
+            focused_control_instance_id: None,
+            ..fake_target()
+        }
+    }
+
+    struct FakeLifecycleState {
+        top: i32,
+        focus: Option<i32>,
+        valid: bool,
+    }
+
+    struct FakeLifecycleObserver {
+        install_ok: Mutex<bool>,
+        destroy_during_capture: Mutex<VecDeque<i32>>,
+        order: Mutex<Vec<&'static str>>,
+        next_token: AtomicUsize,
+        pending_invalid: AtomicBool,
+        states: Mutex<HashMap<usize, FakeLifecycleState>>,
+    }
+
+    impl FakeLifecycleObserver {
+        fn new() -> Self {
+            Self {
+                install_ok: Mutex::new(true),
+                destroy_during_capture: Mutex::new(VecDeque::new()),
+                order: Mutex::new(Vec::new()),
+                next_token: AtomicUsize::new(1),
+                pending_invalid: AtomicBool::new(false),
+                states: Mutex::new(HashMap::new()),
+            }
+        }
+
+        fn capture_event(&self) {
+            if self
+                .destroy_during_capture
+                .lock()
+                .unwrap()
+                .pop_front()
+                .is_some()
+            {
+                self.pending_invalid.store(true, Ordering::Release);
+            }
+        }
+
+        fn destroy(&self, window: i32) {
+            for state in self.states.lock().unwrap().values_mut() {
+                if state.top == window || state.focus == Some(window) {
+                    state.valid = false;
+                }
+            }
+        }
+
+        fn is_valid(&self, token: &TargetToken) -> bool {
+            self.states
+                .lock()
+                .unwrap()
+                .get(&token.platform_value())
+                .is_some_and(|state| state.valid)
+        }
+
+        fn release(&self, token: TargetToken) {
+            self.states.lock().unwrap().remove(&token.platform_value());
+        }
+    }
+
+    impl LifecycleObserver<i32> for FakeLifecycleObserver {
+        fn observe(&self) -> Result<(), WindowsPasteError> {
+            self.order.lock().unwrap().push("observe");
+            self.pending_invalid.store(false, Ordering::Release);
+            if *self.install_ok.lock().unwrap() {
+                Ok(())
+            } else {
+                Err(WindowsPasteError::LifecycleProof)
+            }
+        }
+
+        fn activate(&self, top: i32, focus: Option<i32>) -> Result<TargetToken, WindowsPasteError> {
+            if self.pending_invalid.load(Ordering::Acquire) {
+                return Err(WindowsPasteError::LifecycleProof);
+            }
+            let id = self.next_token.fetch_add(1, Ordering::Relaxed);
+            self.states.lock().unwrap().insert(
+                id,
+                FakeLifecycleState {
+                    top,
+                    focus,
+                    valid: true,
+                },
+            );
+            Ok(TargetToken::from_platform_value(id))
+        }
+
+        fn cancel(&self) {
+            self.pending_invalid.store(true, Ordering::Release);
         }
     }
 }

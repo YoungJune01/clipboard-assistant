@@ -4,7 +4,7 @@ use std::{
     sync::{Mutex, MutexGuard},
 };
 
-use crate::domain::{ClipboardRepresentation, PasteFallbackReason, PasteOutcome};
+use crate::domain::{ClipboardRepresentation, PasteFallbackReason, PasteOutcome, TargetToken};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TargetIdentity {
@@ -24,9 +24,8 @@ pub struct TargetSnapshot<Window> {
     pub window: Window,
     pub focused_control: Option<Window>,
     pub identity: TargetIdentity,
-    pub window_generation: usize,
+    pub lifecycle_token: TargetToken,
     pub focused_control_instance_id: Option<u64>,
-    pub focused_control_generation: Option<usize>,
 }
 
 pub trait PasteTarget: Send + Sync + 'static {
@@ -40,6 +39,7 @@ pub trait PasteTarget: Send + Sync + 'static {
     fn restore(&self, target: &TargetSnapshot<Self::Window>) -> Result<(), Self::Error>;
     fn foreground(&self) -> Result<Self::Window, Self::Error>;
     fn lifecycle_valid(&self, target: &TargetSnapshot<Self::Window>) -> Result<bool, Self::Error>;
+    fn release_lifecycle(&self, target: &TargetSnapshot<Self::Window>);
 }
 
 pub trait PasteClipboard: Send + Sync + 'static {
@@ -139,16 +139,22 @@ where
     pub fn prepare_target(&self) -> Result<(), SafePasteError> {
         let _operation = lock_unpoisoned(&self.operation);
         let captured = self.target.capture().map_err(|error| {
-            *lock_unpoisoned(&self.original_target) = None;
+            if let Some(previous) = lock_unpoisoned(&self.original_target).take() {
+                self.target.release_lifecycle(&previous);
+            }
             SafePasteError::Capture(Box::new(error))
         })?;
-        *lock_unpoisoned(&self.original_target) = Some(captured);
+        if let Some(previous) = lock_unpoisoned(&self.original_target).replace(captured) {
+            self.target.release_lifecycle(&previous);
+        }
         Ok(())
     }
 
     pub fn clear_target(&self) {
         let _operation = lock_unpoisoned(&self.operation);
-        *lock_unpoisoned(&self.original_target) = None;
+        if let Some(target) = lock_unpoisoned(&self.original_target).take() {
+            self.target.release_lifecycle(&target);
+        }
     }
 
     pub fn paste(
@@ -160,24 +166,30 @@ where
         let target_is_safe = target
             .as_ref()
             .is_some_and(|target| self.target_is_safe(target));
-        self.clipboard
-            .publish(representations)
-            .map_err(|error| SafePasteError::Clipboard(Box::new(error)))?;
+        let result = (|| {
+            self.clipboard
+                .publish(representations)
+                .map_err(|error| SafePasteError::Clipboard(Box::new(error)))?;
 
-        self.hide_panel()?;
-        let Some(target) = target.filter(|_| target_is_safe) else {
-            return Ok(copy_only());
-        };
-        if self.target.restore(&target).is_err() || !self.target_is_safe(&target) {
-            return Ok(copy_only());
+            self.hide_panel()?;
+            let Some(target) = target.filter(|_| target_is_safe) else {
+                return Ok(copy_only());
+            };
+            if self.target.restore(&target).is_err() || !self.target_is_safe(&target) {
+                return Ok(copy_only());
+            }
+            if self.target.foreground().ok() != Some(target.window) {
+                return Ok(copy_only());
+            }
+            if self.input.send_ctrl_v(&target).is_err() {
+                return Ok(copy_only());
+            }
+            Ok(PasteOutcome::CommandSent)
+        })();
+        if let Some(target) = target {
+            self.target.release_lifecycle(&target);
         }
-        if self.target.foreground().ok() != Some(target.window) {
-            return Ok(copy_only());
-        }
-        if self.input.send_ctrl_v(&target).is_err() {
-            return Ok(copy_only());
-        }
-        Ok(PasteOutcome::CommandSent)
+        result
     }
 
     fn target_is_safe(&self, target: &TargetSnapshot<T::Window>) -> bool {
