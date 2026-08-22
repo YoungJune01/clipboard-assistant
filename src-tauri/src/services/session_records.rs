@@ -9,7 +9,9 @@ use crate::domain::{
 
 const MAX_SESSION_RECORDS: usize = 500;
 const DEFAULT_TOTAL_BYTES: usize = 64 * 1024 * 1024;
-const DEFAULT_RECORD_BYTES: usize = 16 * 1024 * 1024;
+pub(crate) const MAX_CAPTURE_RECORD_BYTES: usize = 16 * 1024 * 1024;
+pub(crate) const REPRESENTATION_OVERHEAD_BYTES: usize = 32;
+const DEFAULT_RECORD_BYTES: usize = MAX_CAPTURE_RECORD_BYTES;
 const DEFAULT_PREVIEW_BYTES: usize = 4 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -61,31 +63,41 @@ impl SessionRecordStore {
         }
     }
 
-    pub fn capture(&self, mut capture: CapturedClipboard) {
-        retain_preferred_image(&mut capture.representations);
-        if representation_bytes(&capture.representations) > self.limits.record_bytes {
-            return;
+    pub fn capture(&self, capture: CapturedClipboard) -> bool {
+        self.capture_batch(vec![capture])
+    }
+
+    pub(crate) fn capture_batch(&self, mut captures: Vec<CapturedClipboard>) -> bool {
+        for capture in &mut captures {
+            retain_preferred_image(&mut capture.representations);
+        }
+        if captures.iter().any(|capture| {
+            representation_bytes(&capture.representations) > self.limits.record_bytes
+        }) {
+            return false;
         }
         let mut state = lock_unpoisoned(&self.state);
-        if let Some(current) = state.records.front()
-            && current.content_identity == capture.content_identity
-        {
-            let previous_bytes = record_bytes(current);
-            let mut refreshed = current.clone();
-            let _ = refreshed.refresh_from(capture);
-            retain_preferred_image(&mut refreshed.representations);
-            let refreshed_bytes = record_bytes(&refreshed);
-            if refreshed_bytes <= self.limits.record_bytes {
+        for capture in captures {
+            if let Some(current) = state.records.front()
+                && current.content_identity == capture.content_identity
+            {
+                let previous_bytes = record_bytes(current);
+                let mut refreshed = current.clone();
+                let _ = refreshed.refresh_from(capture);
+                retain_preferred_image(&mut refreshed.representations);
+                let refreshed_bytes = record_bytes(&refreshed);
+                debug_assert!(refreshed_bytes <= self.limits.record_bytes);
                 state.total_bytes = state.total_bytes - previous_bytes + refreshed_bytes;
                 state.records[0] = refreshed;
                 evict_to_limits(&mut state, self.limits);
+                continue;
             }
-            return;
+            let record = ClipboardRecord::from_capture(capture);
+            state.total_bytes += record_bytes(&record);
+            state.records.push_front(record);
+            evict_to_limits(&mut state, self.limits);
         }
-        let record = ClipboardRecord::from_capture(capture);
-        state.total_bytes += record_bytes(&record);
-        state.records.push_front(record);
-        evict_to_limits(&mut state, self.limits);
+        true
     }
 
     pub fn list(&self) -> Vec<SessionRecordView> {
@@ -171,7 +183,7 @@ impl SessionRecordView {
     }
 }
 
-fn representation_bytes(representations: &[ClipboardRepresentation]) -> usize {
+pub(crate) fn representation_bytes(representations: &[ClipboardRepresentation]) -> usize {
     representations
         .iter()
         .map(|representation| match representation {
@@ -179,7 +191,7 @@ fn representation_bytes(representations: &[ClipboardRepresentation]) -> usize {
             ClipboardRepresentation::Png { bytes } | ClipboardRepresentation::DibV5 { bytes } => {
                 bytes.len()
             }
-        })
+        } + REPRESENTATION_OVERHEAD_BYTES)
         .sum()
 }
 
@@ -354,8 +366,8 @@ mod tests {
     #[test]
     fn store_enforces_single_and_total_byte_budgets_by_evicting_oldest_records() {
         let store = SessionRecordStore::with_limits(SessionRecordLimits {
-            total_bytes: 18,
-            record_bytes: 10,
+            total_bytes: 82,
+            record_bytes: 42,
             preview_bytes: 8,
         });
 
@@ -369,7 +381,7 @@ mod tests {
         assert_eq!(listed[0].text.as_deref(), Some("ABCDEFGH"));
         assert_eq!(listed[1].text.as_deref(), Some("abcdefgh"));
 
-        store.capture(capture("too-large", "12345678901"));
+        store.capture(capture("too-large", &"x".repeat(43)));
         assert_eq!(store.list(), listed);
     }
 
@@ -426,8 +438,8 @@ mod tests {
     #[test]
     fn note_bytes_count_toward_the_total_budget() {
         let store = SessionRecordStore::with_limits(SessionRecordLimits {
-            total_bytes: 12,
-            record_bytes: 10,
+            total_bytes: 76,
+            record_bytes: 42,
             preview_bytes: 8,
         });
         store.capture(capture("oldest", "12345"));
@@ -448,8 +460,8 @@ mod tests {
     #[test]
     fn note_cannot_push_a_record_over_the_single_record_budget() {
         let store = SessionRecordStore::with_limits(SessionRecordLimits {
-            total_bytes: 32,
-            record_bytes: 8,
+            total_bytes: 64,
+            record_bytes: 40,
             preview_bytes: 8,
         });
         store.capture(capture("record", "123456"));

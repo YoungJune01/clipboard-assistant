@@ -30,6 +30,9 @@ use windows::Win32::{
 use windows::core::{PCWSTR, w};
 
 use crate::domain::{CapturedClipboard, ClipboardRepresentation, ContentIdentity, SourceIdentity};
+use crate::services::session_records::{
+    MAX_CAPTURE_RECORD_BYTES, SessionRecordStore, representation_bytes,
+};
 
 use super::message_loop::{ListenerState, run_message_loop, wake_and_join};
 
@@ -37,7 +40,7 @@ const CF_UNICODETEXT_FORMAT: u32 = 13;
 const CF_DIBV5_FORMAT: u32 = 17;
 const MAX_TEXT_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
 const MAX_IMAGE_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
-const MAX_CAPTURE_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
+const MAX_CAPTURE_PAYLOAD_BYTES: usize = MAX_CAPTURE_RECORD_BYTES;
 const PRODUCT_WRITE_TRANSACTION_TIMEOUT: Duration = Duration::from_secs(2);
 const PRODUCT_WRITE_PENDING_BYTES: usize = 16 * 1024 * 1024;
 const LISTENER_INITIALIZATION_TIMEOUT: Duration = Duration::from_secs(3);
@@ -213,9 +216,6 @@ fn begin_product_write_transaction_with_spawner(
     ) -> Result<JoinHandle<()>, ClipboardListenerError>,
 ) -> Result<ProductWriteGuard, ClipboardListenerError> {
     let events = events.into();
-    if events.has_pending_atomic_batch() {
-        return Err(ClipboardListenerError::ProductWriteAlreadyInProgress);
-    }
     let mut state = lock_unpoisoned(&product_write);
     if !matches!(*state, ProductWriteState::Idle) {
         return Err(ClipboardListenerError::ProductWriteAlreadyInProgress);
@@ -1213,13 +1213,23 @@ impl Drop for ClipboardGuard {
 }
 
 trait ClipboardMemoryReader {
+    type Locked;
+
     fn size(&self, format: u32) -> Result<Option<usize>, ClipboardReadError>;
-    fn copy(&self, format: u32, expected_size: usize) -> Result<Vec<u8>, ClipboardReadError>;
+    fn lock(&self, format: u32) -> Result<Self::Locked, ClipboardReadError>;
+    fn locked_size(&self, locked: &Self::Locked) -> Result<usize, ClipboardReadError>;
+    fn copy_and_unlock(
+        &self,
+        locked: Self::Locked,
+        size: usize,
+    ) -> Result<Vec<u8>, ClipboardReadError>;
 }
 
 struct Win32ClipboardMemory;
 
 impl ClipboardMemoryReader for Win32ClipboardMemory {
+    type Locked = GlobalMemoryLock;
+
     fn size(&self, format: u32) -> Result<Option<usize>, ClipboardReadError> {
         if unsafe { IsClipboardFormatAvailable(format) }.is_err() {
             return Ok(None);
@@ -1228,19 +1238,21 @@ impl ClipboardMemoryReader for Win32ClipboardMemory {
         global_memory_size(HGLOBAL(handle.0)).map(Some)
     }
 
-    fn copy(&self, format: u32, expected_size: usize) -> Result<Vec<u8>, ClipboardReadError> {
+    fn lock(&self, format: u32) -> Result<Self::Locked, ClipboardReadError> {
         let handle = clipboard_data_handle(format)?;
-        let memory = HGLOBAL(handle.0);
-        let actual_size = global_memory_size(memory)?;
-        if actual_size != expected_size {
-            return Err(ClipboardReadError::windows(
-                ClipboardReadOperation::GlobalSize,
-                windows::core::Error::from_win32(),
-            ));
-        }
-        let lock = GlobalMemoryLock::new(memory)?;
-        let bytes =
-            unsafe { std::slice::from_raw_parts(lock.pointer.cast::<u8>(), actual_size) }.to_vec();
+        GlobalMemoryLock::new(HGLOBAL(handle.0))
+    }
+
+    fn locked_size(&self, locked: &Self::Locked) -> Result<usize, ClipboardReadError> {
+        global_memory_size(locked.memory)
+    }
+
+    fn copy_and_unlock(
+        &self,
+        lock: Self::Locked,
+        size: usize,
+    ) -> Result<Vec<u8>, ClipboardReadError> {
+        let bytes = unsafe { std::slice::from_raw_parts(lock.pointer.cast::<u8>(), size) }.to_vec();
         lock.unlock()?;
         Ok(bytes)
     }
@@ -1279,32 +1291,75 @@ fn read_bounded_representations(
     let text_size = reader.size(CF_UNICODETEXT_FORMAT)?;
     let png_size = reader.size(png_format)?;
     let dib_size = reader.size(dib_format)?;
-    let mut remaining = budget;
     let mut representations = Vec::with_capacity(2);
 
-    if let Some(size) =
-        text_size.filter(|size| *size <= MAX_TEXT_PAYLOAD_BYTES && *size <= remaining)
+    if let Some(size) = text_size.filter(|size| text_source_fits_budget(*size, budget))
+        && let Some(bytes) = copy_unchanged(reader, CF_UNICODETEXT_FORMAT, size)?
     {
-        let bytes = reader.copy(CF_UNICODETEXT_FORMAT, size)?;
         let text = decode_unicode_text(&bytes).map_err(ClipboardReadError::InvalidUnicodeText)?;
-        representations.push(ClipboardRepresentation::UnicodeText { text });
-        remaining -= size;
+        drop(bytes);
+        let representation = ClipboardRepresentation::UnicodeText { text };
+        if representation_bytes(std::slice::from_ref(&representation)) <= budget {
+            representations.push(representation);
+        }
     }
+
+    let used = representation_bytes(&representations);
+    let remaining = budget.saturating_sub(used);
 
     let selected_image = [(png_format, png_size, true), (dib_format, dib_size, false)]
         .into_iter()
         .filter_map(|(format, size, png)| size.map(|size| (format, size, png)))
-        .filter(|(_, size, _)| *size <= MAX_IMAGE_PAYLOAD_BYTES && *size <= remaining)
+        .filter(|(_, size, _)| {
+            *size <= MAX_IMAGE_PAYLOAD_BYTES
+                && size
+                    .checked_add(crate::services::session_records::REPRESENTATION_OVERHEAD_BYTES)
+                    .is_some_and(|bytes| bytes <= remaining)
+        })
         .min_by_key(|(_, size, _)| *size);
-    if let Some((format, size, png)) = selected_image {
-        let bytes = reader.copy(format, size)?;
+    if let Some((format, size, png)) = selected_image
+        && let Some(bytes) = copy_unchanged(reader, format, size)?
+    {
         representations.push(if png {
             ClipboardRepresentation::Png { bytes }
         } else {
             ClipboardRepresentation::DibV5 { bytes }
         });
     }
+    debug_assert!(representation_bytes(&representations) <= budget);
     Ok(representations)
+}
+
+fn copy_unchanged(
+    reader: &impl ClipboardMemoryReader,
+    format: u32,
+    expected_size: usize,
+) -> Result<Option<Vec<u8>>, ClipboardReadError> {
+    let locked = reader.lock(format)?;
+    let actual_size = match reader.locked_size(&locked) {
+        Ok(size) => size,
+        Err(_) => return Ok(None),
+    };
+    if actual_size != expected_size {
+        return Ok(None);
+    }
+    reader.copy_and_unlock(locked, actual_size).map(Some)
+}
+
+fn text_source_fits_budget(source_bytes: usize, budget: usize) -> bool {
+    if source_bytes < size_of::<u16>()
+        || !source_bytes.is_multiple_of(size_of::<u16>())
+        || source_bytes > MAX_TEXT_PAYLOAD_BYTES
+    {
+        return false;
+    }
+    let content_units = source_bytes / size_of::<u16>() - 1;
+    content_units
+        .checked_mul(3)
+        .and_then(|bytes| {
+            bytes.checked_add(crate::services::session_records::REPRESENTATION_OVERHEAD_BYTES)
+        })
+        .is_some_and(|bytes| bytes <= budget)
 }
 
 struct GlobalMemoryLock {
@@ -1480,20 +1535,10 @@ enum EventSenderKind {
 }
 
 struct LatestClipboardEventSlot {
-    batches: Mutex<VecDeque<ClipboardEventBatch>>,
+    records: Arc<SessionRecordStore>,
+    revision: AtomicU64,
+    notification: Mutex<Option<u64>>,
     changed: Condvar,
-}
-
-#[derive(Debug)]
-pub struct ClipboardEventBatch {
-    events: Vec<ClipboardEvent>,
-    atomic: bool,
-}
-
-impl ClipboardEventBatch {
-    pub fn into_events(self) -> Vec<ClipboardEvent> {
-        self.events
-    }
 }
 
 pub struct LatestClipboardEventReceiver {
@@ -1504,47 +1549,25 @@ pub struct LatestClipboardEventReceiver {
 pub struct ClipboardEventSendError;
 
 impl EventSender {
-    fn has_pending_atomic_batch(&self) -> bool {
-        match &self.0 {
-            EventSenderKind::Queue(_) => false,
-            EventSenderKind::Latest(slot) => lock_unpoisoned(&slot.batches)
-                .iter()
-                .any(|batch| batch.atomic),
-        }
-    }
-
     pub fn send(&self, event: ClipboardEvent) -> Result<(), ClipboardEventSendError> {
-        self.send_inner(ClipboardEventBatch {
-            events: vec![event],
-            atomic: false,
-        })
+        self.send_batch(vec![event])
     }
 
     fn send_batch(&self, events: Vec<ClipboardEvent>) -> Result<(), ClipboardEventSendError> {
         if events.is_empty() {
             return Ok(());
         }
-        self.send_inner(ClipboardEventBatch {
-            events,
-            atomic: true,
-        })
-    }
-
-    fn send_inner(&self, batch: ClipboardEventBatch) -> Result<(), ClipboardEventSendError> {
         match &self.0 {
-            EventSenderKind::Queue(sender) => batch
-                .events
+            EventSenderKind::Queue(sender) => events
                 .into_iter()
                 .try_for_each(|event| sender.send(event).map_err(|_| ClipboardEventSendError)),
             EventSenderKind::Latest(slot) => {
-                let mut batches = lock_unpoisoned(&slot.batches);
-                if !batch.atomic && batches.back().is_some_and(|queued| !queued.atomic) {
-                    *batches.back_mut().expect("ordinary batch is present") = batch;
-                } else if batch.atomic && batches.iter().any(|queued| queued.atomic) {
+                let captures = events.into_iter().map(|event| event.captured).collect();
+                if !slot.records.capture_batch(captures) {
                     return Err(ClipboardEventSendError);
-                } else {
-                    batches.push_back(batch);
                 }
+                let revision = slot.revision.fetch_add(1, Ordering::AcqRel) + 1;
+                *lock_unpoisoned(&slot.notification) = Some(revision);
                 slot.changed.notify_one();
                 Ok(())
             }
@@ -1586,9 +1609,13 @@ impl From<Sender<ClipboardEvent>> for EventSender {
     }
 }
 
-pub fn latest_clipboard_event_channel() -> (EventSender, LatestClipboardEventReceiver) {
+pub fn latest_clipboard_event_channel(
+    records: Arc<SessionRecordStore>,
+) -> (EventSender, LatestClipboardEventReceiver) {
     let slot = Arc::new(LatestClipboardEventSlot {
-        batches: Mutex::new(VecDeque::new()),
+        records,
+        revision: AtomicU64::new(0),
+        notification: Mutex::new(None),
         changed: Condvar::new(),
     });
     (
@@ -1598,23 +1625,23 @@ pub fn latest_clipboard_event_channel() -> (EventSender, LatestClipboardEventRec
 }
 
 impl LatestClipboardEventReceiver {
-    pub fn recv_timeout(&self, timeout: Duration) -> Result<ClipboardEventBatch, RecvTimeoutError> {
-        let batches = lock_unpoisoned(&self.slot.batches);
-        let (mut batches, wait) = self
+    pub fn recv_timeout(&self, timeout: Duration) -> Result<u64, RecvTimeoutError> {
+        let notification = lock_unpoisoned(&self.slot.notification);
+        let (mut notification, wait) = self
             .slot
             .changed
-            .wait_timeout_while(batches, timeout, |batches| batches.is_empty())
+            .wait_timeout_while(notification, timeout, |revision| revision.is_none())
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        batches.pop_front().ok_or(if wait.timed_out() {
+        notification.take().ok_or(if wait.timed_out() {
             RecvTimeoutError::Timeout
         } else {
             RecvTimeoutError::Disconnected
         })
     }
 
-    pub fn try_recv(&self) -> Result<ClipboardEventBatch, std::sync::mpsc::TryRecvError> {
-        lock_unpoisoned(&self.slot.batches)
-            .pop_front()
+    pub fn try_recv(&self) -> Result<u64, std::sync::mpsc::TryRecvError> {
+        lock_unpoisoned(&self.slot.notification)
+            .take()
             .ok_or(std::sync::mpsc::TryRecvError::Empty)
     }
 }
@@ -1655,7 +1682,7 @@ mod tests {
         classify_format_read, classify_global_unlock, classify_registered_format,
         combine_clipboard_operation_and_close, decode_unicode_text, finish_product_write,
         latest_clipboard_event_channel, orchestrate_listener_initialization,
-        read_bounded_representations, route_event, validate_representations,
+        read_bounded_representations, representation_bytes, route_event, validate_representations,
     };
     use crate::domain::{
         CapturedClipboard, ClipboardRepresentation, ContentIdentity, SourceIdentity,
@@ -1786,7 +1813,8 @@ mod tests {
 
     #[test]
     fn pending_byte_budget_cancels_before_flushing_one_atomic_external_batch() {
-        let (events, receiver) = latest_clipboard_event_channel();
+        let records = Arc::new(SessionRecordStore::default());
+        let (events, receiver) = latest_clipboard_event_channel(Arc::clone(&records));
         let state = Arc::new(Mutex::new(ProductWriteState::armed_with_budget(80, 9)));
 
         route_event(&state, &events, text_event(81, "1234"));
@@ -1794,23 +1822,15 @@ mod tests {
         route_event(&state, &events, text_event(83, "90"));
 
         assert!(matches!(*state.lock().unwrap(), ProductWriteState::Idle));
-        assert_eq!(
-            receiver
-                .recv_timeout(Duration::from_millis(50))
-                .unwrap()
-                .into_events()
-                .into_iter()
-                .map(|event| event.sequence_number)
-                .collect::<Vec<_>>(),
-            [81, 82, 83]
-        );
+        receiver.recv_timeout(Duration::from_millis(50)).unwrap();
+        assert_eq!(stored_texts(&records), ["90", "5678", "1234"]);
         assert!(receiver.try_recv().is_err());
     }
 
     #[test]
     fn production_mailbox_keeps_external_order_and_suppresses_owned_sequences_on_overflow() {
-        let (events, receiver) = latest_clipboard_event_channel();
-        let records = SessionRecordStore::default();
+        let records = Arc::new(SessionRecordStore::default());
+        let (events, receiver) = latest_clipboard_event_channel(Arc::clone(&records));
         let state = Arc::new(Mutex::new(ProductWriteState::armed_with_budget(90, 8)));
         route_event(&state, &events, text_event(91, "one"));
         {
@@ -1823,59 +1843,46 @@ mod tests {
             guard.finish(&[92]);
         }
 
-        let delivered: Vec<_> = std::iter::from_fn(|| receiver.try_recv().ok())
-            .flat_map(|batch| batch.into_events())
-            .collect();
-        let observed: Vec<_> = delivered
-            .iter()
-            .map(|event| event.sequence_number)
-            .collect();
-        for event in delivered {
-            records.capture(event.captured);
-        }
-        assert_eq!(observed, [91, 93, 94]);
-        let stored: Vec<_> = records
-            .list()
-            .into_iter()
-            .filter_map(|record| record.text)
-            .collect();
+        assert!(receiver.try_recv().is_ok());
+        assert!(receiver.try_recv().is_err());
+        let stored = stored_texts(&records);
         assert_eq!(stored, ["four", "three", "one"]);
         assert!(!stored.iter().any(|text| text == "owned"));
     }
 
     #[test]
-    fn production_mailbox_holds_at_most_one_transaction_batch_and_one_latest_snapshot() {
-        let (events, receiver) = latest_clipboard_event_channel();
+    fn paused_notification_drain_does_not_lose_external_history() {
+        let records = Arc::new(SessionRecordStore::default());
+        let (events, receiver) = latest_clipboard_event_channel(Arc::clone(&records));
         events
             .send_batch(vec![text_event(101, "transaction")])
             .unwrap();
         events.send(text_event(102, "old latest")).unwrap();
         events.send(text_event(103, "new latest")).unwrap();
 
-        let first = receiver.try_recv().unwrap().into_events();
-        let second = receiver.try_recv().unwrap().into_events();
-        assert_eq!(first[0].sequence_number, 101);
-        assert_eq!(second[0].sequence_number, 103);
+        assert_eq!(
+            stored_texts(&records),
+            ["new latest", "old latest", "transaction"]
+        );
+        assert_eq!(receiver.try_recv().unwrap(), 3);
         assert!(receiver.try_recv().is_err());
     }
 
     #[test]
     fn latest_event_mailbox_is_bounded_and_preserves_the_newest_capture() {
-        let (events, receiver) = latest_clipboard_event_channel();
+        let records = Arc::new(SessionRecordStore::default());
+        let (events, receiver) = latest_clipboard_event_channel(Arc::clone(&records));
 
         events.send(text_event(91, &"a".repeat(1024))).unwrap();
         events.send(text_event(92, &"b".repeat(1024))).unwrap();
         events.send(text_event(93, &"c".repeat(1024))).unwrap();
 
-        assert_eq!(
-            receiver
-                .recv_timeout(Duration::from_millis(50))
-                .unwrap()
-                .into_events()[0]
-                .sequence_number,
-            93
-        );
+        assert_eq!(receiver.recv_timeout(Duration::from_millis(50)).unwrap(), 3);
         assert!(receiver.try_recv().is_err());
+        assert_eq!(
+            stored_texts(&records),
+            ["c".repeat(1024), "b".repeat(1024), "a".repeat(1024)]
+        );
     }
 
     #[test]
@@ -1907,6 +1914,89 @@ mod tests {
                 .collect::<Vec<_>>(),
             [121, 122]
         );
+    }
+
+    #[test]
+    fn external_commit_and_arming_share_one_coordinator_boundary() {
+        struct BlockingSink {
+            entered: mpsc::SyncSender<()>,
+            release: Mutex<mpsc::Receiver<()>>,
+            delivered: Mutex<Vec<u32>>,
+        }
+
+        impl super::ClipboardEventSink for BlockingSink {
+            fn send_event(
+                &self,
+                event: ClipboardEvent,
+            ) -> Result<(), super::ClipboardEventSendError> {
+                self.send_batch(vec![event])
+            }
+
+            fn send_batch(
+                &self,
+                events: Vec<ClipboardEvent>,
+            ) -> Result<(), super::ClipboardEventSendError> {
+                self.entered.send(()).unwrap();
+                self.release.lock().unwrap().recv().unwrap();
+                self.delivered
+                    .lock()
+                    .unwrap()
+                    .extend(events.into_iter().map(|event| event.sequence_number));
+                Ok(())
+            }
+        }
+
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::channel();
+        let sink = Arc::new(BlockingSink {
+            entered: entered_tx,
+            release: Mutex::new(release_rx),
+            delivered: Mutex::new(Vec::new()),
+        });
+        let state = Arc::new(Mutex::new(ProductWriteState::Idle));
+        let route_thread = {
+            let state = Arc::clone(&state);
+            let sink = Arc::clone(&sink);
+            std::thread::spawn(move || {
+                route_event(&state, &*sink, text_event(101, "external"));
+            })
+        };
+        entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        let (events, _receiver) = mpsc::channel();
+        let (begin_done_tx, begin_done_rx) = mpsc::sync_channel(1);
+        let begin_thread = {
+            let state = Arc::clone(&state);
+            std::thread::spawn(move || {
+                let result =
+                    begin_product_write_transaction(state, events, 101, Duration::from_secs(1));
+                begin_done_tx.send(()).unwrap();
+                result
+            })
+        };
+        assert!(
+            begin_done_rx
+                .recv_timeout(Duration::from_millis(20))
+                .is_err()
+        );
+        release_tx.send(()).unwrap();
+        route_thread.join().unwrap();
+
+        let guard = begin_thread.join().unwrap().unwrap();
+        let (events, _receiver) = mpsc::channel();
+        let second = begin_product_write_transaction(
+            Arc::clone(&state),
+            events,
+            101,
+            Duration::from_secs(1),
+        );
+
+        assert!(matches!(
+            second,
+            Err(ClipboardListenerError::ProductWriteAlreadyInProgress)
+        ));
+        assert_eq!(*sink.delivered.lock().unwrap(), [101]);
+        guard.cancel();
     }
 
     #[test]
@@ -2033,20 +2123,62 @@ mod tests {
     #[derive(Default)]
     struct FakeClipboardMemory {
         payloads: HashMap<u32, Vec<u8>>,
+        locked_sizes: HashMap<u32, Result<usize, ()>>,
         copies: RefCell<Vec<u32>>,
+        operations: RefCell<Vec<(&'static str, u32)>>,
+    }
+
+    struct FakeLockedClipboardMemory {
+        format: u32,
     }
 
     impl ClipboardMemoryReader for FakeClipboardMemory {
+        type Locked = FakeLockedClipboardMemory;
+
         fn size(&self, format: u32) -> Result<Option<usize>, ClipboardReadError> {
             Ok(self.payloads.get(&format).map(Vec::len))
         }
 
-        fn copy(&self, format: u32, expected_size: usize) -> Result<Vec<u8>, ClipboardReadError> {
-            self.copies.borrow_mut().push(format);
-            let bytes = self.payloads.get(&format).cloned().unwrap();
-            assert_eq!(bytes.len(), expected_size);
+        fn lock(&self, format: u32) -> Result<Self::Locked, ClipboardReadError> {
+            self.operations.borrow_mut().push(("lock", format));
+            Ok(FakeLockedClipboardMemory { format })
+        }
+
+        fn locked_size(&self, locked: &Self::Locked) -> Result<usize, ClipboardReadError> {
+            self.operations
+                .borrow_mut()
+                .push(("locked_size", locked.format));
+            self.locked_sizes
+                .get(&locked.format)
+                .cloned()
+                .unwrap_or_else(|| Ok(self.payloads[&locked.format].len()))
+                .map_err(|()| {
+                    ClipboardReadError::windows(
+                        super::ClipboardReadOperation::GlobalSize,
+                        windows::core::Error::from_win32(),
+                    )
+                })
+        }
+
+        fn copy_and_unlock(
+            &self,
+            locked: Self::Locked,
+            size: usize,
+        ) -> Result<Vec<u8>, ClipboardReadError> {
+            self.operations.borrow_mut().push(("copy", locked.format));
+            self.copies.borrow_mut().push(locked.format);
+            let bytes = self.payloads.get(&locked.format).cloned().unwrap();
+            assert_eq!(bytes.len(), size);
             Ok(bytes)
         }
+    }
+
+    fn stored_texts(records: &SessionRecordStore) -> Vec<String> {
+        records
+            .list()
+            .into_iter()
+            .filter_map(|record| record.text)
+            .collect()
     }
 
     #[test]
@@ -2070,7 +2202,7 @@ mod tests {
             ..Default::default()
         };
 
-        let captured = read_bounded_representations(&reader, 100, 101, 32).unwrap();
+        let captured = read_bounded_representations(&reader, 100, 101, 64).unwrap();
 
         assert!(
             matches!(captured.as_slice(), [ClipboardRepresentation::DibV5 { bytes }] if bytes.len() == 4)
@@ -2090,12 +2222,61 @@ mod tests {
             ..Default::default()
         };
 
-        let captured = read_bounded_representations(&reader, 100, 101, 10).unwrap();
+        let captured = read_bounded_representations(&reader, 100, 101, 36).unwrap();
 
         assert!(
             matches!(captured.as_slice(), [ClipboardRepresentation::UnicodeText { text }] if text == "a")
         );
         assert_eq!(&*reader.copies.borrow(), &[CF_UNICODETEXT_FORMAT]);
+    }
+
+    #[test]
+    fn capture_skips_format_when_size_changes_after_lock() {
+        for locked_size in [Ok(3), Ok(5), Err(())] {
+            let reader = FakeClipboardMemory {
+                payloads: HashMap::from([(100, vec![1; 4])]),
+                locked_sizes: HashMap::from([(100, locked_size)]),
+                ..Default::default()
+            };
+
+            let captured = read_bounded_representations(&reader, 100, 101, 64).unwrap();
+
+            assert!(captured.is_empty());
+            assert!(reader.copies.borrow().is_empty());
+            assert_eq!(
+                &*reader.operations.borrow(),
+                &[("lock", 100), ("locked_size", 100)]
+            );
+        }
+    }
+
+    #[test]
+    fn final_utf8_bytes_and_overhead_control_the_aggregate_budget() {
+        let text = "界";
+        let mut encoded = text
+            .encode_utf16()
+            .flat_map(u16::to_ne_bytes)
+            .collect::<Vec<_>>();
+        encoded.extend_from_slice(&0_u16.to_ne_bytes());
+        let reader = FakeClipboardMemory {
+            payloads: HashMap::from([(CF_UNICODETEXT_FORMAT, encoded), (100, vec![1; 1])]),
+            ..Default::default()
+        };
+
+        let captured = read_bounded_representations(&reader, 100, 101, 36).unwrap();
+
+        assert!(matches!(
+            captured.as_slice(),
+            [ClipboardRepresentation::UnicodeText { text }] if text == "界"
+        ));
+        assert_eq!(&*reader.copies.borrow(), &[CF_UNICODETEXT_FORMAT]);
+        assert_eq!(representation_bytes(&captured), 35);
+        assert!(SessionRecordStore::default().capture(CapturedClipboard {
+            content_identity: ContentIdentity::new("boundary"),
+            captured_at: Utc::now(),
+            source: SourceIdentity::default(),
+            representations: captured,
+        }));
     }
 
     #[test]

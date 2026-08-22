@@ -67,7 +67,6 @@ impl Drop for ClipboardRuntime {
 #[cfg(windows)]
 fn spawn_clipboard_event_drain(
     events: platform::windows::clipboard::LatestClipboardEventReceiver,
-    records: Arc<SessionRecordStore>,
     on_change: impl Fn() + Send + 'static,
 ) -> std::io::Result<(std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>)> {
     let (stop, stopped) = std::sync::mpsc::channel();
@@ -79,12 +78,7 @@ fn spawn_clipboard_event_drain(
                     break;
                 }
                 match events.recv_timeout(std::time::Duration::from_millis(100)) {
-                    Ok(batch) => {
-                        for event in batch.into_events() {
-                            records.capture(event.captured);
-                            on_change();
-                        }
-                    }
+                    Ok(_revision) => on_change(),
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                     Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                 }
@@ -106,11 +100,10 @@ mod runtime_tests {
 
     #[test]
     fn clipboard_event_drain_stops_even_when_event_senders_remain_alive() {
-        let (events, receiver) = latest_clipboard_event_channel();
+        let records = Arc::new(SessionRecordStore::default());
+        let (events, receiver) = latest_clipboard_event_channel(records);
         let retained_sender = events.clone();
-        let (stop, thread) =
-            spawn_clipboard_event_drain(receiver, Arc::new(SessionRecordStore::default()), || {})
-                .unwrap();
+        let (stop, thread) = spawn_clipboard_event_drain(receiver, || {}).unwrap();
         let (joined, observed) = std::sync::mpsc::sync_channel(1);
 
         stop.send(()).unwrap();
@@ -129,10 +122,9 @@ mod runtime_tests {
 
     #[test]
     fn clipboard_event_drain_exposes_real_captures_to_the_session_store() {
-        let (events, receiver) = latest_clipboard_event_channel();
         let records = Arc::new(SessionRecordStore::default());
-        let (stop, thread) =
-            spawn_clipboard_event_drain(receiver, Arc::clone(&records), || {}).unwrap();
+        let (events, receiver) = latest_clipboard_event_channel(Arc::clone(&records));
+        let (stop, thread) = spawn_clipboard_event_drain(receiver, || {}).unwrap();
         events
             .send(ClipboardEvent {
                 sequence_number: 41,
@@ -250,17 +242,16 @@ pub fn run() {
             let panel_controller = Arc::new(PanelController::new(panel));
             let session_records = Arc::new(SessionRecordStore::default());
             let (clipboard_events, clipboard_receiver) =
-                platform::windows::clipboard::latest_clipboard_event_channel();
+                platform::windows::clipboard::latest_clipboard_event_channel(Arc::clone(
+                    &session_records,
+                ));
             let listener =
                 platform::windows::clipboard::ClipboardListener::start(clipboard_events)?;
             let app_handle = app.handle().clone();
-            let (event_drain_stop, event_drain) = spawn_clipboard_event_drain(
-                clipboard_receiver,
-                Arc::clone(&session_records),
-                move || {
+            let (event_drain_stop, event_drain) =
+                spawn_clipboard_event_drain(clipboard_receiver, move || {
                     let _ = app_handle.emit("clipboard-records-changed", ());
-                },
-            )?;
+                })?;
             let paste = SafePasteService::new(
                 platform::windows::paste::Win32PasteTarget::new(),
                 listener.publisher(),

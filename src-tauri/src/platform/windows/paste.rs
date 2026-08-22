@@ -1447,6 +1447,8 @@ mod tests {
 
     use super::*;
 
+    static LIFECYCLE_REGISTRY_TEST_LOCK: Mutex<()> = Mutex::new(());
+
     #[derive(Default)]
     struct RecordingLifecycleThreadSpawner {
         spawned: Mutex<Vec<&'static str>>,
@@ -1560,6 +1562,7 @@ mod tests {
 
     #[test]
     fn blocked_shutdown_detaches_with_invalid_state_and_cleans_tracking() {
+        let _registry_test = lock_unpoisoned(&LIFECYCLE_REGISTRY_TEST_LOCK);
         let (release_tx, release_rx) = mpsc::channel();
         let spawner = RecordingLifecycleThreadSpawner::default();
         let observer = Win32LifecycleObserver::start_with(
@@ -1592,6 +1595,7 @@ mod tests {
 
     #[test]
     fn late_worker_exit_cleans_tracking_after_shutdown_lock_contention() {
+        let _registry_test = lock_unpoisoned(&LIFECYCLE_REGISTRY_TEST_LOCK);
         let (release_backend_tx, release_backend_rx) = mpsc::channel();
         let spawner = RecordingLifecycleThreadSpawner::default();
         let observer = Win32LifecycleObserver::start_with(
@@ -1664,6 +1668,7 @@ mod tests {
 
     #[test]
     fn normal_shutdown_joins_after_backend_cleanup_and_clears_tracking() {
+        let _registry_test = lock_unpoisoned(&LIFECYCLE_REGISTRY_TEST_LOCK);
         let backend_cleaned = Arc::new(AtomicBool::new(false));
         let cleaned = Arc::clone(&backend_cleaned);
         let spawner = RecordingLifecycleThreadSpawner::default();
