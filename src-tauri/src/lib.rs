@@ -9,9 +9,11 @@ use std::sync::Arc;
 use services::panel::PanelController;
 #[cfg(windows)]
 use services::paste::{QuickPanelPasteCoordinator, SafePasteService};
+#[cfg(windows)]
+use services::session_records::{SessionRecordCommands, SessionRecordStore, SessionRecordView};
 
 #[cfg(windows)]
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 
 #[cfg(windows)]
 type WindowsSafePasteService = SafePasteService<
@@ -65,6 +67,8 @@ impl Drop for ClipboardRuntime {
 #[cfg(windows)]
 fn spawn_clipboard_event_drain(
     events: std::sync::mpsc::Receiver<platform::windows::clipboard::ClipboardEvent>,
+    records: Arc<SessionRecordStore>,
+    on_change: impl Fn() + Send + 'static,
 ) -> std::io::Result<(std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>)> {
     let (stop, stopped) = std::sync::mpsc::channel();
     let thread = std::thread::Builder::new()
@@ -75,7 +79,10 @@ fn spawn_clipboard_event_drain(
                     break;
                 }
                 match events.recv_timeout(std::time::Duration::from_millis(100)) {
-                    Ok(_) => {}
+                    Ok(event) => {
+                        records.capture(event.captured);
+                        on_change();
+                    }
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                     Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                 }
@@ -87,12 +94,21 @@ fn spawn_clipboard_event_drain(
 #[cfg(all(test, windows))]
 mod runtime_tests {
     use super::spawn_clipboard_event_drain;
+    use crate::{
+        domain::{CapturedClipboard, ClipboardRepresentation, ContentIdentity, SourceIdentity},
+        platform::windows::clipboard::ClipboardEvent,
+        services::session_records::SessionRecordStore,
+    };
+    use chrono::Utc;
+    use std::sync::Arc;
 
     #[test]
     fn clipboard_event_drain_stops_even_when_event_senders_remain_alive() {
         let (events, receiver) = std::sync::mpsc::channel();
         let retained_sender = events.clone();
-        let (stop, thread) = spawn_clipboard_event_drain(receiver).unwrap();
+        let (stop, thread) =
+            spawn_clipboard_event_drain(receiver, Arc::new(SessionRecordStore::default()), || {})
+                .unwrap();
         let (joined, observed) = std::sync::mpsc::sync_channel(1);
 
         stop.send(()).unwrap();
@@ -107,6 +123,38 @@ mod runtime_tests {
                 .unwrap()
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn clipboard_event_drain_exposes_real_captures_to_the_session_store() {
+        let (events, receiver) = std::sync::mpsc::channel();
+        let records = Arc::new(SessionRecordStore::default());
+        let (stop, thread) =
+            spawn_clipboard_event_drain(receiver, Arc::clone(&records), || {}).unwrap();
+        events
+            .send(ClipboardEvent {
+                sequence_number: 41,
+                captured: CapturedClipboard {
+                    content_identity: ContentIdentity::new("clipboard-sequence:41"),
+                    captured_at: Utc::now(),
+                    source: SourceIdentity::default(),
+                    representations: vec![ClipboardRepresentation::UnicodeText {
+                        text: "real capture".to_owned(),
+                    }],
+                },
+            })
+            .unwrap();
+
+        for _ in 0..100 {
+            if !records.list().is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        stop.send(()).unwrap();
+        thread.join().unwrap();
+
+        assert_eq!(records.list()[0].text.as_deref(), Some("real capture"));
     }
 }
 
@@ -130,11 +178,37 @@ fn show_quick_panel(
 #[cfg(windows)]
 #[tauri::command]
 fn paste_selected(
-    representations: Vec<domain::ClipboardRepresentation>,
+    record_id: domain::RecordId,
+    records: tauri::State<'_, Arc<SessionRecordStore>>,
     coordinator: tauri::State<'_, Arc<WindowsQuickPanelCoordinator>>,
-) -> Result<domain::PasteOutcome, String> {
+) -> Result<String, String> {
+    let representations = SessionRecordCommands::new(records.inner())
+        .representations(record_id)
+        .map_err(|error| error.to_string())?;
     coordinator
         .paste(&representations)
+        .map(domain::PasteOutcome::user_message)
+        .map(str::to_owned)
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(windows)]
+#[tauri::command]
+fn list_session_records(
+    records: tauri::State<'_, Arc<SessionRecordStore>>,
+) -> Vec<SessionRecordView> {
+    SessionRecordCommands::new(records.inner()).list()
+}
+
+#[cfg(windows)]
+#[tauri::command]
+fn update_record_note(
+    record_id: domain::RecordId,
+    note: String,
+    records: tauri::State<'_, Arc<SessionRecordStore>>,
+) -> Result<SessionRecordView, String> {
+    SessionRecordCommands::new(records.inner())
+        .update_note(record_id, note)
         .map_err(|error| error.to_string())
 }
 
@@ -172,10 +246,18 @@ pub fn run() {
                 .ok_or_else(|| "quick-panel window is missing".to_owned())?;
             platform::windows::configure_quick_panel_style(panel.hwnd()?)?;
             let panel_controller = Arc::new(PanelController::new(panel));
+            let session_records = Arc::new(SessionRecordStore::default());
             let (clipboard_events, clipboard_receiver) = std::sync::mpsc::channel();
             let listener =
                 platform::windows::clipboard::ClipboardListener::start(clipboard_events)?;
-            let (event_drain_stop, event_drain) = spawn_clipboard_event_drain(clipboard_receiver)?;
+            let app_handle = app.handle().clone();
+            let (event_drain_stop, event_drain) = spawn_clipboard_event_drain(
+                clipboard_receiver,
+                Arc::clone(&session_records),
+                move || {
+                    let _ = app_handle.emit("clipboard-records-changed", ());
+                },
+            )?;
             let paste = SafePasteService::new(
                 platform::windows::paste::Win32PasteTarget,
                 listener.publisher(),
@@ -183,6 +265,7 @@ pub fn run() {
                 platform::windows::paste::Win32PasteInput,
             );
             app.manage(Arc::clone(&panel_controller));
+            app.manage(session_records);
             app.manage(Arc::new(QuickPanelPasteCoordinator::new(
                 panel_controller,
                 paste,
@@ -222,7 +305,9 @@ pub fn run() {
             show_quick_panel,
             hide_quick_panel,
             toggle_quick_panel,
-            paste_selected
+            paste_selected,
+            list_session_records,
+            update_record_note
         ]);
     #[cfg(not(windows))]
     let builder = builder.invoke_handler(tauri::generate_handler![greet]);

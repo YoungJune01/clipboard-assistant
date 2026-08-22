@@ -301,6 +301,7 @@ fn focus_and_rollback_hide_failures_preserve_visible_state_and_both_errors() {
         vec![Ok(())],
         vec![Err(FakeError("focus failed"))],
         vec![Err(FakeError("rollback hide failed")), Ok(())],
+        vec![Ok(false)],
     );
     let service = PanelService::new(monitor, window.clone(), dip(400, 300));
 
@@ -346,6 +347,7 @@ fn successful_focus_rollback_restores_hidden_state() {
         vec![Ok(())],
         vec![Err(FakeError("focus failed"))],
         vec![Ok(())],
+        vec![Ok(false)],
     );
     let service = PanelService::new(monitor, window, dip(400, 300));
 
@@ -355,6 +357,17 @@ fn successful_focus_rollback_restores_hidden_state() {
         observer_action_for_visibility(service.is_visible()),
         ObserverAction::Stop
     );
+}
+
+#[test]
+fn hide_does_not_report_success_until_the_window_is_actually_invisible() {
+    let monitor = FakeMonitor::new(vec![snapshot(point(100, 100), rect(0, 0, 1920, 1040), 96)]);
+    let window = ScriptedWindow::new(vec![Ok(())], vec![Ok(())], vec![Ok(())], vec![Ok(true)]);
+    let service = PanelService::new(monitor, window, dip(400, 300));
+
+    service.show().unwrap();
+    assert!(matches!(service.hide(), Err(PanelError::Window(_))));
+    assert!(service.is_visible());
 }
 
 #[test]
@@ -534,6 +547,12 @@ impl PanelWindow for FakeWindow {
         self.0.lock().unwrap().push(Call::Hide);
         Ok(())
     }
+
+    fn is_visible(&self) -> Result<bool, Self::Error> {
+        let calls = self.0.lock().unwrap();
+        Ok(calls.iter().rposition(|call| *call == Call::Show)
+            > calls.iter().rposition(|call| *call == Call::Hide))
+    }
 }
 
 #[derive(Clone)]
@@ -542,6 +561,7 @@ struct ScriptedWindow {
     show_results: Arc<Mutex<VecDeque<Result<(), FakeError>>>>,
     focus_results: Arc<Mutex<VecDeque<Result<(), FakeError>>>>,
     hide_results: Arc<Mutex<VecDeque<Result<(), FakeError>>>>,
+    visibility_results: Arc<Mutex<VecDeque<Result<bool, FakeError>>>>,
 }
 
 impl ScriptedWindow {
@@ -549,12 +569,14 @@ impl ScriptedWindow {
         show_results: Vec<Result<(), FakeError>>,
         focus_results: Vec<Result<(), FakeError>>,
         hide_results: Vec<Result<(), FakeError>>,
+        visibility_results: Vec<Result<bool, FakeError>>,
     ) -> Self {
         Self {
             calls: Arc::new(Mutex::new(Vec::new())),
             show_results: Arc::new(Mutex::new(show_results.into())),
             focus_results: Arc::new(Mutex::new(focus_results.into())),
             hide_results: Arc::new(Mutex::new(hide_results.into())),
+            visibility_results: Arc::new(Mutex::new(visibility_results.into())),
         }
     }
 
@@ -595,6 +617,14 @@ impl PanelWindow for ScriptedWindow {
     fn hide(&self) -> Result<(), Self::Error> {
         self.calls.lock().unwrap().push(Call::Hide);
         Self::next(&self.hide_results, "hide")
+    }
+
+    fn is_visible(&self) -> Result<bool, Self::Error> {
+        self.visibility_results
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or(Ok(false))
     }
 }
 

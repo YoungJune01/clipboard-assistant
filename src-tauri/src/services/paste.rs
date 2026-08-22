@@ -24,6 +24,9 @@ pub struct TargetSnapshot<Window> {
     pub window: Window,
     pub focused_control: Option<Window>,
     pub identity: TargetIdentity,
+    pub window_generation: usize,
+    pub focused_control_instance_id: Option<u64>,
+    pub focused_control_generation: Option<usize>,
 }
 
 pub trait PasteTarget: Send + Sync + 'static {
@@ -36,6 +39,7 @@ pub trait PasteTarget: Send + Sync + 'static {
     fn input_desktop(&self) -> Result<u64, Self::Error>;
     fn restore(&self, target: &TargetSnapshot<Self::Window>) -> Result<(), Self::Error>;
     fn foreground(&self) -> Result<Self::Window, Self::Error>;
+    fn lifecycle_valid(&self, target: &TargetSnapshot<Self::Window>) -> Result<bool, Self::Error>;
 }
 
 pub trait PasteClipboard: Send + Sync + 'static {
@@ -48,6 +52,7 @@ pub trait PastePanel: Send + Sync + 'static {
     type Error: Error + Send + Sync + 'static;
 
     fn hide(&self) -> Result<(), Self::Error>;
+    fn is_visible(&self) -> Result<bool, Self::Error>;
 }
 
 #[cfg(windows)]
@@ -62,13 +67,15 @@ pub trait QuickPanel: Send + Sync + 'static {
 pub trait PasteInput<Window>: Send + Sync + 'static {
     type Error: Error + Send + Sync + 'static;
 
-    fn send_ctrl_v(&self, expected_foreground: Window) -> Result<(), Self::Error>;
+    fn send_ctrl_v(&self, target: &TargetSnapshot<Window>) -> Result<(), Self::Error>;
 }
 
 #[derive(Debug)]
 pub enum SafePasteError {
     Capture(Box<dyn Error + Send + Sync>),
     Clipboard(Box<dyn Error + Send + Sync>),
+    Panel(Box<dyn Error + Send + Sync>),
+    PanelStillVisible,
 }
 
 impl fmt::Display for SafePasteError {
@@ -78,6 +85,9 @@ impl fmt::Display for SafePasteError {
             Self::Clipboard(_) => {
                 formatter.write_str("could not publish the selected clipboard content")
             }
+            Self::Panel(_) | Self::PanelStillVisible => {
+                formatter.write_str("could not confirm that the quick panel is hidden")
+            }
         }
     }
 }
@@ -85,7 +95,10 @@ impl fmt::Display for SafePasteError {
 impl Error for SafePasteError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::Capture(error) | Self::Clipboard(error) => Some(error.as_ref()),
+            Self::Capture(error) | Self::Clipboard(error) | Self::Panel(error) => {
+                Some(error.as_ref())
+            }
+            Self::PanelStillVisible => None,
         }
     }
 }
@@ -151,20 +164,17 @@ where
             .publish(representations)
             .map_err(|error| SafePasteError::Clipboard(Box::new(error)))?;
 
+        self.hide_panel()?;
         let Some(target) = target.filter(|_| target_is_safe) else {
-            let _ = self.panel.hide();
             return Ok(copy_only());
         };
-        if self.panel.hide().is_err() {
-            return Ok(copy_only());
-        }
         if self.target.restore(&target).is_err() || !self.target_is_safe(&target) {
             return Ok(copy_only());
         }
         if self.target.foreground().ok() != Some(target.window) {
             return Ok(copy_only());
         }
-        if self.input.send_ctrl_v(target.window).is_err() {
+        if self.input.send_ctrl_v(&target).is_err() {
             return Ok(copy_only());
         }
         Ok(PasteOutcome::CommandSent)
@@ -181,6 +191,18 @@ where
             return false;
         }
         self.target.input_desktop().ok() == Some(identity.desktop_id)
+            && matches!(self.target.lifecycle_valid(target), Ok(true))
+    }
+
+    fn hide_panel(&self) -> Result<(), SafePasteError> {
+        self.panel
+            .hide()
+            .map_err(|error| SafePasteError::Panel(Box::new(error)))?;
+        match self.panel.is_visible() {
+            Ok(false) => Ok(()),
+            Ok(true) => Err(SafePasteError::PanelStillVisible),
+            Err(error) => Err(SafePasteError::Panel(Box::new(error))),
+        }
     }
 }
 
@@ -251,6 +273,10 @@ impl PastePanel for std::sync::Arc<crate::services::panel::PanelController> {
 
     fn hide(&self) -> Result<(), Self::Error> {
         crate::services::panel::PanelController::hide(self)
+    }
+
+    fn is_visible(&self) -> Result<bool, Self::Error> {
+        crate::services::panel::PanelController::verified_visibility(self)
     }
 }
 

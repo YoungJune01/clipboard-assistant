@@ -31,6 +31,7 @@ pub trait PanelWindow: Send + Sync + 'static {
     fn show(&self) -> Result<(), Self::Error>;
     fn focus(&self) -> Result<(), Self::Error>;
     fn hide(&self) -> Result<(), Self::Error>;
+    fn is_visible(&self) -> Result<bool, Self::Error>;
 }
 
 #[derive(Debug)]
@@ -145,6 +146,15 @@ where
         self.window
             .hide()
             .map_err(|error| PanelError::Window(Box::new(error)))?;
+        if self
+            .window
+            .is_visible()
+            .map_err(|error| PanelError::Window(Box::new(error)))?
+        {
+            return Err(PanelError::Window(Box::new(PanelStateError(
+                "quick-panel window remains visible",
+            ))));
+        }
         clear_visible_state(&mut lock_unpoisoned(&self.state));
         Ok(())
     }
@@ -204,6 +214,12 @@ where
 
     pub fn is_visible(&self) -> bool {
         lock_unpoisoned(&self.state).visible
+    }
+
+    pub fn verified_visibility(&self) -> Result<bool, PanelError> {
+        self.window
+            .is_visible()
+            .map_err(|error| PanelError::Window(Box::new(error)))
     }
 
     fn query_current_snapshot(&self) -> Result<MonitorSnapshot, PanelError> {
@@ -340,6 +356,11 @@ impl PanelWindow for TauriPanelWindow {
     fn hide(&self) -> Result<(), Self::Error> {
         self.0.hide().map_err(Into::into)
     }
+
+    fn is_visible(&self) -> Result<bool, Self::Error> {
+        let hwnd = self.0.hwnd()?;
+        Ok(unsafe { windows::Win32::UI::WindowsAndMessaging::IsWindowVisible(hwnd).as_bool() })
+    }
 }
 
 #[cfg(windows)]
@@ -445,6 +466,10 @@ impl PanelController {
 
     pub fn is_visible(&self) -> bool {
         self.service.is_visible()
+    }
+
+    pub fn verified_visibility(&self) -> Result<bool, PanelError> {
+        self.service.verified_visibility()
     }
 
     fn schedule_reposition(self: &Arc<Self>) {

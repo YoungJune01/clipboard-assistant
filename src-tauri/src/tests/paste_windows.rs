@@ -197,10 +197,43 @@ fn panel_hide_failure_is_conservative_even_when_target_is_otherwise_safe() {
     *fixture.panel.result.lock().unwrap() = Err(FakeError("hide failed"));
     fixture.service.prepare_target().unwrap();
 
-    assert_copy_only(fixture.service.paste(&text("copied payload")).unwrap());
+    assert!(fixture.service.paste(&text("copied payload")).is_err());
     assert_eq!(fixture.clipboard.published.lock().unwrap().len(), 1);
     assert!(!fixture.calls().contains(&Call::Restore));
     assert!(!fixture.calls().contains(&Call::Inject));
+}
+
+#[test]
+fn panel_reported_visible_after_hide_is_an_infrastructure_error() {
+    let fixture = Fixture::safe();
+    *fixture.panel.visible.lock().unwrap() = Ok(true);
+    fixture
+        .panel
+        .keep_visible_after_hide
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    fixture.service.prepare_target().unwrap();
+
+    assert!(fixture.service.paste(&text("copied payload")).is_err());
+    assert!(!fixture.calls().contains(&Call::Inject));
+}
+
+#[test]
+fn every_successful_outcome_leaves_the_panel_hidden() {
+    let no_target = Fixture::safe();
+    let fixtures = [
+        Fixture::safe(),
+        Fixture::with_inspections([Err(FakeError("gone"))]),
+        no_target,
+    ];
+    for (index, fixture) in fixtures.into_iter().enumerate() {
+        if index != 2 {
+            fixture.service.prepare_target().unwrap();
+        }
+        let outcome = fixture.service.paste(&text("payload"));
+
+        assert!(outcome.is_ok());
+        assert_eq!(*fixture.panel.visible.lock().unwrap(), Ok(false));
+    }
 }
 
 #[test]
@@ -427,12 +460,16 @@ impl Fixture {
                 window: Window(100),
                 focused_control: Some(Window(101)),
                 identity: identity(),
+                window_generation: 1,
+                focused_control_instance_id: Some(2),
+                focused_control_generation: Some(3),
             })]))),
             inspections: Arc::new(Mutex::new(inspections.into_iter().collect())),
             restore_results: Arc::new(Mutex::new(VecDeque::new())),
             input_allowed: Arc::new(Mutex::new(VecDeque::new())),
             input_desktop: Arc::new(Mutex::new(Ok(7))),
             foreground: Arc::new(Mutex::new(Ok(Window(100)))),
+            lifecycle_valid: Arc::new(Mutex::new(VecDeque::new())),
         };
         let clipboard = FakeClipboard {
             calls: Arc::clone(&calls),
@@ -442,6 +479,8 @@ impl Fixture {
         let panel = FakePanel {
             calls: Arc::clone(&calls),
             result: Arc::new(Mutex::new(Ok(()))),
+            visible: Arc::new(Mutex::new(Ok(true))),
+            keep_visible_after_hide: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         let input = FakeInput {
             calls: Arc::clone(&calls),
@@ -468,6 +507,9 @@ impl Fixture {
             window: Window(100),
             focused_control: Some(Window(101)),
             identity,
+            window_generation: 1,
+            focused_control_instance_id: Some(2),
+            focused_control_generation: Some(3),
         })]);
         self
     }
@@ -486,6 +528,7 @@ struct FakeTarget {
     input_allowed: Arc<Mutex<VecDeque<Result<bool, FakeError>>>>,
     input_desktop: Arc<Mutex<Result<u64, FakeError>>>,
     foreground: Arc<Mutex<Result<Window, FakeError>>>,
+    lifecycle_valid: Arc<Mutex<VecDeque<Result<bool, FakeError>>>>,
 }
 
 type CaptureResults = VecDeque<Result<TargetSnapshot<Window>, FakeError>>;
@@ -542,6 +585,14 @@ impl PasteTarget for FakeTarget {
         self.calls.lock().unwrap().push(Call::Foreground);
         *self.foreground.lock().unwrap()
     }
+
+    fn lifecycle_valid(&self, _target: &TargetSnapshot<Self::Window>) -> Result<bool, Self::Error> {
+        self.lifecycle_valid
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or(Ok(true))
+    }
 }
 
 #[derive(Clone)]
@@ -568,6 +619,8 @@ impl PasteClipboard for FakeClipboard {
 struct FakePanel {
     calls: Arc<Mutex<Vec<Call>>>,
     result: Arc<Mutex<Result<(), FakeError>>>,
+    visible: Arc<Mutex<Result<bool, FakeError>>>,
+    keep_visible_after_hide: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl PastePanel for FakePanel {
@@ -575,7 +628,19 @@ impl PastePanel for FakePanel {
 
     fn hide(&self) -> Result<(), Self::Error> {
         self.calls.lock().unwrap().push(Call::Hide);
-        *self.result.lock().unwrap()
+        let result = *self.result.lock().unwrap();
+        if result.is_ok()
+            && !self
+                .keep_visible_after_hide
+                .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            *self.visible.lock().unwrap() = Ok(false);
+        }
+        result
+    }
+
+    fn is_visible(&self) -> Result<bool, Self::Error> {
+        *self.visible.lock().unwrap()
     }
 }
 
@@ -619,7 +684,7 @@ struct FakeInput {
 impl PasteInput<Window> for FakeInput {
     type Error = FakeError;
 
-    fn send_ctrl_v(&self, _expected_foreground: Window) -> Result<(), Self::Error> {
+    fn send_ctrl_v(&self, _target: &TargetSnapshot<Window>) -> Result<(), Self::Error> {
         self.calls.lock().unwrap().push(Call::Inject);
         *self.result.lock().unwrap()
     }

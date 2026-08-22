@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     error::Error,
     fmt,
     mem::size_of,
@@ -167,7 +168,7 @@ impl ClipboardPublisher {
         }
         *state = ProductWriteState::Armed {
             baseline,
-            pending: Vec::new(),
+            pending: VecDeque::new(),
         };
         drop(state);
         Ok(ProductWriteGuard {
@@ -186,7 +187,7 @@ impl ClipboardPublisher {
             .begin_product_write()
             .map_err(ClipboardWriteError::Ownership)?;
         let attempt = write_representations(representations);
-        finish_product_write(ownership, attempt.changed_sequence);
+        finish_product_write(ownership, &attempt.owned_sequences);
         attempt.result
     }
 }
@@ -319,12 +320,14 @@ fn validate_representations(
 
 struct ClipboardWriteAttempt {
     result: Result<u32, ClipboardWriteError>,
-    changed_sequence: Option<u32>,
+    owned_sequences: Vec<u32>,
 }
 
-fn finish_product_write(ownership: ProductWriteGuard, changed_sequence: Option<u32>) {
-    if let Some(sequence) = changed_sequence {
-        ownership.finish(sequence);
+fn finish_product_write(ownership: ProductWriteGuard, owned_sequences: &[u32]) {
+    if owned_sequences.is_empty() {
+        ownership.cancel();
+    } else {
+        ownership.finish(owned_sequences);
     }
 }
 
@@ -334,15 +337,15 @@ fn write_representations(representations: &[ClipboardRepresentation]) -> Clipboa
         Err(error) => {
             return ClipboardWriteAttempt {
                 result: Err(error),
-                changed_sequence: None,
+                owned_sequences: Vec::new(),
             };
         }
     };
-    let mut changed_sequence = None;
+    let mut owned_sequences = Vec::new();
     let operation = (|| {
         unsafe { EmptyClipboard() }
             .map_err(|error| ClipboardWriteError::Windows(ClipboardWriteOperation::Empty, error))?;
-        changed_sequence = Some(unsafe { GetClipboardSequenceNumber() });
+        record_owned_sequence(&mut owned_sequences);
         let mut published = 0usize;
         for representation in representations {
             let (format, bytes) = match representation {
@@ -371,18 +374,20 @@ fn write_representations(representations: &[ClipboardRepresentation]) -> Clipboa
                 ClipboardRepresentation::DibV5 { bytes } => (CF_DIBV5_FORMAT, bytes.clone()),
             };
             publish_global_bytes(format, &bytes)?;
-            changed_sequence = Some(unsafe { GetClipboardSequenceNumber() });
+            record_owned_sequence(&mut owned_sequences);
             published += 1;
         }
         if published == 0 {
             Err(ClipboardWriteError::UnsupportedRepresentation)
         } else {
-            Ok(unsafe { GetClipboardSequenceNumber() })
+            Ok(*owned_sequences
+                .last()
+                .expect("a successful write changed the clipboard"))
         }
     })();
     let close = clipboard.close();
     let result = match (operation, close) {
-        (Ok(_), Ok(())) => Ok(changed_sequence.expect("a successful write changed the clipboard")),
+        (Ok(sequence), Ok(())) => Ok(sequence),
         (Err(operation), Ok(())) => Err(operation),
         (Ok(_), Err(close)) => Err(ClipboardWriteError::Windows(
             ClipboardWriteOperation::Close,
@@ -395,7 +400,14 @@ fn write_representations(representations: &[ClipboardRepresentation]) -> Clipboa
     };
     ClipboardWriteAttempt {
         result,
-        changed_sequence,
+        owned_sequences,
+    }
+}
+
+fn record_owned_sequence(owned_sequences: &mut Vec<u32>) {
+    let sequence = unsafe { GetClipboardSequenceNumber() };
+    if owned_sequences.last().copied() != Some(sequence) {
+        owned_sequences.push(sequence);
     }
 }
 
@@ -722,9 +734,10 @@ fn route_event(
         let mut state = lock_unpoisoned(state);
         match &mut *state {
             ProductWriteState::Armed { pending, .. } => {
-                if pending.len() < MAX_PENDING_PRODUCT_WRITE_EVENTS {
-                    pending.push(event);
+                if pending.len() == MAX_PENDING_PRODUCT_WRITE_EVENTS {
+                    pending.pop_front();
                 }
+                pending.push_back(event);
                 None
             }
             ProductWriteState::Expected { sequence } if *sequence == event.sequence_number => {
@@ -748,7 +761,7 @@ pub(super) enum ProductWriteState {
     Idle,
     Armed {
         baseline: u32,
-        pending: Vec<ClipboardEvent>,
+        pending: VecDeque<ClipboardEvent>,
     },
     Expected {
         sequence: u32,
@@ -762,24 +775,31 @@ pub struct ProductWriteGuard {
 }
 
 impl ProductWriteGuard {
-    pub fn finish(mut self, sequence_number: u32) {
+    pub fn finish(mut self, owned_sequences: &[u32]) {
         let mut state = lock_unpoisoned(&self.state);
         let previous = std::mem::replace(&mut *state, ProductWriteState::Idle);
         *state = match previous {
             ProductWriteState::Armed { baseline, pending } => {
-                let matched = pending
+                let owned_sequences: Vec<_> = owned_sequences
                     .iter()
-                    .any(|event| event.sequence_number == sequence_number);
+                    .copied()
+                    .filter(|sequence| *sequence != baseline)
+                    .collect();
+                let final_sequence = owned_sequences.last().copied();
+                let matched = final_sequence.is_some_and(|sequence| {
+                    pending
+                        .iter()
+                        .any(|event| event.sequence_number == sequence)
+                });
                 let pending_to_send: Vec<_> = pending
                     .into_iter()
-                    .filter(|event| event.sequence_number != sequence_number)
+                    .filter(|event| !owned_sequences.contains(&event.sequence_number))
                     .collect();
-                if matched || sequence_number == baseline {
-                    *state = ProductWriteState::Idle;
-                } else {
-                    *state = ProductWriteState::Expected {
-                        sequence: sequence_number,
-                    };
+                match final_sequence {
+                    Some(sequence) if !matched => {
+                        *state = ProductWriteState::Expected { sequence };
+                    }
+                    _ => *state = ProductWriteState::Idle,
                 }
                 drop(state);
                 for event in pending_to_send {
@@ -792,13 +812,30 @@ impl ProductWriteGuard {
         };
         self.finished = true;
     }
+
+    pub fn cancel(mut self) {
+        self.cancel_inner();
+        self.finished = true;
+    }
+
+    fn cancel_inner(&mut self) {
+        let pending = {
+            let mut state = lock_unpoisoned(&self.state);
+            match std::mem::replace(&mut *state, ProductWriteState::Idle) {
+                ProductWriteState::Armed { pending, .. } => pending,
+                _ => VecDeque::new(),
+            }
+        };
+        for event in pending {
+            let _ = self.events.send(event);
+        }
+    }
 }
 
 impl Drop for ProductWriteGuard {
     fn drop(&mut self) {
         if !self.finished {
-            let mut state = lock_unpoisoned(&self.state);
-            *state = ProductWriteState::Idle;
+            self.cancel_inner();
         }
     }
 }
@@ -1219,6 +1256,7 @@ pub(super) type ShutdownReceiver = std::sync::mpsc::Receiver<()>;
 mod tests {
     use std::{
         cell::RefCell,
+        collections::VecDeque,
         sync::{Arc, Mutex, mpsc},
     };
 
@@ -1242,7 +1280,7 @@ mod tests {
         let (events, receiver) = mpsc::channel();
         let state = Arc::new(Mutex::new(ProductWriteState::Armed {
             baseline: 40,
-            pending: Vec::new(),
+            pending: VecDeque::new(),
         }));
         route_event(&state, &events, event(41));
         route_event(&state, &events, event(42));
@@ -1252,7 +1290,7 @@ mod tests {
             events,
             finished: false,
         }
-        .finish(42);
+        .finish(&[42]);
 
         assert_eq!(receiver.recv().unwrap().sequence_number, 41);
         assert!(receiver.try_recv().is_err());
@@ -1263,7 +1301,7 @@ mod tests {
         let (events, receiver) = mpsc::channel();
         let state = Arc::new(Mutex::new(ProductWriteState::Armed {
             baseline: 50,
-            pending: Vec::new(),
+            pending: VecDeque::new(),
         }));
 
         ProductWriteGuard {
@@ -1271,7 +1309,7 @@ mod tests {
             events: events.clone(),
             finished: false,
         }
-        .finish(51);
+        .finish(&[51]);
 
         route_event(&state, &events, event(51));
         assert!(receiver.try_recv().is_err());
@@ -1280,11 +1318,11 @@ mod tests {
     }
 
     #[test]
-    fn dropping_unfinished_write_discards_identity_unknown_events() {
+    fn open_clipboard_failure_cancels_ownership_and_replays_pending_external_events() {
         let (events, receiver) = mpsc::channel();
         let state = Arc::new(Mutex::new(ProductWriteState::Armed {
             baseline: 60,
-            pending: Vec::new(),
+            pending: VecDeque::new(),
         }));
         route_event(&state, &events, event(61));
 
@@ -1294,7 +1332,36 @@ mod tests {
             finished: false,
         });
 
+        assert_eq!(receiver.recv().unwrap().sequence_number, 61);
         assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn empty_clipboard_failure_replays_every_pending_external_event() {
+        let (events, receiver) = mpsc::channel();
+        let state = Arc::new(Mutex::new(ProductWriteState::Armed {
+            baseline: 70,
+            pending: VecDeque::new(),
+        }));
+        route_event(&state, &events, event(71));
+        route_event(&state, &events, event(72));
+
+        finish_product_write(
+            ProductWriteGuard {
+                state,
+                events,
+                finished: false,
+            },
+            &[],
+        );
+
+        assert_eq!(
+            receiver
+                .try_iter()
+                .map(|event| event.sequence_number)
+                .collect::<Vec<_>>(),
+            [71, 72]
+        );
     }
 
     #[test]
@@ -1302,7 +1369,7 @@ mod tests {
         let (events, receiver) = mpsc::channel();
         let state = Arc::new(Mutex::new(ProductWriteState::Armed {
             baseline: 65,
-            pending: Vec::new(),
+            pending: VecDeque::new(),
         }));
 
         ProductWriteGuard {
@@ -1310,18 +1377,18 @@ mod tests {
             events: events.clone(),
             finished: false,
         }
-        .finish(65);
+        .finish(&[65]);
 
         route_event(&state, &events, event(66));
         assert_eq!(receiver.recv().unwrap().sequence_number, 66);
     }
 
     #[test]
-    fn failed_write_after_clipboard_change_still_suppresses_owned_sequence() {
+    fn close_clipboard_failure_after_owned_change_suppresses_only_the_owned_sequence() {
         let (events, receiver) = mpsc::channel();
         let state = Arc::new(Mutex::new(ProductWriteState::Armed {
             baseline: 65,
-            pending: Vec::new(),
+            pending: VecDeque::new(),
         }));
         route_event(&state, &events, event(66));
 
@@ -1331,7 +1398,7 @@ mod tests {
                 events: events.clone(),
                 finished: false,
             },
-            Some(66),
+            &[66],
         );
 
         assert!(receiver.try_recv().is_err());
@@ -1340,11 +1407,11 @@ mod tests {
     }
 
     #[test]
-    fn owned_write_pending_events_keep_the_earliest_bounded_prefix() {
+    fn owned_write_pending_overflow_preserves_the_latest_external_state() {
         let (events, receiver) = mpsc::channel();
         let state = Arc::new(Mutex::new(ProductWriteState::Armed {
             baseline: 70,
-            pending: Vec::new(),
+            pending: VecDeque::new(),
         }));
         let event_count = MAX_PENDING_PRODUCT_WRITE_EVENTS + 5;
 
@@ -1363,24 +1430,21 @@ mod tests {
             events,
             finished: false,
         }
-        .finish(70 + event_count as u32);
+        .finish(&[70 + event_count as u32]);
 
         let observed: Vec<_> = receiver
             .try_iter()
             .map(|event| event.sequence_number)
             .collect();
-        assert_eq!(
-            observed,
-            (71..71 + MAX_PENDING_PRODUCT_WRITE_EVENTS as u32).collect::<Vec<_>>()
-        );
+        assert_eq!(observed.last().copied(), Some(70 + event_count as u32 - 1));
     }
 
     #[test]
-    fn overflow_never_publishes_product_sequence_and_drops_late_external_events() {
+    fn overflow_never_publishes_product_sequence_and_keeps_latest_external_event() {
         let (events, receiver) = mpsc::channel();
         let state = Arc::new(Mutex::new(ProductWriteState::Armed {
             baseline: 80,
-            pending: Vec::new(),
+            pending: VecDeque::new(),
         }));
         let product_sequence = 81;
         route_event(&state, &events, event(product_sequence));
@@ -1394,7 +1458,7 @@ mod tests {
             events,
             finished: false,
         }
-        .finish(product_sequence);
+        .finish(&[product_sequence]);
 
         let observed: Vec<_> = receiver
             .try_iter()
@@ -1402,8 +1466,8 @@ mod tests {
             .collect();
         assert!(!observed.contains(&product_sequence));
         assert_eq!(
-            observed,
-            (82..80 + MAX_PENDING_PRODUCT_WRITE_EVENTS as u32 + 1).collect::<Vec<_>>()
+            observed.last().copied(),
+            Some(80 + (MAX_PENDING_PRODUCT_WRITE_EVENTS + 5) as u32)
         );
     }
 

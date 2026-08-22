@@ -4,6 +4,7 @@ use std::{
     fmt,
     hash::{Hash, Hasher},
     mem::{size_of, zeroed},
+    sync::atomic::{AtomicUsize, Ordering},
 };
 
 use windows::Win32::{
@@ -30,8 +31,8 @@ use windows::Win32::{
         },
         WindowsAndMessaging::{
             GA_ROOT, GCW_ATOM, GUITHREADINFO, GWLP_HINSTANCE, GWLP_USERDATA, GWLP_WNDPROC,
-            GetAncestor, GetClassLongPtrW, GetForegroundWindow, GetGUIThreadInfo,
-            GetWindowLongPtrW, GetWindowThreadProcessId, IsWindow,
+            GetAncestor, GetClassLongPtrW, GetForegroundWindow, GetGUIThreadInfo, GetPropW,
+            GetWindowLongPtrW, GetWindowThreadProcessId, IsWindow, SetPropW,
         },
     },
 };
@@ -68,6 +69,7 @@ pub enum WindowsPasteError {
     ForegroundChanged,
     InputDispatch,
     InputCleanup,
+    LifecycleProof,
 }
 
 impl fmt::Display for WindowsPasteError {
@@ -88,6 +90,7 @@ impl fmt::Display for WindowsPasteError {
             Self::ForegroundChanged => "the foreground window changed during paste dispatch",
             Self::InputDispatch => "the paste shortcut could not be dispatched completely",
             Self::InputCleanup => "paste shortcut cleanup could not release injected keys",
+            Self::LifecycleProof => "the paste target lifetime could not be proven",
         })
     }
 }
@@ -108,17 +111,39 @@ impl PasteTarget for Win32PasteTarget {
         }
         let root = unsafe { GetAncestor(foreground, GA_ROOT) };
         let window = if root.0.is_null() { foreground } else { root };
-        let identity = inspect_window(window)?;
-        let focused_control = focused_control(identity.thread_id)
-            .filter(|focused| {
-                window_process_thread(*focused).ok()
-                    == Some((identity.process_id, identity.thread_id))
-            })
+        let (window_generation, identity) = capture_with_lifecycle_proof(
+            || establish_window_generation(window),
+            || inspect_window(window),
+            || read_window_generation(window),
+        )?;
+        let focused_control = focused_control(identity.thread_id)?
+            .filter(|focused| *focused != window)
             .map(WindowsWindow::from_hwnd);
+        let (focused_control_instance_id, focused_control_generation) = match focused_control {
+            Some(control) => {
+                let (generation, instance_id) = capture_with_lifecycle_proof(
+                    || establish_window_generation(control.hwnd()),
+                    || {
+                        if window_process_thread(control.hwnd())?
+                            != (identity.process_id, identity.thread_id)
+                        {
+                            return Err(WindowsPasteError::LifecycleProof);
+                        }
+                        window_instance_id(control.hwnd())
+                    },
+                    || read_window_generation(control.hwnd()),
+                )?;
+                (Some(instance_id), Some(generation))
+            }
+            None => (None, None),
+        };
         Ok(TargetSnapshot {
             window: WindowsWindow::from_hwnd(window),
             focused_control,
             identity,
+            window_generation,
+            focused_control_instance_id,
+            focused_control_generation,
         })
     }
 
@@ -141,11 +166,19 @@ impl PasteTarget for Win32PasteTarget {
     }
 
     fn restore(&self, target: &TargetSnapshot<Self::Window>) -> Result<(), Self::Error> {
+        if !lifecycle_valid(target)? || inspect_window(target.window.hwnd())? != target.identity {
+            return Err(WindowsPasteError::LifecycleProof);
+        }
         crate::platform::windows::activation::activate(target.window.hwnd())
             .map_err(|_| WindowsPasteError::ForegroundRejected)?;
+        if !lifecycle_valid(target)? || inspect_window(target.window.hwnd())? != target.identity {
+            return Err(WindowsPasteError::LifecycleProof);
+        }
         if let Some(control) = target.focused_control {
             restore_focus_control(
                 control,
+                target.focused_control_instance_id,
+                target.focused_control_generation,
                 target.identity.process_id,
                 target.identity.thread_id,
             )?;
@@ -169,6 +202,85 @@ impl PasteTarget for Win32PasteTarget {
                 root
             }))
         }
+    }
+
+    fn lifecycle_valid(&self, target: &TargetSnapshot<Self::Window>) -> Result<bool, Self::Error> {
+        lifecycle_valid(target)
+    }
+}
+
+static NEXT_WINDOW_GENERATION: AtomicUsize = AtomicUsize::new(1);
+const WINDOW_GENERATION_PROPERTY: windows::core::PCWSTR =
+    windows::core::w!("ClipboardAssistant.WindowGeneration");
+const WINDOW_GENERATION_OWNER_PROPERTY: windows::core::PCWSTR =
+    windows::core::w!("ClipboardAssistant.WindowGenerationOwner");
+
+fn establish_window_generation(window: HWND) -> Result<usize, WindowsPasteError> {
+    let generation = NEXT_WINDOW_GENERATION
+        .fetch_add(1, Ordering::Relaxed)
+        .max(1);
+    let owner = unsafe { GetCurrentProcessId() } as usize;
+    unsafe {
+        SetPropW(
+            window,
+            WINDOW_GENERATION_OWNER_PROPERTY,
+            Some(HANDLE(owner as *mut _)),
+        )
+    }
+    .map_err(|_| WindowsPasteError::LifecycleProof)?;
+    unsafe {
+        SetPropW(
+            window,
+            WINDOW_GENERATION_PROPERTY,
+            Some(HANDLE(generation as *mut _)),
+        )
+    }
+    .map_err(|_| WindowsPasteError::LifecycleProof)?;
+    if read_window_generation(window) == Some(generation) {
+        Ok(generation)
+    } else {
+        Err(WindowsPasteError::LifecycleProof)
+    }
+}
+
+fn capture_with_lifecycle_proof<T>(
+    install_generation: impl FnOnce() -> Result<usize, WindowsPasteError>,
+    inspect: impl FnOnce() -> Result<T, WindowsPasteError>,
+    read_generation: impl FnOnce() -> Option<usize>,
+) -> Result<(usize, T), WindowsPasteError> {
+    let generation = install_generation()?;
+    let value = inspect()?;
+    if read_generation() == Some(generation) {
+        Ok((generation, value))
+    } else {
+        Err(WindowsPasteError::LifecycleProof)
+    }
+}
+
+fn read_window_generation(window: HWND) -> Option<usize> {
+    let owner = unsafe { GetPropW(window, WINDOW_GENERATION_OWNER_PROPERTY) };
+    if owner.0 as usize != unsafe { GetCurrentProcessId() } as usize {
+        return None;
+    }
+    let value = unsafe { GetPropW(window, WINDOW_GENERATION_PROPERTY) };
+    (!value.0.is_null()).then_some(value.0 as usize)
+}
+
+fn lifecycle_valid(target: &TargetSnapshot<WindowsWindow>) -> Result<bool, WindowsPasteError> {
+    if read_window_generation(target.window.hwnd()) != Some(target.window_generation) {
+        return Ok(false);
+    }
+    match (
+        target.focused_control,
+        target.focused_control_instance_id,
+        target.focused_control_generation,
+    ) {
+        (None, None, None) => Ok(true),
+        (Some(control), Some(instance), Some(generation)) => {
+            Ok(read_window_generation(control.hwnd()) == Some(generation)
+                && window_instance_id(control.hwnd())? == instance)
+        }
+        _ => Ok(false),
     }
 }
 
@@ -226,24 +338,33 @@ fn window_instance_id(window: HWND) -> Result<u64, WindowsPasteError> {
     Ok(hasher.finish())
 }
 
-fn focused_control(thread_id: u32) -> Option<HWND> {
+fn focused_control(thread_id: u32) -> Result<Option<HWND>, WindowsPasteError> {
     let mut info = GUITHREADINFO {
         cbSize: size_of::<GUITHREADINFO>() as u32,
         ..unsafe { zeroed() }
     };
     unsafe { GetGUIThreadInfo(thread_id, &mut info) }
-        .ok()
-        .and_then(|_| (!info.hwndFocus.0.is_null()).then_some(info.hwndFocus))
+        .map_err(|_| WindowsPasteError::LifecycleProof)?;
+    Ok((!info.hwndFocus.0.is_null()).then_some(info.hwndFocus))
 }
 
 fn restore_focus_control(
     control: WindowsWindow,
+    expected_instance_id: Option<u64>,
+    expected_generation: Option<usize>,
     process_id: u32,
     thread_id: u32,
 ) -> Result<(), WindowsPasteError> {
     let control = control.hwnd();
+    let (Some(expected_instance_id), Some(expected_generation)) =
+        (expected_instance_id, expected_generation)
+    else {
+        return Err(WindowsPasteError::LifecycleProof);
+    };
     if !unsafe { IsWindow(Some(control)) }.as_bool()
         || window_process_thread(control)? != (process_id, thread_id)
+        || read_window_generation(control) != Some(expected_generation)
+        || window_instance_id(control)? != expected_instance_id
     {
         return Err(WindowsPasteError::FocusRestore);
     }
@@ -253,13 +374,24 @@ fn restore_focus_control(
     if current_thread != thread_id && !attached {
         return Err(WindowsPasteError::FocusRestore);
     }
+    if read_window_generation(control) != Some(expected_generation)
+        || window_instance_id(control)? != expected_instance_id
+    {
+        if attached {
+            let _ = unsafe { AttachThreadInput(current_thread, thread_id, false) };
+        }
+        return Err(WindowsPasteError::LifecycleProof);
+    }
     let _ = unsafe { SetFocus(Some(control)) };
     let detached =
         !attached || unsafe { AttachThreadInput(current_thread, thread_id, false) }.as_bool();
     if !detached {
         return Err(WindowsPasteError::FocusRestore);
     }
-    if focused_control(thread_id) == Some(control) {
+    if read_window_generation(control) == Some(expected_generation)
+        && window_instance_id(control)? == expected_instance_id
+        && focused_control(thread_id)? == Some(control)
+    {
         Ok(())
     } else {
         Err(WindowsPasteError::FocusRestore)
@@ -442,8 +574,8 @@ pub struct Win32PasteInput;
 impl PasteInput<WindowsWindow> for Win32PasteInput {
     type Error = WindowsPasteError;
 
-    fn send_ctrl_v(&self, expected_foreground: WindowsWindow) -> Result<(), Self::Error> {
-        send_ctrl_v(&Win32InputApi, expected_foreground)
+    fn send_ctrl_v(&self, target: &TargetSnapshot<WindowsWindow>) -> Result<(), Self::Error> {
+        send_ctrl_v(&Win32InputApi, target)
     }
 }
 
@@ -457,12 +589,17 @@ trait InputApi {
     type Window: Copy + Eq;
 
     fn foreground(&self) -> Self::Window;
+    fn target_valid(&self, target: &TargetSnapshot<Self::Window>) -> bool;
     fn key_down(&self, key: PasteKey) -> bool;
     fn send(&self, key: PasteKey, key_up: bool) -> bool;
 }
 
-fn send_ctrl_v<A: InputApi>(api: &A, expected: A::Window) -> Result<(), WindowsPasteError> {
-    if api.foreground() != expected {
+fn send_ctrl_v<A: InputApi>(
+    api: &A,
+    target: &TargetSnapshot<A::Window>,
+) -> Result<(), WindowsPasteError> {
+    let expected = target.window;
+    if !target_matches(api, target, expected) {
         return Err(WindowsPasteError::ForegroundChanged);
     }
     if api.key_down(PasteKey::Control) || api.key_down(PasteKey::V) {
@@ -470,30 +607,38 @@ fn send_ctrl_v<A: InputApi>(api: &A, expected: A::Window) -> Result<(), WindowsP
     }
     let mut pressed = Vec::with_capacity(2);
     for key in [PasteKey::Control, PasteKey::V] {
-        if api.foreground() != expected {
+        if !target_matches(api, target, expected) {
             return release_pressed(api, &mut pressed, WindowsPasteError::ForegroundChanged);
         }
         if !api.send(key, false) {
             return release_pressed(api, &mut pressed, WindowsPasteError::InputDispatch);
         }
         pressed.push(key);
-        if api.foreground() != expected {
+        if !target_matches(api, target, expected) {
             return release_pressed(api, &mut pressed, WindowsPasteError::ForegroundChanged);
         }
     }
     for key in [PasteKey::V, PasteKey::Control] {
-        if api.foreground() != expected {
+        if !target_matches(api, target, expected) {
             return release_pressed(api, &mut pressed, WindowsPasteError::ForegroundChanged);
         }
         if !api.send(key, true) {
             return release_pressed(api, &mut pressed, WindowsPasteError::InputDispatch);
         }
         pressed.pop();
-        if api.foreground() != expected {
+        if !target_matches(api, target, expected) {
             return release_pressed(api, &mut pressed, WindowsPasteError::ForegroundChanged);
         }
     }
     Ok(())
+}
+
+fn target_matches<A: InputApi>(
+    api: &A,
+    target: &TargetSnapshot<A::Window>,
+    expected: A::Window,
+) -> bool {
+    api.foreground() == expected && api.target_valid(target)
 }
 
 fn release_pressed<A: InputApi>(
@@ -525,6 +670,11 @@ impl InputApi for Win32InputApi {
 
     fn key_down(&self, key: PasteKey) -> bool {
         (unsafe { GetAsyncKeyState(virtual_key(key).0.into()) }) < 0
+    }
+
+    fn target_valid(&self, target: &TargetSnapshot<Self::Window>) -> bool {
+        inspect_window(target.window.hwnd()).ok() == Some(target.identity)
+            && lifecycle_valid(target).ok() == Some(true)
     }
 
     fn send(&self, key: PasteKey, key_up: bool) -> bool {
@@ -560,10 +710,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn stable_capture_installs_generation_before_inspection_and_rejects_reuse_during_inspection() {
+        use std::cell::Cell;
+
+        let generation = Cell::new(None);
+        let inspected_after_install = Cell::new(false);
+        let result = capture_with_lifecycle_proof(
+            || {
+                generation.set(Some(41));
+                Ok(41)
+            },
+            || {
+                inspected_after_install.set(generation.get() == Some(41));
+                generation.set(Some(42));
+                Ok(7)
+            },
+            || generation.get(),
+        );
+
+        assert!(inspected_after_install.get());
+        assert_eq!(result, Err(WindowsPasteError::LifecycleProof));
+    }
+
+    #[test]
     fn input_state_machine_sends_balanced_ctrl_v() {
         let api = FakeInputApi::new([true, true, true, true]);
 
-        send_ctrl_v(&api, 7).unwrap();
+        send_ctrl_v(&api, &fake_target()).unwrap();
 
         assert_eq!(
             *api.events.lock().unwrap(),
@@ -580,7 +753,10 @@ mod tests {
     fn partial_send_releases_only_keys_pressed_by_this_operation() {
         let api = FakeInputApi::new([true, false, true]);
 
-        assert_eq!(send_ctrl_v(&api, 7), Err(WindowsPasteError::InputDispatch));
+        assert_eq!(
+            send_ctrl_v(&api, &fake_target()),
+            Err(WindowsPasteError::InputDispatch)
+        );
         assert_eq!(
             *api.events.lock().unwrap(),
             [
@@ -595,7 +771,10 @@ mod tests {
     fn cleanup_failure_is_reported_after_partial_send() {
         let api = FakeInputApi::new([true, false, false]);
 
-        assert_eq!(send_ctrl_v(&api, 7), Err(WindowsPasteError::InputCleanup));
+        assert_eq!(
+            send_ctrl_v(&api, &fake_target()),
+            Err(WindowsPasteError::InputCleanup)
+        );
     }
 
     #[test]
@@ -605,7 +784,7 @@ mod tests {
             *api.held.lock().unwrap() = held;
 
             assert_eq!(
-                send_ctrl_v(&api, 7),
+                send_ctrl_v(&api, &fake_target()),
                 Err(WindowsPasteError::PhysicalPasteKeyDown)
             );
             assert!(api.events.lock().unwrap().is_empty());
@@ -618,7 +797,46 @@ mod tests {
         *api.foregrounds.lock().unwrap() = VecDeque::from([7, 7, 8]);
 
         assert_eq!(
-            send_ctrl_v(&api, 7),
+            send_ctrl_v(&api, &fake_target()),
+            Err(WindowsPasteError::ForegroundChanged)
+        );
+        assert_eq!(
+            *api.events.lock().unwrap(),
+            [(PasteKey::Control, false), (PasteKey::Control, true)]
+        );
+    }
+
+    #[test]
+    fn top_level_reuse_before_first_key_down_sends_no_input() {
+        let api = FakeInputApi::new([]);
+        *api.validity.lock().unwrap() = VecDeque::from([true, false]);
+
+        assert_eq!(
+            send_ctrl_v(&api, &fake_target()),
+            Err(WindowsPasteError::ForegroundChanged)
+        );
+        assert!(api.events.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn focused_child_reuse_before_first_key_down_sends_no_input() {
+        let api = FakeInputApi::new([]);
+        *api.validity.lock().unwrap() = VecDeque::from([true, false]);
+
+        assert_eq!(
+            send_ctrl_v(&api, &fake_target()),
+            Err(WindowsPasteError::ForegroundChanged)
+        );
+        assert!(api.events.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn lifecycle_change_before_later_key_down_releases_owned_control() {
+        let api = FakeInputApi::new([true, true]);
+        *api.validity.lock().unwrap() = VecDeque::from([true, true, true, false]);
+
+        assert_eq!(
+            send_ctrl_v(&api, &fake_target()),
             Err(WindowsPasteError::ForegroundChanged)
         );
         assert_eq!(
@@ -662,14 +880,15 @@ mod tests {
             std::env::var("CLIPBOARD_ASSISTANT_RUN_PASTE_TESTS").as_deref(),
             Ok("1")
         );
-        let foreground = Win32InputApi.foreground();
-        Win32PasteInput.send_ctrl_v(foreground).unwrap();
+        let target = Win32PasteTarget.capture().unwrap();
+        Win32PasteInput.send_ctrl_v(&target).unwrap();
     }
 
     struct FakeInputApi {
         foregrounds: Mutex<VecDeque<i32>>,
         held: Mutex<[bool; 2]>,
         results: Mutex<VecDeque<bool>>,
+        validity: Mutex<VecDeque<bool>>,
         events: Mutex<Vec<(PasteKey, bool)>>,
     }
 
@@ -679,6 +898,7 @@ mod tests {
                 foregrounds: Mutex::new(VecDeque::from([7])),
                 held: Mutex::new([false, false]),
                 results: Mutex::new(results.into_iter().collect()),
+                validity: Mutex::new(VecDeque::from([true])),
                 events: Mutex::new(Vec::new()),
             }
         }
@@ -703,9 +923,39 @@ mod tests {
             }]
         }
 
+        fn target_valid(&self, _target: &TargetSnapshot<Self::Window>) -> bool {
+            let mut values = self.validity.lock().unwrap();
+            if values.len() > 1 {
+                values.pop_front().unwrap()
+            } else {
+                *values.front().unwrap()
+            }
+        }
+
         fn send(&self, key: PasteKey, key_up: bool) -> bool {
             self.events.lock().unwrap().push((key, key_up));
             self.results.lock().unwrap().pop_front().unwrap_or(true)
+        }
+    }
+
+    fn fake_target() -> TargetSnapshot<i32> {
+        TargetSnapshot {
+            window: 7,
+            focused_control: Some(8),
+            identity: TargetIdentity {
+                window_instance_id: 1,
+                process_id: 2,
+                thread_id: 3,
+                process_started_at: 4,
+                session_id: 5,
+                desktop_id: 6,
+                integrity_level: 7,
+                restricted: false,
+                app_container: false,
+            },
+            window_generation: 10,
+            focused_control_instance_id: Some(11),
+            focused_control_generation: Some(12),
         }
     }
 }
