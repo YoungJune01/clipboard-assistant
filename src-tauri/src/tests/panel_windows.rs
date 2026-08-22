@@ -5,7 +5,7 @@ use std::{
 
 use crate::{
     platform::windows::monitor::{
-        DipSize, MonitorSnapshot, PhysicalPoint, PhysicalRect, place_panel,
+        DipSize, MonitorIdentity, MonitorSnapshot, PhysicalPoint, PhysicalRect, place_panel,
     },
     services::panel::{
         ObserverAction, PanelError, PanelMonitor, PanelService, PanelWindow,
@@ -201,6 +201,58 @@ fn service_requeries_monitor_on_show_reposition_and_hot_unplug_fallback() {
 }
 
 #[test]
+fn visible_panel_stays_on_owner_monitor_when_pointer_moves_elsewhere() {
+    let monitor = OwnerAwareMonitor::new(
+        snapshot_on("A", point(1800, 1000), rect(0, 0, 1920, 1040), 96),
+        vec![
+            snapshot_on("A", point(1800, 1000), rect(0, 0, 1920, 1040), 96),
+            snapshot_on("A", point(1800, 1000), rect(0, 0, 1920, 1040), 96),
+        ],
+    );
+    let window = FakeWindow::default();
+    let service = PanelService::new(monitor.clone(), window.clone(), dip(400, 300));
+
+    service.show().unwrap();
+    monitor.set_current(snapshot_on(
+        "B",
+        point(2500, 100),
+        rect(1920, 0, 3840, 1040),
+        144,
+    ));
+    assert!(!service.owner_environment_changed().unwrap());
+    service.reposition_if_visible().unwrap();
+
+    assert_eq!(monitor.owner_queries(), vec!["A", "A"]);
+    assert_eq!(window.last_bounds(), Some(rect(1399, 699, 1799, 999)));
+}
+
+#[test]
+fn owner_monitor_changes_reposition_with_original_anchor_and_removal_falls_back() {
+    let monitor = OwnerAwareMonitor::new(
+        snapshot_on("A", point(1800, 1000), rect(0, 0, 1920, 1040), 96),
+        vec![
+            snapshot_on("A", point(1800, 1000), rect(0, 40, 1920, 1000), 144),
+            snapshot_on("A", point(1800, 1000), rect(0, 40, 1920, 1000), 144),
+            snapshot_on("B", point(1919, 900), rect(1920, 0, 3840, 1040), 120),
+            snapshot_on("B", point(1919, 900), rect(1920, 0, 3840, 1040), 120),
+        ],
+    );
+    let window = FakeWindow::default();
+    let service = PanelService::new(monitor.clone(), window.clone(), dip(400, 300));
+
+    service.show().unwrap();
+    assert!(service.owner_environment_changed().unwrap());
+    service.reposition_if_visible().unwrap();
+    assert_eq!(window.last_bounds(), Some(rect(1199, 549, 1799, 999)));
+
+    assert!(service.owner_environment_changed().unwrap());
+    service.reposition_if_visible().unwrap();
+    assert_eq!(service.owner_identity().as_deref(), Some("B"));
+    assert_eq!(window.last_bounds(), Some(rect(1920, 524, 2420, 899)));
+    assert_eq!(monitor.owner_queries(), vec!["A", "A", "A", "A"]);
+}
+
+#[test]
 fn service_toggle_hide_focus_loss_and_focus_domain_are_deterministic() {
     let monitor = FakeMonitor::new(vec![snapshot(point(100, 100), rect(0, 0, 1920, 1040), 96)]);
     let window = FakeWindow::default();
@@ -381,9 +433,66 @@ impl PanelMonitor for FakeMonitor {
         let mut snapshots = self.snapshots.lock().unwrap();
         let snapshot = snapshots.pop().expect("configured monitor snapshot");
         if snapshots.is_empty() {
-            snapshots.push(snapshot);
+            snapshots.push(snapshot.clone());
         }
         Ok(snapshot)
+    }
+
+    fn snapshot_for_owner(
+        &self,
+        _identity: &MonitorIdentity,
+        _anchor: PhysicalPoint,
+    ) -> Result<MonitorSnapshot, Self::Error> {
+        self.snapshot()
+    }
+}
+
+#[derive(Clone)]
+struct OwnerAwareMonitor {
+    current: Arc<Mutex<MonitorSnapshot>>,
+    owner_snapshots: Arc<Mutex<VecDeque<MonitorSnapshot>>>,
+    owner_queries: Arc<Mutex<Vec<String>>>,
+}
+
+impl OwnerAwareMonitor {
+    fn new(current: MonitorSnapshot, owner_snapshots: Vec<MonitorSnapshot>) -> Self {
+        Self {
+            current: Arc::new(Mutex::new(current)),
+            owner_snapshots: Arc::new(Mutex::new(owner_snapshots.into())),
+            owner_queries: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    fn set_current(&self, snapshot: MonitorSnapshot) {
+        *self.current.lock().unwrap() = snapshot;
+    }
+
+    fn owner_queries(&self) -> Vec<String> {
+        self.owner_queries.lock().unwrap().clone()
+    }
+}
+
+impl PanelMonitor for OwnerAwareMonitor {
+    type Error = FakeError;
+
+    fn snapshot(&self) -> Result<MonitorSnapshot, Self::Error> {
+        Ok(self.current.lock().unwrap().clone())
+    }
+
+    fn snapshot_for_owner(
+        &self,
+        identity: &MonitorIdentity,
+        _anchor: PhysicalPoint,
+    ) -> Result<MonitorSnapshot, Self::Error> {
+        self.owner_queries
+            .lock()
+            .unwrap()
+            .push(identity.as_str().to_owned());
+        self.owner_snapshots
+            .lock()
+            .unwrap()
+            .pop_front()
+            .ok_or(FakeError("missing owner snapshot"))
     }
 }
 
@@ -525,8 +634,23 @@ const fn dip(width: u32, height: u32) -> DipSize {
     DipSize { width, height }
 }
 
-const fn snapshot(pointer: PhysicalPoint, work_area: PhysicalRect, dpi: u32) -> MonitorSnapshot {
+fn snapshot(pointer: PhysicalPoint, work_area: PhysicalRect, dpi: u32) -> MonitorSnapshot {
     MonitorSnapshot {
+        identity: MonitorIdentity::from_static("test-monitor"),
+        pointer,
+        work_area,
+        dpi,
+    }
+}
+
+fn snapshot_on(
+    identity: &'static str,
+    pointer: PhysicalPoint,
+    work_area: PhysicalRect,
+    dpi: u32,
+) -> MonitorSnapshot {
+    MonitorSnapshot {
+        identity: MonitorIdentity::from_static(identity),
         pointer,
         work_area,
         dpi,

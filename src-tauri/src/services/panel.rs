@@ -9,12 +9,19 @@ use std::{
     time::Duration,
 };
 
-use crate::platform::windows::monitor::{DipSize, MonitorSnapshot, PhysicalRect, place_panel};
+use crate::platform::windows::monitor::{
+    DipSize, MonitorIdentity, MonitorSnapshot, PhysicalPoint, PhysicalRect, place_panel,
+};
 
 pub trait PanelMonitor: Send + Sync + 'static {
     type Error: Error + Send + Sync + 'static;
 
     fn snapshot(&self) -> Result<MonitorSnapshot, Self::Error>;
+    fn snapshot_for_owner(
+        &self,
+        identity: &MonitorIdentity,
+        anchor: PhysicalPoint,
+    ) -> Result<MonitorSnapshot, Self::Error>;
 }
 
 pub trait PanelWindow: Send + Sync + 'static {
@@ -74,6 +81,9 @@ pub(crate) fn observer_action_for_visibility(visible: bool) -> ObserverAction {
 struct PanelState {
     visible: bool,
     focus_domain_depth: usize,
+    owner: Option<MonitorIdentity>,
+    anchor: Option<PhysicalPoint>,
+    environment: Option<DisplayEnvironment>,
 }
 
 pub struct PanelService<M, W> {
@@ -96,20 +106,30 @@ where
             state: Arc::new(Mutex::new(PanelState {
                 visible: false,
                 focus_domain_depth: 0,
+                owner: None,
+                anchor: None,
+                environment: None,
             })),
         }
     }
 
     pub fn show(&self) -> Result<(), PanelError> {
-        self.reposition()?;
+        let snapshot = self.query_current_snapshot()?;
+        self.apply_snapshot(&snapshot)?;
         self.window
             .show()
             .map_err(|error| PanelError::Window(Box::new(error)))?;
-        lock_unpoisoned(&self.state).visible = true;
+        {
+            let mut state = lock_unpoisoned(&self.state);
+            state.visible = true;
+            state.owner = Some(snapshot.identity.clone());
+            state.anchor = Some(snapshot.pointer);
+            state.environment = Some(DisplayEnvironment::from(&snapshot));
+        }
         if let Err(error) = self.window.focus() {
             return match self.window.hide() {
                 Ok(()) => {
-                    lock_unpoisoned(&self.state).visible = false;
+                    clear_visible_state(&mut lock_unpoisoned(&self.state));
                     Err(PanelError::Window(Box::new(error)))
                 }
                 Err(rollback_hide) => Err(PanelError::FocusAndRollback {
@@ -125,7 +145,7 @@ where
         self.window
             .hide()
             .map_err(|error| PanelError::Window(Box::new(error)))?;
-        lock_unpoisoned(&self.state).visible = false;
+        clear_visible_state(&mut lock_unpoisoned(&self.state));
         Ok(())
     }
 
@@ -139,10 +159,31 @@ where
 
     pub fn reposition_if_visible(&self) -> Result<(), PanelError> {
         if self.is_visible() {
-            self.reposition()
+            let snapshot = self.query_owner_snapshot()?;
+            self.apply_snapshot(&snapshot)?;
+            let mut state = lock_unpoisoned(&self.state);
+            state.owner = Some(snapshot.identity.clone());
+            state.environment = Some(DisplayEnvironment::from(&snapshot));
+            Ok(())
         } else {
             Ok(())
         }
+    }
+
+    pub fn owner_environment_changed(&self) -> Result<bool, PanelError> {
+        if !self.is_visible() {
+            return Ok(false);
+        }
+        let snapshot = self.query_owner_snapshot()?;
+        let current = DisplayEnvironment::from(&snapshot);
+        Ok(lock_unpoisoned(&self.state).environment.as_ref() != Some(&current))
+    }
+
+    pub fn owner_identity(&self) -> Option<String> {
+        lock_unpoisoned(&self.state)
+            .owner
+            .as_ref()
+            .map(|identity| identity.as_str().to_owned())
     }
 
     pub fn on_focus_changed(&self, focused: bool) -> Result<(), PanelError> {
@@ -165,11 +206,29 @@ where
         lock_unpoisoned(&self.state).visible
     }
 
-    fn reposition(&self) -> Result<(), PanelError> {
-        let snapshot = self
-            .monitor
+    fn query_current_snapshot(&self) -> Result<MonitorSnapshot, PanelError> {
+        self.monitor
             .snapshot()
-            .map_err(|error| PanelError::Monitor(Box::new(error)))?;
+            .map_err(|error| PanelError::Monitor(Box::new(error)))
+    }
+
+    fn query_owner_snapshot(&self) -> Result<MonitorSnapshot, PanelError> {
+        let (owner, anchor) = {
+            let state = lock_unpoisoned(&self.state);
+            (state.owner.clone(), state.anchor)
+        };
+        let owner = owner.ok_or_else(|| {
+            PanelError::Monitor(Box::new(PanelStateError("quick-panel owner is missing")))
+        })?;
+        let anchor = anchor.ok_or_else(|| {
+            PanelError::Monitor(Box::new(PanelStateError("quick-panel anchor is missing")))
+        })?;
+        self.monitor
+            .snapshot_for_owner(&owner, anchor)
+            .map_err(|error| PanelError::Monitor(Box::new(error)))
+    }
+
+    fn apply_snapshot(&self, snapshot: &MonitorSnapshot) -> Result<(), PanelError> {
         let bounds = place_panel(
             snapshot.pointer,
             snapshot.work_area,
@@ -180,6 +239,24 @@ where
             .set_bounds(bounds)
             .map_err(|error| PanelError::Window(Box::new(error)))
     }
+}
+
+#[derive(Debug)]
+struct PanelStateError(&'static str);
+
+impl fmt::Display for PanelStateError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.0)
+    }
+}
+
+impl Error for PanelStateError {}
+
+fn clear_visible_state(state: &mut PanelState) {
+    state.visible = false;
+    state.owner = None;
+    state.anchor = None;
+    state.environment = None;
 }
 
 pub struct FocusDomainGuard {
@@ -216,6 +293,14 @@ impl PanelMonitor for WindowsMonitor {
     fn snapshot(&self) -> Result<MonitorSnapshot, Self::Error> {
         crate::platform::windows::monitor::current_monitor_snapshot()
     }
+
+    fn snapshot_for_owner(
+        &self,
+        identity: &MonitorIdentity,
+        anchor: PhysicalPoint,
+    ) -> Result<MonitorSnapshot, Self::Error> {
+        crate::platform::windows::monitor::snapshot_for_identity(identity, anchor)
+    }
 }
 
 #[cfg(windows)]
@@ -231,7 +316,7 @@ impl TauriPanelWindow {
 
 #[cfg(windows)]
 impl PanelWindow for TauriPanelWindow {
-    type Error = tauri::Error;
+    type Error = TauriPanelWindowError;
 
     fn set_bounds(&self, bounds: PhysicalRect) -> Result<(), Self::Error> {
         self.0.set_size(tauri::PhysicalSize::new(
@@ -240,18 +325,61 @@ impl PanelWindow for TauriPanelWindow {
         ))?;
         self.0
             .set_position(tauri::PhysicalPosition::new(bounds.left, bounds.top))
+            .map_err(Into::into)
     }
 
     fn show(&self) -> Result<(), Self::Error> {
-        self.0.show()
+        self.0.show().map_err(Into::into)
     }
 
     fn focus(&self) -> Result<(), Self::Error> {
-        self.0.set_focus()
+        let hwnd = self.0.hwnd()?;
+        crate::platform::windows::activation::activate(hwnd).map_err(Into::into)
     }
 
     fn hide(&self) -> Result<(), Self::Error> {
-        self.0.hide()
+        self.0.hide().map_err(Into::into)
+    }
+}
+
+#[cfg(windows)]
+#[derive(Debug)]
+pub enum TauriPanelWindowError {
+    Tauri(tauri::Error),
+    Activation(crate::platform::windows::activation::ActivationError),
+}
+
+#[cfg(windows)]
+impl fmt::Display for TauriPanelWindowError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Tauri(_) => formatter.write_str("quick-panel window operation failed"),
+            Self::Activation(_) => formatter.write_str("quick-panel activation was rejected"),
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Error for TauriPanelWindowError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Tauri(error) => Some(error),
+            Self::Activation(error) => Some(error),
+        }
+    }
+}
+
+#[cfg(windows)]
+impl From<tauri::Error> for TauriPanelWindowError {
+    fn from(error: tauri::Error) -> Self {
+        Self::Tauri(error)
+    }
+}
+
+#[cfg(windows)]
+impl From<crate::platform::windows::activation::ActivationError> for TauriPanelWindowError {
+    fn from(error: crate::platform::windows::activation::ActivationError) -> Self {
+        Self::Activation(error)
     }
 }
 
@@ -335,18 +463,14 @@ impl PanelController {
         let thread = thread::Builder::new()
             .name("quick-panel-display-observer".to_owned())
             .spawn(move || {
-                let mut display = WindowsMonitor.snapshot().ok().map(DisplayEnvironment::from);
                 loop {
                     match stopped.recv_timeout(Duration::from_millis(500)) {
                         Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
                         Err(RecvTimeoutError::Timeout) => {
-                            let current = WindowsMonitor.snapshot().ok();
-                            let environment = current.map(DisplayEnvironment::from);
-                            if environment != display {
-                                display = environment;
-                                if !reposition_controller(&controller) {
-                                    break;
-                                }
+                            if controller_environment_changed(&controller)
+                                && !reposition_controller(&controller)
+                            {
+                                break;
                             }
                         }
                     }
@@ -383,6 +507,16 @@ fn reposition_controller(controller: &Weak<PanelController>) -> bool {
 }
 
 #[cfg(windows)]
+fn controller_environment_changed(controller: &Weak<PanelController>) -> bool {
+    controller.upgrade().is_some_and(|controller| {
+        controller
+            .service
+            .owner_environment_changed()
+            .unwrap_or(false)
+    })
+}
+
+#[cfg(windows)]
 impl Drop for PanelController {
     fn drop(&mut self) {
         let observer = self
@@ -402,17 +536,17 @@ struct PanelObserver {
     thread: JoinHandle<()>,
 }
 
-#[cfg(windows)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct DisplayEnvironment {
+    identity: MonitorIdentity,
     work_area: PhysicalRect,
     dpi: u32,
 }
 
-#[cfg(windows)]
-impl From<MonitorSnapshot> for DisplayEnvironment {
-    fn from(snapshot: MonitorSnapshot) -> Self {
+impl From<&MonitorSnapshot> for DisplayEnvironment {
+    fn from(snapshot: &MonitorSnapshot) -> Self {
         Self {
+            identity: snapshot.identity.clone(),
             work_area: snapshot.work_area,
             dpi: snapshot.dpi,
         }

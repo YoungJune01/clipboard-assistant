@@ -1,3 +1,4 @@
+pub mod activation;
 pub mod clipboard;
 mod message_loop;
 pub mod monitor;

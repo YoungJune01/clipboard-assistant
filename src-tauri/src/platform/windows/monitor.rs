@@ -9,7 +9,7 @@ use windows::{
         Foundation::{GetLastError, LPARAM, POINT},
         Graphics::Gdi::{
             EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITOR_DEFAULTTONEAREST,
-            MONITORINFO, MonitorFromPoint,
+            MONITORINFO, MONITORINFOEXW, MonitorFromPoint,
         },
         UI::{
             HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI},
@@ -59,15 +59,38 @@ pub struct DipSize {
     pub height: u32,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MonitorIdentity(String);
+
+impl MonitorIdentity {
+    pub fn from_static(identity: &'static str) -> Self {
+        Self(identity.to_owned())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    fn from_device_name(device_name: &[u16]) -> Self {
+        let length = device_name
+            .iter()
+            .position(|character| *character == 0)
+            .unwrap_or(device_name.len());
+        Self(String::from_utf16_lossy(&device_name[..length]))
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MonitorSnapshot {
+    pub identity: MonitorIdentity,
     pub pointer: PhysicalPoint,
     pub work_area: PhysicalRect,
     pub dpi: u32,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct MonitorDetails {
+    identity: MonitorIdentity,
     work_area: PhysicalRect,
     primary: bool,
 }
@@ -164,6 +187,13 @@ pub fn snapshot_for_point(pointer: PhysicalPoint) -> Result<MonitorSnapshot, Mon
     query_snapshot_for_pointer(&Win32MonitorApi, pointer)
 }
 
+pub fn snapshot_for_identity(
+    identity: &MonitorIdentity,
+    anchor: PhysicalPoint,
+) -> Result<MonitorSnapshot, MonitorError> {
+    query_snapshot_for_identity(&Win32MonitorApi, identity, anchor)
+}
+
 #[cfg(test)]
 pub(crate) fn fallback_monitor_snapshot_for_test() -> Result<MonitorSnapshot, MonitorError> {
     fallback_snapshot(&Win32MonitorApi, None)
@@ -184,14 +214,26 @@ fn query_snapshot_for_pointer<A: MonitorApi>(
         && let Some(details) = api.monitor_details(monitor)
         && valid_work_area(details.work_area)
     {
-        return Ok(snapshot_from_monitor(
-            api,
-            monitor,
-            details.work_area,
-            pointer,
-        ));
+        return Ok(snapshot_from_monitor(api, monitor, details, pointer));
     }
     fallback_snapshot(api, Some(pointer))
+}
+
+fn query_snapshot_for_identity<A: MonitorApi>(
+    api: &A,
+    identity: &MonitorIdentity,
+    anchor: PhysicalPoint,
+) -> Result<MonitorSnapshot, MonitorError> {
+    for monitor in api.enumerate_monitors() {
+        let Some(details) = api.monitor_details(monitor) else {
+            continue;
+        };
+        if details.identity == *identity && valid_work_area(details.work_area) {
+            let pointer = fallback_pointer(Some(anchor), details.work_area);
+            return Ok(snapshot_from_monitor(api, monitor, details, pointer));
+        }
+    }
+    fallback_snapshot(api, Some(anchor))
 }
 
 fn fallback_snapshot<A: MonitorApi>(
@@ -207,33 +249,36 @@ fn fallback_snapshot<A: MonitorApi>(
             continue;
         }
         if details.primary {
+            let fallback_pointer = fallback_pointer(pointer, details.work_area);
             return Ok(snapshot_from_monitor(
                 api,
                 monitor,
-                details.work_area,
-                fallback_pointer(pointer, details.work_area),
+                details,
+                fallback_pointer,
             ));
         }
-        fallback.get_or_insert((monitor, details.work_area));
+        fallback.get_or_insert((monitor, details));
     }
-    let (monitor, work_area) = fallback.ok_or(MonitorError::MonitorUnavailable)?;
+    let (monitor, details) = fallback.ok_or(MonitorError::MonitorUnavailable)?;
+    let fallback_pointer = fallback_pointer(pointer, details.work_area);
     Ok(snapshot_from_monitor(
         api,
         monitor,
-        work_area,
-        fallback_pointer(pointer, work_area),
+        details,
+        fallback_pointer,
     ))
 }
 
 fn snapshot_from_monitor<A: MonitorApi>(
     api: &A,
     monitor: A::Monitor,
-    work_area: PhysicalRect,
+    details: MonitorDetails,
     pointer: PhysicalPoint,
 ) -> MonitorSnapshot {
     MonitorSnapshot {
+        identity: details.identity,
         pointer,
-        work_area,
+        work_area: details.work_area,
         dpi: api.monitor_dpi(monitor).unwrap_or(DEFAULT_DPI),
     }
 }
@@ -285,21 +330,25 @@ impl MonitorApi for Win32MonitorApi {
     }
 
     fn monitor_details(&self, monitor: Self::Monitor) -> Option<MonitorDetails> {
-        let mut info = MONITORINFO {
-            cbSize: size_of::<MONITORINFO>() as u32,
+        let mut info = MONITORINFOEXW {
+            monitorInfo: MONITORINFO {
+                cbSize: size_of::<MONITORINFOEXW>() as u32,
+                ..Default::default()
+            },
             ..Default::default()
         };
-        if !unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
+        if !unsafe { GetMonitorInfoW(monitor, &mut info.monitorInfo) }.as_bool() {
             return None;
         }
         Some(MonitorDetails {
+            identity: MonitorIdentity::from_device_name(&info.szDevice),
             work_area: PhysicalRect {
-                left: info.rcWork.left,
-                top: info.rcWork.top,
-                right: info.rcWork.right,
-                bottom: info.rcWork.bottom,
+                left: info.monitorInfo.rcWork.left,
+                top: info.monitorInfo.rcWork.top,
+                right: info.monitorInfo.rcWork.right,
+                bottom: info.monitorInfo.rcWork.bottom,
             },
-            primary: info.dwFlags & MONITORINFOF_PRIMARY != 0,
+            primary: info.monitorInfo.dwFlags & MONITORINFOF_PRIMARY != 0,
         })
     }
 
@@ -361,6 +410,7 @@ mod tests {
             vec![(
                 11,
                 MonitorDetails {
+                    identity: MonitorIdentity::from_static("primary"),
                     work_area: PhysicalRect {
                         left: 0,
                         top: 0,
@@ -398,6 +448,7 @@ mod tests {
             vec![(
                 3,
                 MonitorDetails {
+                    identity: MonitorIdentity::from_static("fallback"),
                     work_area: PhysicalRect {
                         left: -1600,
                         top: -200,
@@ -419,6 +470,53 @@ mod tests {
         assert!(snapshot.pointer.y >= snapshot.work_area.top);
         assert!(snapshot.pointer.y < snapshot.work_area.bottom);
         assert_eq!(api.enumeration_count(), 1);
+    }
+
+    #[test]
+    fn identity_query_stays_on_owner_until_owner_is_removed() {
+        let owner = MonitorIdentity::from_static("A");
+        let api = FakeMonitorApi::new(
+            Some(PhysicalPoint { x: 2500, y: 100 }),
+            Some(2),
+            vec![
+                (
+                    1,
+                    MonitorDetails {
+                        identity: owner.clone(),
+                        work_area: PhysicalRect {
+                            left: 0,
+                            top: 40,
+                            right: 1920,
+                            bottom: 1000,
+                        },
+                        primary: true,
+                    },
+                ),
+                (
+                    2,
+                    MonitorDetails {
+                        identity: MonitorIdentity::from_static("B"),
+                        work_area: PhysicalRect {
+                            left: 1920,
+                            top: 0,
+                            right: 3840,
+                            bottom: 1040,
+                        },
+                        primary: false,
+                    },
+                ),
+            ],
+            vec![(1, Some(144))],
+        );
+
+        let snapshot =
+            query_snapshot_for_identity(&api, &owner, PhysicalPoint { x: 1800, y: 1000 })
+                .expect("owner monitor snapshot");
+
+        assert_eq!(snapshot.identity, owner);
+        assert_eq!(snapshot.pointer, PhysicalPoint { x: 1800, y: 999 });
+        assert_eq!(snapshot.dpi, 144);
+        assert_eq!(api.info_queries(), vec![1]);
     }
 
     struct FakeMonitorApi {
@@ -443,7 +541,7 @@ mod tests {
                 .map(|(monitor, dpi)| {
                     let details = dpi.and_then(|_| {
                         monitors.iter().find_map(|(candidate, details)| {
-                            (*candidate == *monitor).then_some(*details)
+                            (*candidate == *monitor).then_some(details.clone())
                         })
                     });
                     (*monitor, details)
