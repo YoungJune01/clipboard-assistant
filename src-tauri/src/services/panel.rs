@@ -30,6 +30,10 @@ pub trait PanelWindow: Send + Sync + 'static {
 pub enum PanelError {
     Monitor(Box<dyn Error + Send + Sync>),
     Window(Box<dyn Error + Send + Sync>),
+    FocusAndRollback {
+        focus: Box<dyn Error + Send + Sync>,
+        rollback_hide: Box<dyn Error + Send + Sync>,
+    },
 }
 
 impl fmt::Display for PanelError {
@@ -37,6 +41,9 @@ impl fmt::Display for PanelError {
         match self {
             Self::Monitor(_) => formatter.write_str("quick-panel monitor query failed"),
             Self::Window(_) => formatter.write_str("quick-panel window operation failed"),
+            Self::FocusAndRollback { .. } => {
+                formatter.write_str("quick-panel focus and rollback hide both failed")
+            }
         }
     }
 }
@@ -45,7 +52,22 @@ impl Error for PanelError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Monitor(error) | Self::Window(error) => Some(error.as_ref()),
+            Self::FocusAndRollback { focus, .. } => Some(focus.as_ref()),
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ObserverAction {
+    StartOrKeep,
+    Stop,
+}
+
+pub(crate) fn observer_action_for_visibility(visible: bool) -> ObserverAction {
+    if visible {
+        ObserverAction::StartOrKeep
+    } else {
+        ObserverAction::Stop
     }
 }
 
@@ -83,11 +105,19 @@ where
         self.window
             .show()
             .map_err(|error| PanelError::Window(Box::new(error)))?;
-        if let Err(error) = self.window.focus() {
-            let _ = self.window.hide();
-            return Err(PanelError::Window(Box::new(error)));
-        }
         lock_unpoisoned(&self.state).visible = true;
+        if let Err(error) = self.window.focus() {
+            return match self.window.hide() {
+                Ok(()) => {
+                    lock_unpoisoned(&self.state).visible = false;
+                    Err(PanelError::Window(Box::new(error)))
+                }
+                Err(rollback_hide) => Err(PanelError::FocusAndRollback {
+                    focus: Box::new(error),
+                    rollback_hide: Box::new(rollback_hide),
+                }),
+            };
+        }
         Ok(())
     }
 
@@ -248,14 +278,16 @@ impl PanelController {
     }
 
     pub fn show(self: &Arc<Self>) -> Result<(), PanelError> {
-        self.service.show()?;
-        self.start_observer();
-        Ok(())
+        let result = self.service.show();
+        self.update_observer();
+        result
     }
 
     pub fn hide(&self) -> Result<(), PanelError> {
         let result = self.service.hide();
-        self.stop_observer();
+        if !self.service.is_visible() {
+            self.stop_observer();
+        }
         result
     }
 
@@ -272,11 +304,11 @@ impl PanelController {
     }
 
     pub fn on_focus_changed(&self, focused: bool) -> Result<(), PanelError> {
-        self.service.on_focus_changed(focused)?;
+        let result = self.service.on_focus_changed(focused);
         if !self.service.is_visible() {
             self.stop_observer();
         }
-        Ok(())
+        result
     }
 
     pub fn enter_focus_domain(&self) -> FocusDomainGuard {
@@ -330,6 +362,13 @@ impl PanelController {
         let observer = lock_unpoisoned(&self.observer).take();
         if let Some(observer) = observer {
             observer.stop();
+        }
+    }
+
+    fn update_observer(self: &Arc<Self>) {
+        match observer_action_for_visibility(self.service.is_visible()) {
+            ObserverAction::StartOrKeep => self.start_observer(),
+            ObserverAction::Stop => self.stop_observer(),
         }
     }
 }

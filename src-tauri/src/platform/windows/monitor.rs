@@ -1,14 +1,22 @@
-use std::{error::Error, fmt};
+use std::{
+    error::Error,
+    fmt,
+    panic::{AssertUnwindSafe, catch_unwind},
+};
 
-use windows::Win32::{
-    Foundation::{GetLastError, POINT},
-    Graphics::Gdi::{
-        GetMonitorInfoW, HMONITOR, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint,
+use windows::{
+    Win32::{
+        Foundation::{GetLastError, LPARAM, POINT},
+        Graphics::Gdi::{
+            EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITOR_DEFAULTTONEAREST,
+            MONITORINFO, MonitorFromPoint,
+        },
+        UI::{
+            HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI},
+            WindowsAndMessaging::{GetCursorPos, MONITORINFOF_PRIMARY},
+        },
     },
-    UI::{
-        HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI},
-        WindowsAndMessaging::GetCursorPos,
-    },
+    core::BOOL,
 };
 
 pub const DEFAULT_DPI: u32 = 96;
@@ -56,6 +64,22 @@ pub struct MonitorSnapshot {
     pub pointer: PhysicalPoint,
     pub work_area: PhysicalRect,
     pub dpi: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MonitorDetails {
+    work_area: PhysicalRect,
+    primary: bool,
+}
+
+trait MonitorApi {
+    type Monitor: Copy;
+
+    fn cursor_position(&self) -> Option<PhysicalPoint>;
+    fn monitor_from_point(&self, pointer: PhysicalPoint) -> Option<Self::Monitor>;
+    fn monitor_details(&self, monitor: Self::Monitor) -> Option<MonitorDetails>;
+    fn monitor_dpi(&self, monitor: Self::Monitor) -> Option<u32>;
+    fn enumerate_monitors(&self) -> Vec<Self::Monitor>;
 }
 
 #[derive(Debug)]
@@ -133,71 +157,354 @@ pub fn place_panel(
 }
 
 pub fn current_monitor_snapshot() -> Result<MonitorSnapshot, MonitorError> {
-    let mut pointer = POINT::default();
-    unsafe { GetCursorPos(&mut pointer) }.map_err(MonitorError::Cursor)?;
-    snapshot_for_point(PhysicalPoint {
-        x: pointer.x,
-        y: pointer.y,
-    })
+    query_monitor_snapshot(&Win32MonitorApi)
 }
 
 pub fn snapshot_for_point(pointer: PhysicalPoint) -> Result<MonitorSnapshot, MonitorError> {
-    let monitor = unsafe {
-        MonitorFromPoint(
-            POINT {
-                x: pointer.x,
-                y: pointer.y,
-            },
-            MONITOR_DEFAULTTONEAREST,
-        )
-    };
-    if monitor.is_invalid() {
-        return Err(MonitorError::MonitorUnavailable);
-    }
-    monitor_snapshot(pointer, monitor)
+    query_snapshot_for_pointer(&Win32MonitorApi, pointer)
 }
 
-fn monitor_snapshot(
-    pointer: PhysicalPoint,
-    monitor: HMONITOR,
-) -> Result<MonitorSnapshot, MonitorError> {
-    let mut info = MONITORINFO {
-        cbSize: size_of::<MONITORINFO>() as u32,
-        ..Default::default()
-    };
-    if !unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
-        return Err(MonitorError::MonitorInfo(windows::core::Error::from_win32()));
-    }
-    let work_area = PhysicalRect {
-        left: info.rcWork.left,
-        top: info.rcWork.top,
-        right: info.rcWork.right,
-        bottom: info.rcWork.bottom,
-    };
-    if work_area.width() <= 0 || work_area.height() <= 0 {
-        return Err(MonitorError::InvalidWorkArea);
-    }
+#[cfg(test)]
+pub(crate) fn fallback_monitor_snapshot_for_test() -> Result<MonitorSnapshot, MonitorError> {
+    fallback_snapshot(&Win32MonitorApi, None)
+}
 
-    let mut dpi_x = DEFAULT_DPI;
-    let mut dpi_y = DEFAULT_DPI;
-    let dpi = if unsafe { GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y) }
-        .is_ok()
-        && dpi_x > 0
+fn query_monitor_snapshot<A: MonitorApi>(api: &A) -> Result<MonitorSnapshot, MonitorError> {
+    match api.cursor_position() {
+        Some(pointer) => query_snapshot_for_pointer(api, pointer),
+        None => fallback_snapshot(api, None),
+    }
+}
+
+fn query_snapshot_for_pointer<A: MonitorApi>(
+    api: &A,
+    pointer: PhysicalPoint,
+) -> Result<MonitorSnapshot, MonitorError> {
+    if let Some(monitor) = api.monitor_from_point(pointer)
+        && let Some(details) = api.monitor_details(monitor)
+        && valid_work_area(details.work_area)
     {
-        dpi_x
-    } else {
-        let _ = unsafe { GetLastError() };
-        DEFAULT_DPI
-    };
-    Ok(MonitorSnapshot {
+        return Ok(snapshot_from_monitor(
+            api,
+            monitor,
+            details.work_area,
+            pointer,
+        ));
+    }
+    fallback_snapshot(api, Some(pointer))
+}
+
+fn fallback_snapshot<A: MonitorApi>(
+    api: &A,
+    pointer: Option<PhysicalPoint>,
+) -> Result<MonitorSnapshot, MonitorError> {
+    let mut fallback = None;
+    for monitor in api.enumerate_monitors() {
+        let Some(details) = api.monitor_details(monitor) else {
+            continue;
+        };
+        if !valid_work_area(details.work_area) {
+            continue;
+        }
+        if details.primary {
+            return Ok(snapshot_from_monitor(
+                api,
+                monitor,
+                details.work_area,
+                fallback_pointer(pointer, details.work_area),
+            ));
+        }
+        fallback.get_or_insert((monitor, details.work_area));
+    }
+    let (monitor, work_area) = fallback.ok_or(MonitorError::MonitorUnavailable)?;
+    Ok(snapshot_from_monitor(
+        api,
+        monitor,
+        work_area,
+        fallback_pointer(pointer, work_area),
+    ))
+}
+
+fn snapshot_from_monitor<A: MonitorApi>(
+    api: &A,
+    monitor: A::Monitor,
+    work_area: PhysicalRect,
+    pointer: PhysicalPoint,
+) -> MonitorSnapshot {
+    MonitorSnapshot {
         pointer,
         work_area,
-        dpi,
-    })
+        dpi: api.monitor_dpi(monitor).unwrap_or(DEFAULT_DPI),
+    }
+}
+
+fn valid_work_area(work_area: PhysicalRect) -> bool {
+    work_area.width() > 0 && work_area.height() > 0
+}
+
+fn fallback_pointer(pointer: Option<PhysicalPoint>, work_area: PhysicalRect) -> PhysicalPoint {
+    let max_x = work_area.right.saturating_sub(1);
+    let max_y = work_area.bottom.saturating_sub(1);
+    match pointer {
+        Some(pointer) => PhysicalPoint {
+            x: pointer.x.clamp(work_area.left, max_x),
+            y: pointer.y.clamp(work_area.top, max_y),
+        },
+        None => PhysicalPoint {
+            x: (i64::from(work_area.left) + i64::from(work_area.width()) / 2) as i32,
+            y: (i64::from(work_area.top) + i64::from(work_area.height()) / 2) as i32,
+        },
+    }
+}
+
+struct Win32MonitorApi;
+
+impl MonitorApi for Win32MonitorApi {
+    type Monitor = HMONITOR;
+
+    fn cursor_position(&self) -> Option<PhysicalPoint> {
+        let mut pointer = POINT::default();
+        unsafe { GetCursorPos(&mut pointer) }.ok()?;
+        Some(PhysicalPoint {
+            x: pointer.x,
+            y: pointer.y,
+        })
+    }
+
+    fn monitor_from_point(&self, pointer: PhysicalPoint) -> Option<Self::Monitor> {
+        let monitor = unsafe {
+            MonitorFromPoint(
+                POINT {
+                    x: pointer.x,
+                    y: pointer.y,
+                },
+                MONITOR_DEFAULTTONEAREST,
+            )
+        };
+        (!monitor.is_invalid()).then_some(monitor)
+    }
+
+    fn monitor_details(&self, monitor: Self::Monitor) -> Option<MonitorDetails> {
+        let mut info = MONITORINFO {
+            cbSize: size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if !unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
+            return None;
+        }
+        Some(MonitorDetails {
+            work_area: PhysicalRect {
+                left: info.rcWork.left,
+                top: info.rcWork.top,
+                right: info.rcWork.right,
+                bottom: info.rcWork.bottom,
+            },
+            primary: info.dwFlags & MONITORINFOF_PRIMARY != 0,
+        })
+    }
+
+    fn monitor_dpi(&self, monitor: Self::Monitor) -> Option<u32> {
+        let mut dpi_x = DEFAULT_DPI;
+        let mut dpi_y = DEFAULT_DPI;
+        if unsafe { GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y) }.is_ok()
+            && dpi_x > 0
+        {
+            Some(dpi_x)
+        } else {
+            let _ = unsafe { GetLastError() };
+            None
+        }
+    }
+
+    fn enumerate_monitors(&self) -> Vec<Self::Monitor> {
+        let mut monitors = Vec::new();
+        let data = LPARAM((&mut monitors as *mut Vec<HMONITOR>) as isize);
+        let succeeded = unsafe { EnumDisplayMonitors(None, None, Some(collect_monitor), data) };
+        if succeeded.as_bool() {
+            monitors
+        } else {
+            Vec::new()
+        }
+    }
+}
+
+unsafe extern "system" fn collect_monitor(
+    monitor: HMONITOR,
+    _device_context: HDC,
+    _monitor_rect: *mut windows::Win32::Foundation::RECT,
+    data: LPARAM,
+) -> BOOL {
+    let collected = catch_unwind(AssertUnwindSafe(|| {
+        let monitors = unsafe { &mut *(data.0 as *mut Vec<HMONITOR>) };
+        monitors.push(monitor);
+    }));
+    BOOL::from(collected.is_ok())
 }
 
 fn dip_to_physical(dip: u32, dpi: u32) -> i32 {
     let physical =
         (u64::from(dip) * u64::from(dpi) + u64::from(DEFAULT_DPI / 2)) / u64::from(DEFAULT_DPI);
     physical.min(i32::MAX as u64) as i32
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{collections::VecDeque, sync::Mutex};
+
+    use super::*;
+
+    #[test]
+    fn stale_point_monitor_falls_back_to_fresh_primary_monitor() {
+        let api = FakeMonitorApi::new(
+            Some(PhysicalPoint { x: 2500, y: 400 }),
+            Some(7),
+            vec![(
+                11,
+                MonitorDetails {
+                    work_area: PhysicalRect {
+                        left: 0,
+                        top: 0,
+                        right: 1920,
+                        bottom: 1040,
+                    },
+                    primary: true,
+                },
+            )],
+            vec![(7, None), (11, Some(DEFAULT_DPI))],
+        );
+
+        let snapshot = query_monitor_snapshot(&api).expect("fallback monitor snapshot");
+
+        assert_eq!(snapshot.pointer, PhysicalPoint { x: 1919, y: 400 });
+        assert_eq!(
+            snapshot.work_area,
+            PhysicalRect {
+                left: 0,
+                top: 0,
+                right: 1920,
+                bottom: 1040
+            }
+        );
+        assert_eq!(snapshot.dpi, DEFAULT_DPI);
+        assert_eq!(api.info_queries(), vec![7, 11]);
+        assert_eq!(api.enumeration_count(), 1);
+    }
+
+    #[test]
+    fn cursor_failure_uses_center_of_an_enumerated_valid_monitor() {
+        let api = FakeMonitorApi::new(
+            None,
+            None,
+            vec![(
+                3,
+                MonitorDetails {
+                    work_area: PhysicalRect {
+                        left: -1600,
+                        top: -200,
+                        right: 0,
+                        bottom: 700,
+                    },
+                    primary: false,
+                },
+            )],
+            vec![(3, Some(144))],
+        );
+
+        let snapshot = query_monitor_snapshot(&api).expect("enumerated fallback snapshot");
+
+        assert_eq!(snapshot.pointer, PhysicalPoint { x: -800, y: 250 });
+        assert_eq!(snapshot.dpi, 144);
+        assert!(snapshot.pointer.x >= snapshot.work_area.left);
+        assert!(snapshot.pointer.x < snapshot.work_area.right);
+        assert!(snapshot.pointer.y >= snapshot.work_area.top);
+        assert!(snapshot.pointer.y < snapshot.work_area.bottom);
+        assert_eq!(api.enumeration_count(), 1);
+    }
+
+    struct FakeMonitorApi {
+        cursor: Option<PhysicalPoint>,
+        point_monitor: Option<usize>,
+        monitors: Vec<(usize, MonitorDetails)>,
+        detail_results: Mutex<VecDeque<(usize, Option<MonitorDetails>)>>,
+        dpi_by_monitor: Vec<(usize, u32)>,
+        info_queries: Mutex<Vec<usize>>,
+        enumeration_count: Mutex<usize>,
+    }
+
+    impl FakeMonitorApi {
+        fn new(
+            cursor: Option<PhysicalPoint>,
+            point_monitor: Option<usize>,
+            monitors: Vec<(usize, MonitorDetails)>,
+            results: Vec<(usize, Option<u32>)>,
+        ) -> Self {
+            let detail_results = results
+                .iter()
+                .map(|(monitor, dpi)| {
+                    let details = dpi.and_then(|_| {
+                        monitors.iter().find_map(|(candidate, details)| {
+                            (*candidate == *monitor).then_some(*details)
+                        })
+                    });
+                    (*monitor, details)
+                })
+                .collect();
+            let dpi_by_monitor = results
+                .into_iter()
+                .filter_map(|(monitor, dpi)| dpi.map(|dpi| (monitor, dpi)))
+                .collect();
+            Self {
+                cursor,
+                point_monitor,
+                monitors,
+                detail_results: Mutex::new(detail_results),
+                dpi_by_monitor,
+                info_queries: Mutex::new(Vec::new()),
+                enumeration_count: Mutex::new(0),
+            }
+        }
+
+        fn info_queries(&self) -> Vec<usize> {
+            self.info_queries.lock().unwrap().clone()
+        }
+
+        fn enumeration_count(&self) -> usize {
+            *self.enumeration_count.lock().unwrap()
+        }
+    }
+
+    impl MonitorApi for FakeMonitorApi {
+        type Monitor = usize;
+
+        fn cursor_position(&self) -> Option<PhysicalPoint> {
+            self.cursor
+        }
+
+        fn monitor_from_point(&self, _pointer: PhysicalPoint) -> Option<Self::Monitor> {
+            self.point_monitor
+        }
+
+        fn monitor_details(&self, monitor: Self::Monitor) -> Option<MonitorDetails> {
+            self.info_queries.lock().unwrap().push(monitor);
+            let (expected, details) = self
+                .detail_results
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("configured monitor info result");
+            assert_eq!(monitor, expected);
+            details
+        }
+
+        fn monitor_dpi(&self, monitor: Self::Monitor) -> Option<u32> {
+            self.dpi_by_monitor
+                .iter()
+                .find_map(|(candidate, dpi)| (*candidate == monitor).then_some(*dpi))
+        }
+
+        fn enumerate_monitors(&self) -> Vec<Self::Monitor> {
+            *self.enumeration_count.lock().unwrap() += 1;
+            self.monitors.iter().map(|(monitor, _)| *monitor).collect()
+        }
+    }
 }

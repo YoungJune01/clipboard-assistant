@@ -1,10 +1,16 @@
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::VecDeque,
+    sync::{Arc, Mutex},
+};
 
 use crate::{
     platform::windows::monitor::{
         DipSize, MonitorSnapshot, PhysicalPoint, PhysicalRect, place_panel,
     },
-    services::panel::{PanelError, PanelMonitor, PanelService, PanelWindow},
+    services::panel::{
+        ObserverAction, PanelError, PanelMonitor, PanelService, PanelWindow,
+        observer_action_for_visibility,
+    },
 };
 
 #[test]
@@ -237,6 +243,69 @@ fn failed_monitor_query_does_not_show_or_corrupt_state() {
 }
 
 #[test]
+fn focus_and_rollback_hide_failures_preserve_visible_state_and_both_errors() {
+    let monitor = FakeMonitor::new(vec![snapshot(point(100, 100), rect(0, 0, 1920, 1040), 96)]);
+    let window = ScriptedWindow::new(
+        vec![Ok(())],
+        vec![Err(FakeError("focus failed"))],
+        vec![Err(FakeError("rollback hide failed")), Ok(())],
+    );
+    let service = PanelService::new(monitor, window.clone(), dip(400, 300));
+
+    let error = service.show().expect_err("focus must fail");
+    match error {
+        PanelError::FocusAndRollback {
+            focus,
+            rollback_hide,
+        } => {
+            assert_eq!(focus.to_string(), "focus failed");
+            assert_eq!(rollback_hide.to_string(), "rollback hide failed");
+        }
+        other => panic!("expected combined focus/rollback error, got {other:?}"),
+    }
+    assert!(service.is_visible());
+    assert_eq!(
+        observer_action_for_visibility(service.is_visible()),
+        ObserverAction::StartOrKeep
+    );
+
+    service.toggle().expect("later hide succeeds");
+    assert!(!service.is_visible());
+    assert_eq!(
+        observer_action_for_visibility(service.is_visible()),
+        ObserverAction::Stop
+    );
+    assert_eq!(
+        window.calls(),
+        vec![
+            Call::Bounds(rect(101, 101, 501, 401)),
+            Call::Show,
+            Call::Focus,
+            Call::Hide,
+            Call::Hide,
+        ]
+    );
+}
+
+#[test]
+fn successful_focus_rollback_restores_hidden_state() {
+    let monitor = FakeMonitor::new(vec![snapshot(point(100, 100), rect(0, 0, 1920, 1040), 96)]);
+    let window = ScriptedWindow::new(
+        vec![Ok(())],
+        vec![Err(FakeError("focus failed"))],
+        vec![Ok(())],
+    );
+    let service = PanelService::new(monitor, window, dip(400, 300));
+
+    assert!(matches!(service.show(), Err(PanelError::Window(_))));
+    assert!(!service.is_visible());
+    assert_eq!(
+        observer_action_for_visibility(service.is_visible()),
+        ObserverAction::Stop
+    );
+}
+
+#[test]
 fn current_cursor_monitor_is_valid_without_showing_a_window() {
     let snapshot = crate::platform::windows::monitor::current_monitor_snapshot()
         .expect("query current cursor monitor");
@@ -250,6 +319,25 @@ fn current_cursor_monitor_is_valid_without_showing_a_window() {
         snapshot.dpi,
     );
     assert!(snapshot.work_area.contains_rect(placed));
+}
+
+#[test]
+fn enumerated_fallback_monitor_is_valid_without_showing_a_window() {
+    let snapshot = crate::platform::windows::monitor::fallback_monitor_snapshot_for_test()
+        .expect("enumerate fallback monitor");
+    assert!(snapshot.work_area.width() > 0);
+    assert!(snapshot.work_area.height() > 0);
+    assert!(snapshot.dpi >= 96);
+    assert!(snapshot.pointer.x >= snapshot.work_area.left);
+    assert!(snapshot.pointer.x < snapshot.work_area.right);
+    assert!(snapshot.pointer.y >= snapshot.work_area.top);
+    assert!(snapshot.pointer.y < snapshot.work_area.bottom);
+    assert!(snapshot.work_area.contains_rect(place_panel(
+        snapshot.pointer,
+        snapshot.work_area,
+        dip(400, 300),
+        snapshot.dpi,
+    )));
 }
 
 #[derive(Clone)]
@@ -336,6 +424,68 @@ impl PanelWindow for FakeWindow {
     fn hide(&self) -> Result<(), Self::Error> {
         self.0.lock().unwrap().push(Call::Hide);
         Ok(())
+    }
+}
+
+#[derive(Clone)]
+struct ScriptedWindow {
+    calls: Arc<Mutex<Vec<Call>>>,
+    show_results: Arc<Mutex<VecDeque<Result<(), FakeError>>>>,
+    focus_results: Arc<Mutex<VecDeque<Result<(), FakeError>>>>,
+    hide_results: Arc<Mutex<VecDeque<Result<(), FakeError>>>>,
+}
+
+impl ScriptedWindow {
+    fn new(
+        show_results: Vec<Result<(), FakeError>>,
+        focus_results: Vec<Result<(), FakeError>>,
+        hide_results: Vec<Result<(), FakeError>>,
+    ) -> Self {
+        Self {
+            calls: Arc::new(Mutex::new(Vec::new())),
+            show_results: Arc::new(Mutex::new(show_results.into())),
+            focus_results: Arc::new(Mutex::new(focus_results.into())),
+            hide_results: Arc::new(Mutex::new(hide_results.into())),
+        }
+    }
+
+    fn calls(&self) -> Vec<Call> {
+        self.calls.lock().unwrap().clone()
+    }
+
+    fn next(
+        results: &Mutex<VecDeque<Result<(), FakeError>>>,
+        operation: &'static str,
+    ) -> Result<(), FakeError> {
+        results
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or_else(|| panic!("missing scripted {operation} result"))
+    }
+}
+
+impl PanelWindow for ScriptedWindow {
+    type Error = FakeError;
+
+    fn set_bounds(&self, bounds: PhysicalRect) -> Result<(), Self::Error> {
+        self.calls.lock().unwrap().push(Call::Bounds(bounds));
+        Ok(())
+    }
+
+    fn show(&self) -> Result<(), Self::Error> {
+        self.calls.lock().unwrap().push(Call::Show);
+        Self::next(&self.show_results, "show")
+    }
+
+    fn focus(&self) -> Result<(), Self::Error> {
+        self.calls.lock().unwrap().push(Call::Focus);
+        Self::next(&self.focus_results, "focus")
+    }
+
+    fn hide(&self) -> Result<(), Self::Error> {
+        self.calls.lock().unwrap().push(Call::Hide);
+        Self::next(&self.hide_results, "hide")
     }
 }
 
