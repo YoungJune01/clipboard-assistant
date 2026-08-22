@@ -259,7 +259,7 @@ pub fn run() {
                 },
             )?;
             let paste = SafePasteService::new(
-                platform::windows::paste::Win32PasteTarget,
+                platform::windows::paste::Win32PasteTarget::new(),
                 listener.publisher(),
                 Arc::clone(&panel_controller),
                 platform::windows::paste::Win32PasteInput,
