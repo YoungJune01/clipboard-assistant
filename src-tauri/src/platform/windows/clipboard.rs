@@ -1573,6 +1573,8 @@ struct ClipboardIngestionQueue {
     pause_before_store_commit: bool,
     #[cfg(test)]
     processing_started: bool,
+    #[cfg(test)]
+    processed_generation: u64,
 }
 
 struct QueuedCapture {
@@ -1665,6 +1667,8 @@ fn clipboard_event_channel_with_limits(
             pause_before_store_commit: false,
             #[cfg(test)]
             processing_started: false,
+            #[cfg(test)]
+            processed_generation: 0,
         }),
         queue_changed: Condvar::new(),
         revision: AtomicU64::new(0),
@@ -1801,15 +1805,18 @@ fn run_clipboard_ingestion(shared: Arc<ClipboardIngestionShared>) {
             state.reserved_bytes = state.reserved_bytes.saturating_sub(queued.bytes);
             state.reserved_count = state.reserved_count.saturating_sub(1);
             state.processing = false;
-            #[cfg(test)]
-            {
-                state.processing_started = false;
-            }
         }
         if !matches!(status, CaptureStatus::RejectedTooLarge) {
             let revision = shared.revision.fetch_add(1, Ordering::AcqRel) + 1;
             *lock_unpoisoned(&shared.notification) = Some(revision);
             shared.notification_changed.notify_one();
+        }
+        #[cfg(test)]
+        {
+            let mut state = lock_unpoisoned(&shared.queue);
+            state.processing_started = false;
+            state.processed_generation = state.processed_generation.saturating_add(1);
+            shared.queue_changed.notify_all();
         }
     }
 }
@@ -1874,18 +1881,69 @@ impl LatestClipboardEventReceiver {
         lock_unpoisoned(&self.shared.queue).pause_before_store_commit = true;
     }
 
-    fn wait_until_processing(&self) {
+    fn wait_until_processing(&self, timeout: Duration) {
         let state = lock_unpoisoned(&self.shared.queue);
-        let _state = self
+        let (state, wait) = self
             .shared
             .queue_changed
-            .wait_while(state, |state| !state.processing_started)
+            .wait_timeout_while(state, timeout, |state| {
+                !state.stopped && !state.processing_started
+            })
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            state.processing_started,
+            "clipboard ingestion did not start processing before deadline (timed out: {})",
+            wait.timed_out()
+        );
     }
 
     fn resume_store_commit(&self) {
         lock_unpoisoned(&self.shared.queue).pause_before_store_commit = false;
         self.shared.queue_changed.notify_all();
+    }
+
+    fn processed_generation(&self) -> u64 {
+        lock_unpoisoned(&self.shared.queue).processed_generation
+    }
+
+    fn wait_for_processed_generation(&self, expected: u64, timeout: Duration) {
+        let state = lock_unpoisoned(&self.shared.queue);
+        let (state, wait) = self
+            .shared
+            .queue_changed
+            .wait_timeout_while(state, timeout, |state| {
+                !state.stopped && state.processed_generation < expected
+            })
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            state.processed_generation >= expected,
+            "clipboard ingestion did not reach processed generation {expected} before deadline; current generation is {} (timed out: {})",
+            state.processed_generation,
+            wait.timed_out()
+        );
+    }
+
+    fn wait_until_ingestion_idle(&self, timeout: Duration) {
+        let state = lock_unpoisoned(&self.shared.queue);
+        let (state, wait) = self
+            .shared
+            .queue_changed
+            .wait_timeout_while(state, timeout, |state| {
+                !state.stopped
+                    && (state.processing
+                        || state.processing_started
+                        || state.reserved_count != 0
+                        || !state.captures.is_empty())
+            })
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            !state.processing
+                && !state.processing_started
+                && state.reserved_count == 0
+                && state.captures.is_empty(),
+            "clipboard ingestion did not become idle before deadline (timed out: {})",
+            wait.timed_out()
+        );
     }
 }
 pub(super) type ProductWriteOwnership = Arc<Mutex<ProductWriteState>>;
@@ -1916,14 +1974,14 @@ mod tests {
 
     use super::{
         CF_UNICODETEXT_FORMAT, ClipboardEvent, ClipboardListenerError, ClipboardMemoryReader,
-        ClipboardReadError, ClipboardWriteError, EventSender, MAX_CAPTURE_PAYLOAD_BYTES,
-        MAX_IMAGE_PAYLOAD_BYTES, ProductWriteGuard, ProductWriteState, ReadyWait, ShutdownFailure,
-        begin_product_write_transaction, begin_product_write_transaction_with_spawner,
-        classify_format_read, classify_global_unlock, classify_registered_format,
-        clipboard_event_channel_with_limits, combine_clipboard_operation_and_close,
-        decode_unicode_text, finish_product_write, latest_clipboard_event_channel,
-        orchestrate_listener_initialization, read_bounded_representations, representation_bytes,
-        route_event, validate_representations,
+        ClipboardReadError, ClipboardWriteError, EventSender, LatestClipboardEventReceiver,
+        MAX_CAPTURE_PAYLOAD_BYTES, MAX_IMAGE_PAYLOAD_BYTES, ProductWriteGuard, ProductWriteState,
+        ReadyWait, ShutdownFailure, begin_product_write_transaction,
+        begin_product_write_transaction_with_spawner, classify_format_read, classify_global_unlock,
+        classify_registered_format, clipboard_event_channel_with_limits,
+        combine_clipboard_operation_and_close, decode_unicode_text, finish_product_write,
+        latest_clipboard_event_channel, orchestrate_listener_initialization,
+        read_bounded_representations, representation_bytes, route_event, validate_representations,
     };
     use crate::domain::{
         CapturedClipboard, ClipboardRepresentation, ContentIdentity, SourceIdentity,
@@ -2067,7 +2125,7 @@ mod tests {
         route_event(&state, &events, text_event(83, "90"));
 
         assert!(matches!(*state.lock().unwrap(), ProductWriteState::Idle));
-        wait_for_record_count(&records, 3);
+        wait_for_record_count(&receiver, &records, 3);
         assert_eq!(stored_texts(&records), ["90", "5678", "1234"]);
         assert!(receiver.try_recv().is_ok());
     }
@@ -2092,7 +2150,7 @@ mod tests {
             guard.finish(&[92]);
         }
 
-        wait_for_record_count(&records, 3);
+        wait_for_record_count(&receiver, &records, 3);
         assert!(receiver.try_recv().is_ok());
         assert!(receiver.try_recv().is_err());
         let stored = stored_texts(&records);
@@ -2114,7 +2172,7 @@ mod tests {
         assert!(started.elapsed() < Duration::from_millis(200));
         assert!(records.list().is_empty());
         receiver.resume_ingestion();
-        wait_for_record_count(&records, 3);
+        wait_for_record_count(&receiver, &records, 3);
 
         assert_eq!(
             stored_texts(&records),
@@ -2132,12 +2190,12 @@ mod tests {
             clipboard_event_channel_with_limits(Arc::clone(&records), bytes * 3, 3);
         events.send(text_event(1, "oldest-a")).unwrap();
         events.send(text_event(2, "middle-b")).unwrap();
-        wait_for_record_count(&records, 2);
+        wait_for_record_count(&receiver, &records, 2);
         receiver.pause_ingestion();
         events.send(text_event(3, "queued-c")).unwrap();
         events.send(text_event(4, "newest-d")).unwrap();
         receiver.resume_ingestion();
-        wait_for_record_count(&records, 3);
+        wait_for_record_count(&receiver, &records, 3);
 
         assert_eq!(stored_texts(&records), ["newest-d", "queued-c", "middle-b"]);
     }
@@ -2160,7 +2218,7 @@ mod tests {
         assert!(queue.reserved_count <= 2);
         drop(queue);
         receiver.resume_ingestion();
-        wait_for_record_count(&records, 2);
+        wait_for_record_count(&receiver, &records, 2);
         assert_eq!(stored_texts(&records), ["newest-c", "middle-b"]);
     }
 
@@ -2172,7 +2230,7 @@ mod tests {
             clipboard_event_channel_with_limits(Arc::clone(&records), bytes, 1);
         receiver.pause_before_store_commit();
         events.send(text_event(1, "processing")).unwrap();
-        receiver.wait_until_processing();
+        receiver.wait_until_processing(Duration::from_secs(1));
 
         let queue = receiver.shared.queue.lock().unwrap();
         assert!(queue.processing);
@@ -2180,7 +2238,7 @@ mod tests {
         assert_eq!(queue.reserved_bytes, bytes);
         drop(queue);
         receiver.resume_store_commit();
-        wait_for_record_count(&records, 1);
+        wait_for_record_count(&receiver, &records, 1);
     }
 
     #[test]
@@ -2189,13 +2247,13 @@ mod tests {
         let (events, receiver) = clipboard_event_channel_with_limits(Arc::clone(&records), 128, 4);
         events.send(text_event(1, "12345")).unwrap();
         events.send(text_event(2, "abcde")).unwrap();
-        wait_for_record_count(&records, 2);
+        wait_for_record_count(&receiver, &records, 2);
         let newest = records.list()[0].id;
 
         records.update_note(newest, "note".to_owned()).unwrap();
         assert_eq!(records.list().len(), 1);
         events.send(text_event(3, "xyz")).unwrap();
-        wait_for_record_count(&records, 2);
+        wait_for_record_count(&receiver, &records, 2);
 
         let listed = records.list();
         assert_eq!(listed[1].id, newest);
@@ -2234,9 +2292,15 @@ mod tests {
         duplicate.captured.representations =
             vec![ClipboardRepresentation::Png { bytes: vec![1; 40] }];
 
+        let processed = receiver.processed_generation();
         events.send(duplicate).unwrap();
-        std::thread::sleep(Duration::from_millis(20));
+        receiver.wait_for_processed_generation(processed + 1, Duration::from_secs(1));
 
+        let queue = receiver.shared.queue.lock().unwrap();
+        assert!(!queue.processing);
+        assert_eq!(queue.reserved_count, 0);
+        assert_eq!(queue.reserved_bytes, 0);
+        drop(queue);
         assert_eq!(records.list(), before);
         assert!(receiver.try_recv().is_err());
     }
@@ -2260,7 +2324,7 @@ mod tests {
         drop(queue);
 
         receiver.resume_ingestion();
-        wait_for_record_count(&records, 1);
+        wait_for_record_count(&receiver, &records, 1);
         assert_eq!(stored_texts(&records), ["kept"]);
     }
 
@@ -2274,7 +2338,7 @@ mod tests {
             clipboard_event_channel_with_limits(Arc::clone(&records), queue_bytes, 1);
         receiver.pause_before_store_commit();
         events.send(text_event(3, "queue")).unwrap();
-        receiver.wait_until_processing();
+        receiver.wait_until_processing(Duration::from_secs(1));
 
         let (store_bytes, _) = records.budget_snapshot();
         let queue = receiver.shared.queue.lock().unwrap();
@@ -2340,7 +2404,7 @@ mod tests {
         events.send(text_event(92, &"b".repeat(1024))).unwrap();
         events.send(text_event(93, &"c".repeat(1024))).unwrap();
 
-        wait_for_record_count(&records, 3);
+        wait_for_record_count(&receiver, &records, 3);
         assert_eq!(receiver.recv_timeout(Duration::from_millis(50)).unwrap(), 3);
         assert!(receiver.try_recv().is_err());
         assert_eq!(
@@ -2524,7 +2588,9 @@ mod tests {
         .unwrap();
         let old_transaction_id = old_guard.transaction_id;
         route_event(&state, &events, event(121));
-        std::thread::sleep(Duration::from_millis(50));
+        let replayed = receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(replayed.sequence_number, 121);
+        assert!(matches!(*state.lock().unwrap(), ProductWriteState::Idle));
 
         let new_guard = begin_product_write_transaction(
             Arc::clone(&state),
@@ -2558,11 +2624,12 @@ mod tests {
         new_guard.cancel();
         assert_eq!(
             receiver
-                .try_iter()
-                .map(|event| event.sequence_number)
-                .collect::<Vec<_>>(),
-            [121, 131]
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .sequence_number,
+            131
         );
+        assert!(receiver.try_recv().is_err());
     }
 
     fn product_write_guard(
@@ -2645,13 +2712,12 @@ mod tests {
             .collect()
     }
 
-    fn wait_for_record_count(records: &SessionRecordStore, expected: usize) {
-        for _ in 0..200 {
-            if records.list().len() == expected {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(2));
-        }
+    fn wait_for_record_count(
+        receiver: &LatestClipboardEventReceiver,
+        records: &SessionRecordStore,
+        expected: usize,
+    ) {
+        receiver.wait_until_ingestion_idle(Duration::from_secs(1));
         assert_eq!(records.list().len(), expected);
     }
 
