@@ -31,7 +31,8 @@ use windows::core::{PCWSTR, w};
 
 use crate::domain::{CapturedClipboard, ClipboardRepresentation, ContentIdentity, SourceIdentity};
 use crate::services::session_records::{
-    MAX_CAPTURE_RECORD_BYTES, SessionRecordStore, representation_bytes,
+    CaptureStatus, DEFAULT_TOTAL_BYTES, MAX_CAPTURE_RECORD_BYTES, MAX_SESSION_RECORDS,
+    SessionRecordStore, checked_representation_bytes, representation_bytes,
 };
 
 use super::message_loop::{ListenerState, run_message_loop, wake_and_join};
@@ -43,6 +44,8 @@ const MAX_IMAGE_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
 const MAX_CAPTURE_PAYLOAD_BYTES: usize = MAX_CAPTURE_RECORD_BYTES;
 const PRODUCT_WRITE_TRANSACTION_TIMEOUT: Duration = Duration::from_secs(2);
 const PRODUCT_WRITE_PENDING_BYTES: usize = 16 * 1024 * 1024;
+const MAX_PENDING_EVENTS: usize = 1024;
+const CLIPBOARD_EVENT_OVERHEAD_BYTES: usize = 64;
 const LISTENER_INITIALIZATION_TIMEOUT: Duration = Duration::from_secs(3);
 const LISTENER_INITIALIZATION_CLEANUP_GRACE: Duration = Duration::from_secs(1);
 static NEXT_PRODUCT_WRITE_TRANSACTION: AtomicU64 = AtomicU64::new(1);
@@ -809,18 +812,24 @@ fn route_event(
             pending,
             pending_bytes,
             pending_budget,
+            pending_events,
+            pending_event_limit,
             owned_sequences,
             ..
         } => {
-            let event_bytes = clipboard_event_bytes(&event);
             if owned_sequences.contains(&event.sequence_number) {
                 return;
             }
-            if pending_bytes
-                .checked_add(event_bytes)
+            let event_bytes = clipboard_event_bytes(&event);
+            if event_bytes
+                .and_then(|event_bytes| checked_pending_bytes(*pending_bytes, event_bytes))
                 .is_some_and(|bytes| bytes <= *pending_budget)
+                && pending_events
+                    .checked_add(1)
+                    .is_some_and(|count| count <= *pending_event_limit)
             {
-                *pending_bytes += event_bytes;
+                *pending_bytes += event_bytes.expect("checked event bytes above");
+                *pending_events += 1;
                 pending.push_back(event);
             } else {
                 let previous = std::mem::replace(&mut *state, ProductWriteState::Idle);
@@ -860,6 +869,8 @@ pub(super) enum ProductWriteState {
         pending: VecDeque<ClipboardEvent>,
         pending_bytes: usize,
         pending_budget: usize,
+        pending_events: usize,
+        pending_event_limit: usize,
         owned_sequences: Vec<u32>,
     },
     Expected {
@@ -873,12 +884,18 @@ impl ProductWriteState {
     }
 
     fn armed_with_budget(baseline: u32, pending_budget: usize) -> Self {
+        Self::armed_with_limits(baseline, pending_budget, MAX_PENDING_EVENTS)
+    }
+
+    fn armed_with_limits(baseline: u32, pending_budget: usize, pending_event_limit: usize) -> Self {
         Self::Armed {
             transaction_id: NEXT_PRODUCT_WRITE_TRANSACTION.fetch_add(1, Ordering::Relaxed),
             baseline,
             pending: VecDeque::new(),
             pending_bytes: 0,
             pending_budget,
+            pending_events: 0,
+            pending_event_limit,
             owned_sequences: Vec::new(),
         }
     }
@@ -1531,18 +1548,41 @@ pub struct EventSender(EventSenderKind);
 #[derive(Clone)]
 enum EventSenderKind {
     Queue(Sender<ClipboardEvent>),
-    Latest(Arc<LatestClipboardEventSlot>),
+    Latest(Arc<ClipboardIngestionShared>),
 }
 
-struct LatestClipboardEventSlot {
+struct ClipboardIngestionShared {
     records: Arc<SessionRecordStore>,
+    queue: Mutex<ClipboardIngestionQueue>,
+    queue_changed: Condvar,
     revision: AtomicU64,
     notification: Mutex<Option<u64>>,
-    changed: Condvar,
+    notification_changed: Condvar,
+    total_bytes_limit: usize,
+    record_count_limit: usize,
+}
+
+struct ClipboardIngestionQueue {
+    captures: VecDeque<QueuedCapture>,
+    queued_bytes: usize,
+    committed: VecDeque<usize>,
+    committed_bytes: usize,
+    inflight_bytes: usize,
+    inflight_count: usize,
+    evict_committed: usize,
+    stopped: bool,
+    paused: bool,
+}
+
+struct QueuedCapture {
+    capture: CapturedClipboard,
+    bytes: usize,
 }
 
 pub struct LatestClipboardEventReceiver {
-    slot: Arc<LatestClipboardEventSlot>,
+    shared: Arc<ClipboardIngestionShared>,
+    worker: Option<JoinHandle<()>>,
+    worker_done: std::sync::mpsc::Receiver<()>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1561,16 +1601,7 @@ impl EventSender {
             EventSenderKind::Queue(sender) => events
                 .into_iter()
                 .try_for_each(|event| sender.send(event).map_err(|_| ClipboardEventSendError)),
-            EventSenderKind::Latest(slot) => {
-                let captures = events.into_iter().map(|event| event.captured).collect();
-                if !slot.records.capture_batch(captures) {
-                    return Err(ClipboardEventSendError);
-                }
-                let revision = slot.revision.fetch_add(1, Ordering::AcqRel) + 1;
-                *lock_unpoisoned(&slot.notification) = Some(revision);
-                slot.changed.notify_one();
-                Ok(())
-            }
+            EventSenderKind::Latest(shared) => enqueue_captures(shared, events),
         }
     }
 }
@@ -1612,24 +1643,169 @@ impl From<Sender<ClipboardEvent>> for EventSender {
 pub fn latest_clipboard_event_channel(
     records: Arc<SessionRecordStore>,
 ) -> (EventSender, LatestClipboardEventReceiver) {
-    let slot = Arc::new(LatestClipboardEventSlot {
+    clipboard_event_channel_with_limits(records, DEFAULT_TOTAL_BYTES, MAX_SESSION_RECORDS)
+}
+
+fn clipboard_event_channel_with_limits(
+    records: Arc<SessionRecordStore>,
+    total_bytes_limit: usize,
+    record_count_limit: usize,
+) -> (EventSender, LatestClipboardEventReceiver) {
+    let shared = Arc::new(ClipboardIngestionShared {
         records,
+        queue: Mutex::new(ClipboardIngestionQueue {
+            captures: VecDeque::new(),
+            queued_bytes: 0,
+            committed: VecDeque::new(),
+            committed_bytes: 0,
+            inflight_bytes: 0,
+            inflight_count: 0,
+            evict_committed: 0,
+            stopped: false,
+            paused: false,
+        }),
+        queue_changed: Condvar::new(),
         revision: AtomicU64::new(0),
         notification: Mutex::new(None),
-        changed: Condvar::new(),
+        notification_changed: Condvar::new(),
+        total_bytes_limit,
+        record_count_limit,
     });
+    let (done_sender, worker_done) = sync_channel(1);
+    let worker_shared = Arc::clone(&shared);
+    let worker = thread::Builder::new()
+        .name("clipboard-ingestion".to_owned())
+        .spawn(move || {
+            run_clipboard_ingestion(worker_shared);
+            let _ = done_sender.send(());
+        })
+        .expect("clipboard ingestion worker must start");
     (
-        EventSender(EventSenderKind::Latest(Arc::clone(&slot))),
-        LatestClipboardEventReceiver { slot },
+        EventSender(EventSenderKind::Latest(Arc::clone(&shared))),
+        LatestClipboardEventReceiver {
+            shared,
+            worker: Some(worker),
+            worker_done,
+        },
     )
+}
+
+fn enqueue_captures(
+    shared: &ClipboardIngestionShared,
+    events: Vec<ClipboardEvent>,
+) -> Result<(), ClipboardEventSendError> {
+    let mut queued = Vec::with_capacity(events.len());
+    for event in events {
+        let bytes = checked_representation_bytes(&event.captured.representations)
+            .ok_or(ClipboardEventSendError)?;
+        if bytes > MAX_CAPTURE_RECORD_BYTES {
+            return Err(ClipboardEventSendError);
+        }
+        queued.push(QueuedCapture {
+            capture: event.captured,
+            bytes,
+        });
+    }
+    let mut state = lock_unpoisoned(&shared.queue);
+    if state.stopped {
+        return Err(ClipboardEventSendError);
+    }
+    for capture in queued {
+        while state
+            .committed_bytes
+            .checked_add(state.queued_bytes)
+            .and_then(|bytes| bytes.checked_add(state.inflight_bytes))
+            .and_then(|bytes| bytes.checked_add(capture.bytes))
+            .is_none_or(|bytes| bytes > shared.total_bytes_limit)
+            || state.committed.len() + state.captures.len() + state.inflight_count + 1
+                > shared.record_count_limit
+        {
+            if let Some(bytes) = state.committed.pop_front() {
+                state.committed_bytes = state.committed_bytes.saturating_sub(bytes);
+                state.evict_committed += 1;
+            } else if let Some(removed) = state.captures.pop_front() {
+                state.queued_bytes = state.queued_bytes.saturating_sub(removed.bytes);
+            } else {
+                break;
+            }
+        }
+        state.queued_bytes = state
+            .queued_bytes
+            .checked_add(capture.bytes)
+            .ok_or(ClipboardEventSendError)?;
+        state.captures.push_back(capture);
+    }
+    drop(state);
+    shared.queue_changed.notify_one();
+    Ok(())
+}
+
+fn run_clipboard_ingestion(shared: Arc<ClipboardIngestionShared>) {
+    loop {
+        let (evictions, queued) = {
+            let state = lock_unpoisoned(&shared.queue);
+            let mut state = shared
+                .queue_changed
+                .wait_while(state, |state| {
+                    !state.stopped
+                        && (state.paused
+                            || (state.evict_committed == 0 && state.captures.is_empty()))
+                })
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if state.stopped && state.evict_committed == 0 && state.captures.is_empty() {
+                return;
+            }
+            let evictions = std::mem::take(&mut state.evict_committed);
+            let queued = state.captures.pop_front();
+            if let Some(capture) = &queued {
+                state.queued_bytes = state.queued_bytes.saturating_sub(capture.bytes);
+                state.inflight_bytes = state.inflight_bytes.saturating_add(capture.bytes);
+                state.inflight_count += 1;
+            }
+            (evictions, queued)
+        };
+        for _ in 0..evictions {
+            let _ = shared.records.evict_oldest();
+        }
+        let Some(queued) = queued else {
+            continue;
+        };
+        let status = shared.records.capture_one(queued.capture);
+        {
+            let mut state = lock_unpoisoned(&shared.queue);
+            state.inflight_bytes = state.inflight_bytes.saturating_sub(queued.bytes);
+            state.inflight_count = state.inflight_count.saturating_sub(1);
+            match status {
+                CaptureStatus::Inserted { bytes } => {
+                    state.committed.push_back(bytes);
+                    state.committed_bytes = state.committed_bytes.saturating_add(bytes);
+                }
+                CaptureStatus::Refreshed { previous, bytes } => {
+                    if let Some(current) = state.committed.back_mut() {
+                        *current = bytes;
+                    }
+                    state.committed_bytes = state
+                        .committed_bytes
+                        .saturating_sub(previous)
+                        .saturating_add(bytes);
+                }
+                CaptureStatus::RejectedTooLarge => {}
+            }
+        }
+        if !matches!(status, CaptureStatus::RejectedTooLarge) {
+            let revision = shared.revision.fetch_add(1, Ordering::AcqRel) + 1;
+            *lock_unpoisoned(&shared.notification) = Some(revision);
+            shared.notification_changed.notify_one();
+        }
+    }
 }
 
 impl LatestClipboardEventReceiver {
     pub fn recv_timeout(&self, timeout: Duration) -> Result<u64, RecvTimeoutError> {
-        let notification = lock_unpoisoned(&self.slot.notification);
+        let notification = lock_unpoisoned(&self.shared.notification);
         let (mut notification, wait) = self
-            .slot
-            .changed
+            .shared
+            .notification_changed
             .wait_timeout_while(notification, timeout, |revision| revision.is_none())
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         notification.take().ok_or(if wait.timed_out() {
@@ -1640,27 +1816,55 @@ impl LatestClipboardEventReceiver {
     }
 
     pub fn try_recv(&self) -> Result<u64, std::sync::mpsc::TryRecvError> {
-        lock_unpoisoned(&self.slot.notification)
+        lock_unpoisoned(&self.shared.notification)
             .take()
             .ok_or(std::sync::mpsc::TryRecvError::Empty)
+    }
+}
+
+impl Drop for LatestClipboardEventReceiver {
+    fn drop(&mut self) {
+        {
+            let mut state = lock_unpoisoned(&self.shared.queue);
+            state.stopped = true;
+            state.paused = false;
+        }
+        self.shared.queue_changed.notify_all();
+        if self
+            .worker_done
+            .recv_timeout(Duration::from_secs(1))
+            .is_ok()
+            && let Some(worker) = self.worker.take()
+        {
+            let _ = worker.join();
+        }
+    }
+}
+
+#[cfg(test)]
+impl LatestClipboardEventReceiver {
+    fn pause_ingestion(&self) {
+        lock_unpoisoned(&self.shared.queue).paused = true;
+    }
+
+    fn resume_ingestion(&self) {
+        lock_unpoisoned(&self.shared.queue).paused = false;
+        self.shared.queue_changed.notify_all();
     }
 }
 pub(super) type ProductWriteOwnership = Arc<Mutex<ProductWriteState>>;
 pub(super) type ReadySender = std::sync::mpsc::SyncSender<Result<(), ClipboardListenerError>>;
 pub(super) type ShutdownReceiver = std::sync::mpsc::Receiver<()>;
 
-fn clipboard_event_bytes(event: &ClipboardEvent) -> usize {
-    event
-        .captured
-        .representations
-        .iter()
-        .map(|representation| match representation {
-            ClipboardRepresentation::UnicodeText { text } => text.len(),
-            ClipboardRepresentation::Png { bytes } | ClipboardRepresentation::DibV5 { bytes } => {
-                bytes.len()
-            }
-        })
-        .sum()
+fn clipboard_event_bytes(event: &ClipboardEvent) -> Option<usize> {
+    checked_representation_bytes(&event.captured.representations)?
+        .checked_add(CLIPBOARD_EVENT_OVERHEAD_BYTES)
+        .and_then(|bytes| bytes.checked_add(size_of::<ClipboardEvent>()))
+        .and_then(|bytes| bytes.checked_add(size_of::<usize>() * 2))
+}
+
+fn checked_pending_bytes(current: usize, event: usize) -> Option<usize> {
+    current.checked_add(event)
 }
 
 #[cfg(test)]
@@ -1680,9 +1884,10 @@ mod tests {
         MAX_IMAGE_PAYLOAD_BYTES, ProductWriteGuard, ProductWriteState, ReadyWait, ShutdownFailure,
         begin_product_write_transaction, begin_product_write_transaction_with_spawner,
         classify_format_read, classify_global_unlock, classify_registered_format,
-        combine_clipboard_operation_and_close, decode_unicode_text, finish_product_write,
-        latest_clipboard_event_channel, orchestrate_listener_initialization,
-        read_bounded_representations, representation_bytes, route_event, validate_representations,
+        clipboard_event_channel_with_limits, combine_clipboard_operation_and_close,
+        decode_unicode_text, finish_product_write, latest_clipboard_event_channel,
+        orchestrate_listener_initialization, read_bounded_representations, representation_bytes,
+        route_event, validate_representations,
     };
     use crate::domain::{
         CapturedClipboard, ClipboardRepresentation, ContentIdentity, SourceIdentity,
@@ -1815,23 +2020,31 @@ mod tests {
     fn pending_byte_budget_cancels_before_flushing_one_atomic_external_batch() {
         let records = Arc::new(SessionRecordStore::default());
         let (events, receiver) = latest_clipboard_event_channel(Arc::clone(&records));
-        let state = Arc::new(Mutex::new(ProductWriteState::armed_with_budget(80, 9)));
+        let one = super::clipboard_event_bytes(&text_event(81, "1234")).unwrap();
+        let state = Arc::new(Mutex::new(ProductWriteState::armed_with_budget(
+            80,
+            one * 2,
+        )));
 
         route_event(&state, &events, text_event(81, "1234"));
         route_event(&state, &events, text_event(82, "5678"));
         route_event(&state, &events, text_event(83, "90"));
 
         assert!(matches!(*state.lock().unwrap(), ProductWriteState::Idle));
-        receiver.recv_timeout(Duration::from_millis(50)).unwrap();
+        wait_for_record_count(&records, 3);
         assert_eq!(stored_texts(&records), ["90", "5678", "1234"]);
-        assert!(receiver.try_recv().is_err());
+        assert!(receiver.try_recv().is_ok());
     }
 
     #[test]
     fn production_mailbox_keeps_external_order_and_suppresses_owned_sequences_on_overflow() {
         let records = Arc::new(SessionRecordStore::default());
         let (events, receiver) = latest_clipboard_event_channel(Arc::clone(&records));
-        let state = Arc::new(Mutex::new(ProductWriteState::armed_with_budget(90, 8)));
+        let one = super::clipboard_event_bytes(&text_event(91, "one")).unwrap();
+        let state = Arc::new(Mutex::new(ProductWriteState::armed_with_budget(
+            90,
+            one * 3,
+        )));
         route_event(&state, &events, text_event(91, "one"));
         {
             let mut guard = product_write_guard(Arc::clone(&state), events.clone());
@@ -1843,6 +2056,7 @@ mod tests {
             guard.finish(&[92]);
         }
 
+        wait_for_record_count(&records, 3);
         assert!(receiver.try_recv().is_ok());
         assert!(receiver.try_recv().is_err());
         let stored = stored_texts(&records);
@@ -1854,11 +2068,17 @@ mod tests {
     fn paused_notification_drain_does_not_lose_external_history() {
         let records = Arc::new(SessionRecordStore::default());
         let (events, receiver) = latest_clipboard_event_channel(Arc::clone(&records));
+        receiver.pause_ingestion();
+        let started = std::time::Instant::now();
         events
             .send_batch(vec![text_event(101, "transaction")])
             .unwrap();
         events.send(text_event(102, "old latest")).unwrap();
         events.send(text_event(103, "new latest")).unwrap();
+        assert!(started.elapsed() < Duration::from_millis(200));
+        assert!(records.list().is_empty());
+        receiver.resume_ingestion();
+        wait_for_record_count(&records, 3);
 
         assert_eq!(
             stored_texts(&records),
@@ -1866,6 +2086,68 @@ mod tests {
         );
         assert_eq!(receiver.try_recv().unwrap(), 3);
         assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn ingestion_budget_evicts_the_globally_oldest_history() {
+        let records = Arc::new(SessionRecordStore::default());
+        let bytes = representation_bytes(&text_event(1, "12345678").captured.representations);
+        let (events, receiver) =
+            clipboard_event_channel_with_limits(Arc::clone(&records), bytes * 3, 3);
+        events.send(text_event(1, "oldest-a")).unwrap();
+        events.send(text_event(2, "middle-b")).unwrap();
+        wait_for_record_count(&records, 2);
+        receiver.pause_ingestion();
+        events.send(text_event(3, "queued-c")).unwrap();
+        events.send(text_event(4, "newest-d")).unwrap();
+        receiver.resume_ingestion();
+        wait_for_record_count(&records, 3);
+
+        assert_eq!(stored_texts(&records), ["newest-d", "queued-c", "middle-b"]);
+    }
+
+    #[test]
+    fn ingestion_worker_shutdown_joins_and_releases_shared_state() {
+        let records = Arc::new(SessionRecordStore::default());
+        let (events, receiver) = latest_clipboard_event_channel(records);
+        let shared = Arc::downgrade(&receiver.shared);
+        events.send(text_event(1, "queued")).unwrap();
+
+        drop(events);
+        let started = std::time::Instant::now();
+        drop(receiver);
+
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(shared.upgrade().is_none());
+    }
+
+    #[test]
+    fn empty_pending_events_hit_the_count_limit_and_replay_in_order() {
+        let (events, receiver) = mpsc::channel();
+        let state = Arc::new(Mutex::new(ProductWriteState::armed_with_limits(
+            200,
+            usize::MAX,
+            2,
+        )));
+
+        route_event(&state, &events, text_event(201, ""));
+        route_event(&state, &events, text_event(202, ""));
+        route_event(&state, &events, text_event(203, ""));
+
+        assert!(matches!(*state.lock().unwrap(), ProductWriteState::Idle));
+        assert_eq!(
+            receiver
+                .try_iter()
+                .map(|event| event.sequence_number)
+                .collect::<Vec<_>>(),
+            [201, 202, 203]
+        );
+    }
+
+    #[test]
+    fn pending_byte_accounting_rejects_checked_overflow() {
+        assert_eq!(super::checked_pending_bytes(usize::MAX, 1), None);
+        assert_eq!(super::checked_pending_bytes(7, 11), Some(18));
     }
 
     #[test]
@@ -1877,6 +2159,7 @@ mod tests {
         events.send(text_event(92, &"b".repeat(1024))).unwrap();
         events.send(text_event(93, &"c".repeat(1024))).unwrap();
 
+        wait_for_record_count(&records, 3);
         assert_eq!(receiver.recv_timeout(Duration::from_millis(50)).unwrap(), 3);
         assert!(receiver.try_recv().is_err());
         assert_eq!(
@@ -2179,6 +2462,16 @@ mod tests {
             .into_iter()
             .filter_map(|record| record.text)
             .collect()
+    }
+
+    fn wait_for_record_count(records: &SessionRecordStore, expected: usize) {
+        for _ in 0..200 {
+            if records.list().len() == expected {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(records.list().len(), expected);
     }
 
     #[test]

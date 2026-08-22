@@ -1,4 +1,7 @@
-use std::{collections::VecDeque, sync::Mutex};
+use std::{
+    collections::VecDeque,
+    sync::{Arc, Mutex},
+};
 
 use serde::Serialize;
 
@@ -7,8 +10,8 @@ use crate::domain::{
     RecordNoteError,
 };
 
-const MAX_SESSION_RECORDS: usize = 500;
-const DEFAULT_TOTAL_BYTES: usize = 64 * 1024 * 1024;
+pub(crate) const MAX_SESSION_RECORDS: usize = 500;
+pub(crate) const DEFAULT_TOTAL_BYTES: usize = 64 * 1024 * 1024;
 pub(crate) const MAX_CAPTURE_RECORD_BYTES: usize = 16 * 1024 * 1024;
 pub(crate) const REPRESENTATION_OVERHEAD_BYTES: usize = 32;
 const DEFAULT_RECORD_BYTES: usize = MAX_CAPTURE_RECORD_BYTES;
@@ -38,8 +41,15 @@ struct SessionRecordLimits {
 }
 
 struct SessionRecordState {
-    records: VecDeque<ClipboardRecord>,
+    records: VecDeque<Arc<ClipboardRecord>>,
     total_bytes: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CaptureStatus {
+    Inserted { bytes: usize },
+    Refreshed { previous: usize, bytes: usize },
+    RejectedTooLarge,
 }
 
 impl Default for SessionRecordStore {
@@ -64,56 +74,79 @@ impl SessionRecordStore {
     }
 
     pub fn capture(&self, capture: CapturedClipboard) -> bool {
-        self.capture_batch(vec![capture])
+        !matches!(self.capture_one(capture), CaptureStatus::RejectedTooLarge)
     }
 
-    pub(crate) fn capture_batch(&self, mut captures: Vec<CapturedClipboard>) -> bool {
-        for capture in &mut captures {
-            retain_preferred_image(&mut capture.representations);
-        }
-        if captures.iter().any(|capture| {
-            representation_bytes(&capture.representations) > self.limits.record_bytes
-        }) {
-            return false;
+    pub(crate) fn capture_one(&self, mut capture: CapturedClipboard) -> CaptureStatus {
+        retain_preferred_image(&mut capture.representations);
+        let Some(capture_bytes) = checked_representation_bytes(&capture.representations) else {
+            return CaptureStatus::RejectedTooLarge;
+        };
+        if capture_bytes > self.limits.record_bytes {
+            return CaptureStatus::RejectedTooLarge;
         }
         let mut state = lock_unpoisoned(&self.state);
-        for capture in captures {
-            if let Some(current) = state.records.front()
-                && current.content_identity == capture.content_identity
-            {
-                let previous_bytes = record_bytes(current);
-                let mut refreshed = current.clone();
-                let _ = refreshed.refresh_from(capture);
-                retain_preferred_image(&mut refreshed.representations);
-                let refreshed_bytes = record_bytes(&refreshed);
-                debug_assert!(refreshed_bytes <= self.limits.record_bytes);
-                state.total_bytes = state.total_bytes - previous_bytes + refreshed_bytes;
-                state.records[0] = refreshed;
-                evict_to_limits(&mut state, self.limits);
-                continue;
+        if let Some(current) = state.records.front()
+            && current.content_identity == capture.content_identity
+        {
+            let previous_bytes = record_bytes(current);
+            let mut refreshed = current.as_ref().clone();
+            let _ = refreshed.refresh_from(capture);
+            retain_preferred_image(&mut refreshed.representations);
+            let Some(refreshed_bytes) = checked_record_bytes(&refreshed) else {
+                return CaptureStatus::RejectedTooLarge;
+            };
+            if refreshed_bytes > self.limits.record_bytes {
+                return CaptureStatus::RejectedTooLarge;
             }
-            let record = ClipboardRecord::from_capture(capture);
-            state.total_bytes += record_bytes(&record);
-            state.records.push_front(record);
+            state.total_bytes = state
+                .total_bytes
+                .saturating_sub(previous_bytes)
+                .saturating_add(refreshed_bytes);
+            state.records[0] = Arc::new(refreshed);
             evict_to_limits(&mut state, self.limits);
+            return CaptureStatus::Refreshed {
+                previous: previous_bytes,
+                bytes: refreshed_bytes,
+            };
         }
+        let record = ClipboardRecord::from_capture(capture);
+        state.total_bytes = state.total_bytes.saturating_add(capture_bytes);
+        state.records.push_front(Arc::new(record));
+        evict_to_limits(&mut state, self.limits);
+        CaptureStatus::Inserted {
+            bytes: capture_bytes,
+        }
+    }
+
+    pub(crate) fn evict_oldest(&self) -> bool {
+        let mut state = lock_unpoisoned(&self.state);
+        let Some(removed) = state.records.pop_back() else {
+            return false;
+        };
+        state.total_bytes = state.total_bytes.saturating_sub(record_bytes(&removed));
         true
     }
 
     pub fn list(&self) -> Vec<SessionRecordView> {
-        lock_unpoisoned(&self.state)
+        let records: Vec<_> = lock_unpoisoned(&self.state)
             .records
+            .iter()
+            .cloned()
+            .collect();
+        records
             .iter()
             .map(|record| SessionRecordView::from_record(record, self.limits.preview_bytes))
             .collect()
     }
 
     pub fn representations(&self, id: RecordId) -> Option<Vec<ClipboardRepresentation>> {
-        lock_unpoisoned(&self.state)
+        let record = lock_unpoisoned(&self.state)
             .records
             .iter()
             .find(|record| record.id == id)
-            .map(|record| record.representations.clone())
+            .cloned();
+        record.map(|record| record.representations.clone())
     }
 
     pub fn update_note(
@@ -138,11 +171,12 @@ impl SessionRecordStore {
         if updated_bytes > self.limits.record_bytes {
             return Err(SessionRecordError::RecordTooLarge);
         }
-        let record = state
-            .records
-            .iter_mut()
-            .find(|record| record.id == id)
-            .ok_or(SessionRecordError::NotFound)?;
+        let record = Arc::make_mut(
+            state
+                .records
+                .get_mut(index)
+                .ok_or(SessionRecordError::NotFound)?,
+        );
         record.note = note;
         state.total_bytes = state.total_bytes - previous_bytes + updated_bytes;
         evict_to_limits(&mut state, self.limits);
@@ -183,21 +217,32 @@ impl SessionRecordView {
     }
 }
 
-pub(crate) fn representation_bytes(representations: &[ClipboardRepresentation]) -> usize {
+pub(crate) fn checked_representation_bytes(
+    representations: &[ClipboardRepresentation],
+) -> Option<usize> {
     representations
         .iter()
-        .map(|representation| match representation {
-            ClipboardRepresentation::UnicodeText { text } => text.len(),
-            ClipboardRepresentation::Png { bytes } | ClipboardRepresentation::DibV5 { bytes } => {
-                bytes.len()
-            }
-        } + REPRESENTATION_OVERHEAD_BYTES)
-        .sum()
+        .try_fold(0_usize, |total, representation| {
+            let payload = match representation {
+                ClipboardRepresentation::UnicodeText { text } => text.len(),
+                ClipboardRepresentation::Png { bytes }
+                | ClipboardRepresentation::DibV5 { bytes } => bytes.len(),
+            };
+            total.checked_add(payload.checked_add(REPRESENTATION_OVERHEAD_BYTES)?)
+        })
+}
+
+pub(crate) fn representation_bytes(representations: &[ClipboardRepresentation]) -> usize {
+    checked_representation_bytes(representations).unwrap_or(usize::MAX)
 }
 
 fn record_bytes(record: &ClipboardRecord) -> usize {
-    representation_bytes(&record.representations)
-        + record.note.as_ref().map_or(0, |note| note.as_str().len())
+    checked_record_bytes(record).unwrap_or(usize::MAX)
+}
+
+fn checked_record_bytes(record: &ClipboardRecord) -> Option<usize> {
+    checked_representation_bytes(&record.representations)?
+        .checked_add(record.note.as_ref().map_or(0, |note| note.as_str().len()))
 }
 
 fn retain_preferred_image(representations: &mut Vec<ClipboardRepresentation>) {
@@ -412,6 +457,47 @@ mod tests {
                 ClipboardRepresentation::Png { .. }
             ))
         );
+    }
+
+    #[test]
+    fn duplicate_merge_over_record_budget_keeps_existing_record_unchanged() {
+        let store = SessionRecordStore::with_limits(SessionRecordLimits {
+            total_bytes: 256,
+            record_bytes: 80,
+            preview_bytes: 16,
+        });
+        assert_eq!(
+            store.capture_one(capture("same", &"a".repeat(40))),
+            CaptureStatus::Inserted { bytes: 72 }
+        );
+        let before = store.list();
+        let duplicate = CapturedClipboard {
+            content_identity: ContentIdentity::new("same"),
+            captured_at: Utc::now(),
+            source: SourceIdentity::default(),
+            representations: vec![ClipboardRepresentation::Png { bytes: vec![7; 40] }],
+        };
+
+        assert_eq!(
+            store.capture_one(duplicate),
+            CaptureStatus::RejectedTooLarge
+        );
+        assert_eq!(store.list(), before);
+        assert_eq!(
+            store.representations(before[0].id),
+            Some(vec![ClipboardRepresentation::UnicodeText {
+                text: "a".repeat(40)
+            }])
+        );
+    }
+
+    #[test]
+    fn checked_representation_budget_reports_arithmetic_overflow() {
+        let payload = ClipboardRepresentation::UnicodeText {
+            text: String::new(),
+        };
+        assert_eq!(checked_representation_bytes(&[payload]), Some(32));
+        assert_eq!(usize::MAX.checked_add(REPRESENTATION_OVERHEAD_BYTES), None);
     }
 
     #[test]
