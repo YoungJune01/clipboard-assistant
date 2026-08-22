@@ -442,7 +442,7 @@ impl Win32LifecycleObserver {
                 );
             }),
         )?;
-        let thread = match LifecycleThread::reap(spawner, worker) {
+        let thread = match LifecycleThread::reap(spawner, worker, Arc::clone(&state)) {
             Ok(thread) => thread,
             Err(error) => {
                 state.stop.store(true, Ordering::Release);
@@ -524,7 +524,6 @@ impl Win32LifecycleObserver {
         if let Some(thread) = self.thread.take() {
             let _ = thread.wait(remaining_until(deadline));
         }
-        cleanup_lifecycle_tracking_until(&self.state, deadline);
     }
 }
 
@@ -596,12 +595,14 @@ impl LifecycleThread {
     fn reap(
         spawner: &impl LifecycleThreadSpawner,
         worker: JoinHandle<()>,
+        state: Arc<LifecycleState>,
     ) -> Result<Self, WindowsPasteError> {
         let (joined_tx, joined_rx) = mpsc::sync_channel(1);
         let reaper = spawner.spawn(
             "paste-lifecycle-reaper",
             Box::new(move || {
                 let _ = worker.join();
+                cleanup_lifecycle_tracking(&state);
                 let _ = joined_tx.send(());
             }),
         )?;
@@ -633,23 +634,12 @@ fn request_lifecycle_stop(state: &LifecycleState, observer_thread_id: Option<u32
     }
 }
 
-fn cleanup_lifecycle_tracking_until(state: &Arc<LifecycleState>, deadline: Instant) {
-    let mut registry_cleaned = false;
-    let mut tokens_cleaned = false;
-    loop {
-        if !registry_cleaned && let Some(mut registry) = try_lock_unpoisoned(lifecycle_registry()) {
-            registry.retain(|_, entry| !Arc::ptr_eq(&entry.state, state));
-            registry_cleaned = true;
-        }
-        if !tokens_cleaned && let Some(mut tokens) = try_lock_unpoisoned(&state.tokens) {
-            tokens.clear();
-            tokens_cleaned = true;
-        }
-        if registry_cleaned && tokens_cleaned || Instant::now() >= deadline {
-            return;
-        }
-        thread::sleep(Duration::from_millis(1));
+fn cleanup_lifecycle_tracking(state: &Arc<LifecycleState>) {
+    {
+        let mut registry = lock_unpoisoned(lifecycle_registry());
+        registry.retain(|_, entry| !Arc::ptr_eq(&entry.state, state));
     }
+    lock_unpoisoned(&state.tokens).clear();
 }
 
 fn remaining_until(deadline: Instant) -> Duration {
@@ -1547,14 +1537,85 @@ mod tests {
         assert!(started_at.elapsed() < Duration::from_millis(500));
         assert!(!state.usable.load(Ordering::Acquire));
         assert!(!state.alive.load(Ordering::Acquire));
-        assert!(lock_unpoisoned(&state.tokens).is_empty());
-        assert!(!lock_unpoisoned(lifecycle_registry()).contains_key(&token));
         assert_eq!(
             *lock_unpoisoned(&spawner.spawned),
             ["paste-lifecycle-observer", "paste-lifecycle-reaper"]
         );
 
         let _ = release_tx.send(());
+        wait_for_lifecycle_cleanup(&state, token);
+    }
+
+    #[test]
+    fn late_worker_exit_cleans_tracking_after_shutdown_lock_contention() {
+        let (release_backend_tx, release_backend_rx) = mpsc::channel();
+        let spawner = RecordingLifecycleThreadSpawner::default();
+        let observer = Win32LifecycleObserver::start_with(
+            &spawner,
+            LifecycleDeadlines::for_tests(),
+            move |state, ready, _barrier_requests, _barrier_acks| {
+                state.alive.store(true, Ordering::Release);
+                let _ = ready.send(Ok(unsafe { GetCurrentThreadId() }));
+                let _ = release_backend_rx.recv();
+            },
+        )
+        .unwrap();
+        let state = Arc::clone(&observer.state);
+        let token = register_test_lifecycle(&observer, 7, 8);
+
+        let (registry_locked_tx, registry_locked_rx) = mpsc::sync_channel(1);
+        let (release_registry_tx, release_registry_rx) = mpsc::channel();
+        let registry_holder = thread::spawn(move || {
+            let _registry = lock_unpoisoned(lifecycle_registry());
+            registry_locked_tx.send(()).unwrap();
+            release_registry_rx.recv().unwrap();
+        });
+        registry_locked_rx
+            .recv_timeout(Duration::from_millis(500))
+            .unwrap();
+
+        let token_state = Arc::clone(&state);
+        let (tokens_locked_tx, tokens_locked_rx) = mpsc::sync_channel(1);
+        let (release_tokens_tx, release_tokens_rx) = mpsc::channel();
+        let tokens_holder = thread::spawn(move || {
+            let _tokens = lock_unpoisoned(&token_state.tokens);
+            tokens_locked_tx.send(()).unwrap();
+            release_tokens_rx.recv().unwrap();
+        });
+        tokens_locked_rx
+            .recv_timeout(Duration::from_millis(500))
+            .unwrap();
+
+        let started_at = Instant::now();
+        drop(observer);
+
+        assert!(started_at.elapsed() < Duration::from_millis(500));
+        assert!(!state.usable.load(Ordering::Acquire));
+        assert!(!state.alive.load(Ordering::Acquire));
+
+        release_registry_tx.send(()).unwrap();
+        release_tokens_tx.send(()).unwrap();
+        registry_holder.join().unwrap();
+        tokens_holder.join().unwrap();
+        release_backend_tx.send(()).unwrap();
+
+        wait_for_lifecycle_cleanup(&state, token);
+    }
+
+    fn wait_for_lifecycle_cleanup(state: &LifecycleState, token: usize) {
+        let cleanup_deadline = Instant::now() + Duration::from_millis(500);
+        loop {
+            let registry_clean = !lock_unpoisoned(lifecycle_registry()).contains_key(&token);
+            let tokens_clean = lock_unpoisoned(&state.tokens).is_empty();
+            if registry_clean && tokens_clean {
+                return;
+            }
+            assert!(
+                Instant::now() < cleanup_deadline,
+                "late observer exit left lifecycle tracking behind"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
     }
 
     #[test]
