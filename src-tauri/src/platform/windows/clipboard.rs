@@ -31,7 +31,7 @@ use windows::core::{PCWSTR, w};
 
 use crate::domain::{CapturedClipboard, ClipboardRepresentation, ContentIdentity, SourceIdentity};
 use crate::services::session_records::{
-    CaptureStatus, DEFAULT_TOTAL_BYTES, MAX_CAPTURE_RECORD_BYTES, MAX_SESSION_RECORDS,
+    CaptureStatus, INGESTION_QUEUE_BYTES, INGESTION_QUEUE_EVENTS, MAX_CAPTURE_RECORD_BYTES,
     SessionRecordStore, checked_representation_bytes, representation_bytes,
 };
 
@@ -1564,14 +1564,15 @@ struct ClipboardIngestionShared {
 
 struct ClipboardIngestionQueue {
     captures: VecDeque<QueuedCapture>,
-    queued_bytes: usize,
-    committed: VecDeque<usize>,
-    committed_bytes: usize,
-    inflight_bytes: usize,
-    inflight_count: usize,
-    evict_committed: usize,
+    reserved_bytes: usize,
+    reserved_count: usize,
+    processing: bool,
     stopped: bool,
     paused: bool,
+    #[cfg(test)]
+    pause_before_store_commit: bool,
+    #[cfg(test)]
+    processing_started: bool,
 }
 
 struct QueuedCapture {
@@ -1643,7 +1644,7 @@ impl From<Sender<ClipboardEvent>> for EventSender {
 pub fn latest_clipboard_event_channel(
     records: Arc<SessionRecordStore>,
 ) -> (EventSender, LatestClipboardEventReceiver) {
-    clipboard_event_channel_with_limits(records, DEFAULT_TOTAL_BYTES, MAX_SESSION_RECORDS)
+    clipboard_event_channel_with_limits(records, INGESTION_QUEUE_BYTES, INGESTION_QUEUE_EVENTS)
 }
 
 fn clipboard_event_channel_with_limits(
@@ -1655,14 +1656,15 @@ fn clipboard_event_channel_with_limits(
         records,
         queue: Mutex::new(ClipboardIngestionQueue {
             captures: VecDeque::new(),
-            queued_bytes: 0,
-            committed: VecDeque::new(),
-            committed_bytes: 0,
-            inflight_bytes: 0,
-            inflight_count: 0,
-            evict_committed: 0,
+            reserved_bytes: 0,
+            reserved_count: 0,
+            processing: false,
             stopped: false,
             paused: false,
+            #[cfg(test)]
+            pause_before_store_commit: false,
+            #[cfg(test)]
+            processing_started: false,
         }),
         queue_changed: Condvar::new(),
         revision: AtomicU64::new(0),
@@ -1710,28 +1712,39 @@ fn enqueue_captures(
     if state.stopped {
         return Err(ClipboardEventSendError);
     }
+    let queued_bytes = state
+        .captures
+        .iter()
+        .try_fold(0_usize, |total, capture| total.checked_add(capture.bytes))
+        .ok_or(ClipboardEventSendError)?;
+    let processing_bytes = state.reserved_bytes.saturating_sub(queued_bytes);
+    let processing_count = usize::from(state.processing);
+    let available_bytes = shared.total_bytes_limit.saturating_sub(processing_bytes);
+    let available_count = shared.record_count_limit.saturating_sub(processing_count);
+    if available_count == 0 || queued.iter().any(|capture| capture.bytes > available_bytes) {
+        return Err(ClipboardEventSendError);
+    }
     for capture in queued {
         while state
-            .committed_bytes
-            .checked_add(state.queued_bytes)
-            .and_then(|bytes| bytes.checked_add(state.inflight_bytes))
-            .and_then(|bytes| bytes.checked_add(capture.bytes))
+            .reserved_bytes
+            .checked_add(capture.bytes)
             .is_none_or(|bytes| bytes > shared.total_bytes_limit)
-            || state.committed.len() + state.captures.len() + state.inflight_count + 1
-                > shared.record_count_limit
+            || state.reserved_count + 1 > shared.record_count_limit
         {
-            if let Some(bytes) = state.committed.pop_front() {
-                state.committed_bytes = state.committed_bytes.saturating_sub(bytes);
-                state.evict_committed += 1;
-            } else if let Some(removed) = state.captures.pop_front() {
-                state.queued_bytes = state.queued_bytes.saturating_sub(removed.bytes);
+            if let Some(removed) = state.captures.pop_front() {
+                state.reserved_bytes = state.reserved_bytes.saturating_sub(removed.bytes);
+                state.reserved_count = state.reserved_count.saturating_sub(1);
             } else {
-                break;
+                return Err(ClipboardEventSendError);
             }
         }
-        state.queued_bytes = state
-            .queued_bytes
+        state.reserved_bytes = state
+            .reserved_bytes
             .checked_add(capture.bytes)
+            .ok_or(ClipboardEventSendError)?;
+        state.reserved_count = state
+            .reserved_count
+            .checked_add(1)
             .ok_or(ClipboardEventSendError)?;
         state.captures.push_back(capture);
     }
@@ -1742,54 +1755,55 @@ fn enqueue_captures(
 
 fn run_clipboard_ingestion(shared: Arc<ClipboardIngestionShared>) {
     loop {
-        let (evictions, queued) = {
+        let queued = {
             let state = lock_unpoisoned(&shared.queue);
             let mut state = shared
                 .queue_changed
                 .wait_while(state, |state| {
-                    !state.stopped
-                        && (state.paused
-                            || (state.evict_committed == 0 && state.captures.is_empty()))
+                    !state.stopped && (state.paused || state.captures.is_empty())
                 })
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if state.stopped && state.evict_committed == 0 && state.captures.is_empty() {
+            if state.stopped {
                 return;
             }
-            let evictions = std::mem::take(&mut state.evict_committed);
             let queued = state.captures.pop_front();
-            if let Some(capture) = &queued {
-                state.queued_bytes = state.queued_bytes.saturating_sub(capture.bytes);
-                state.inflight_bytes = state.inflight_bytes.saturating_add(capture.bytes);
-                state.inflight_count += 1;
+            if queued.is_some() {
+                state.processing = true;
+                #[cfg(test)]
+                {
+                    state.processing_started = true;
+                    shared.queue_changed.notify_all();
+                }
             }
-            (evictions, queued)
+            queued
         };
-        for _ in 0..evictions {
-            let _ = shared.records.evict_oldest();
-        }
         let Some(queued) = queued else {
             continue;
         };
+
+        #[cfg(test)]
+        {
+            let state = lock_unpoisoned(&shared.queue);
+            let state = shared
+                .queue_changed
+                .wait_while(state, |state| {
+                    !state.stopped && state.pause_before_store_commit
+                })
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if state.stopped {
+                return;
+            }
+        }
+
         let status = shared.records.capture_one(queued.capture);
         {
             let mut state = lock_unpoisoned(&shared.queue);
-            state.inflight_bytes = state.inflight_bytes.saturating_sub(queued.bytes);
-            state.inflight_count = state.inflight_count.saturating_sub(1);
-            match status {
-                CaptureStatus::Inserted { bytes } => {
-                    state.committed.push_back(bytes);
-                    state.committed_bytes = state.committed_bytes.saturating_add(bytes);
-                }
-                CaptureStatus::Refreshed { previous, bytes } => {
-                    if let Some(current) = state.committed.back_mut() {
-                        *current = bytes;
-                    }
-                    state.committed_bytes = state
-                        .committed_bytes
-                        .saturating_sub(previous)
-                        .saturating_add(bytes);
-                }
-                CaptureStatus::RejectedTooLarge => {}
+            state.reserved_bytes = state.reserved_bytes.saturating_sub(queued.bytes);
+            state.reserved_count = state.reserved_count.saturating_sub(1);
+            state.processing = false;
+            #[cfg(test)]
+            {
+                state.processing_started = false;
             }
         }
         if !matches!(status, CaptureStatus::RejectedTooLarge) {
@@ -1828,6 +1842,10 @@ impl Drop for LatestClipboardEventReceiver {
             let mut state = lock_unpoisoned(&self.shared.queue);
             state.stopped = true;
             state.paused = false;
+            #[cfg(test)]
+            {
+                state.pause_before_store_commit = false;
+            }
         }
         self.shared.queue_changed.notify_all();
         if self
@@ -1849,6 +1867,24 @@ impl LatestClipboardEventReceiver {
 
     fn resume_ingestion(&self) {
         lock_unpoisoned(&self.shared.queue).paused = false;
+        self.shared.queue_changed.notify_all();
+    }
+
+    fn pause_before_store_commit(&self) {
+        lock_unpoisoned(&self.shared.queue).pause_before_store_commit = true;
+    }
+
+    fn wait_until_processing(&self) {
+        let state = lock_unpoisoned(&self.shared.queue);
+        let _state = self
+            .shared
+            .queue_changed
+            .wait_while(state, |state| !state.processing_started)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+    }
+
+    fn resume_store_commit(&self) {
+        lock_unpoisoned(&self.shared.queue).pause_before_store_commit = false;
         self.shared.queue_changed.notify_all();
     }
 }
@@ -2090,8 +2126,8 @@ mod tests {
 
     #[test]
     fn ingestion_budget_evicts_the_globally_oldest_history() {
-        let records = Arc::new(SessionRecordStore::default());
         let bytes = representation_bytes(&text_event(1, "12345678").captured.representations);
+        let records = Arc::new(SessionRecordStore::with_test_limits(bytes * 3, bytes, 16));
         let (events, receiver) =
             clipboard_event_channel_with_limits(Arc::clone(&records), bytes * 3, 3);
         events.send(text_event(1, "oldest-a")).unwrap();
@@ -2104,6 +2140,151 @@ mod tests {
         wait_for_record_count(&records, 3);
 
         assert_eq!(stored_texts(&records), ["newest-d", "queued-c", "middle-b"]);
+    }
+
+    #[test]
+    fn paused_worker_keeps_queue_within_its_own_byte_and_count_budget() {
+        let records = Arc::new(SessionRecordStore::default());
+        let bytes = representation_bytes(&text_event(1, "12345678").captured.representations);
+        let (events, receiver) =
+            clipboard_event_channel_with_limits(Arc::clone(&records), bytes * 2, 2);
+        receiver.pause_ingestion();
+
+        events.send(text_event(1, "oldest-a")).unwrap();
+        events.send(text_event(2, "middle-b")).unwrap();
+        events.send(text_event(3, "newest-c")).unwrap();
+
+        let queue = receiver.shared.queue.lock().unwrap();
+        assert_eq!(queue.captures.len(), 2);
+        assert!(queue.reserved_bytes <= bytes * 2);
+        assert!(queue.reserved_count <= 2);
+        drop(queue);
+        receiver.resume_ingestion();
+        wait_for_record_count(&records, 2);
+        assert_eq!(stored_texts(&records), ["newest-c", "middle-b"]);
+    }
+
+    #[test]
+    fn processing_capture_keeps_its_queue_reservation_until_store_commit() {
+        let records = Arc::new(SessionRecordStore::default());
+        let bytes = representation_bytes(&text_event(1, "processing").captured.representations);
+        let (events, receiver) =
+            clipboard_event_channel_with_limits(Arc::clone(&records), bytes, 1);
+        receiver.pause_before_store_commit();
+        events.send(text_event(1, "processing")).unwrap();
+        receiver.wait_until_processing();
+
+        let queue = receiver.shared.queue.lock().unwrap();
+        assert!(queue.processing);
+        assert_eq!(queue.reserved_count, 1);
+        assert_eq!(queue.reserved_bytes, bytes);
+        drop(queue);
+        receiver.resume_store_commit();
+        wait_for_record_count(&records, 1);
+    }
+
+    #[test]
+    fn note_eviction_remains_authoritative_through_production_ingestion() {
+        let records = Arc::new(SessionRecordStore::with_test_limits(77, 48, 16));
+        let (events, receiver) = clipboard_event_channel_with_limits(Arc::clone(&records), 128, 4);
+        events.send(text_event(1, "12345")).unwrap();
+        events.send(text_event(2, "abcde")).unwrap();
+        wait_for_record_count(&records, 2);
+        let newest = records.list()[0].id;
+
+        records.update_note(newest, "note".to_owned()).unwrap();
+        assert_eq!(records.list().len(), 1);
+        events.send(text_event(3, "xyz")).unwrap();
+        wait_for_record_count(&records, 2);
+
+        let listed = records.list();
+        assert_eq!(listed[1].id, newest);
+        assert_eq!(receiver.recv_timeout(Duration::from_millis(50)).unwrap(), 3);
+    }
+
+    #[test]
+    fn duplicate_refresh_at_full_count_does_not_pre_evict_store_history() {
+        let records = Arc::new(SessionRecordStore::default());
+        for index in 0..500 {
+            records.capture(text_event(index, &format!("value-{index}")).captured);
+        }
+        let before = records.list();
+        let oldest = before.last().unwrap().id;
+        let (events, receiver) = latest_clipboard_event_channel(Arc::clone(&records));
+
+        let mut duplicate = text_event(501, "value-499");
+        duplicate.captured.content_identity = ContentIdentity::new("test:499");
+        events.send(duplicate).unwrap();
+        assert_eq!(receiver.recv_timeout(Duration::from_secs(1)).unwrap(), 1);
+
+        let after = records.list();
+        assert_eq!(after.len(), 500);
+        assert_eq!(after.last().unwrap().id, oldest);
+    }
+
+    #[test]
+    fn rejected_refresh_through_production_ingestion_keeps_store_unchanged() {
+        let records = Arc::new(SessionRecordStore::with_test_limits(128, 80, 16));
+        records.capture(text_event(1, "old").captured);
+        records.capture(text_event(2, &"a".repeat(40)).captured);
+        let before = records.list();
+        let (events, receiver) = latest_clipboard_event_channel(Arc::clone(&records));
+        let mut duplicate = text_event(3, "");
+        duplicate.captured.content_identity = ContentIdentity::new("test:2");
+        duplicate.captured.representations =
+            vec![ClipboardRepresentation::Png { bytes: vec![1; 40] }];
+
+        events.send(duplicate).unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+
+        assert_eq!(records.list(), before);
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn failed_enqueue_does_not_evict_existing_queued_history() {
+        let records = Arc::new(SessionRecordStore::default());
+        let bytes = representation_bytes(&text_event(1, "kept").captured.representations);
+        let (events, receiver) =
+            clipboard_event_channel_with_limits(Arc::clone(&records), bytes, 1);
+        receiver.pause_ingestion();
+        events.send(text_event(1, "kept")).unwrap();
+
+        assert!(events.send(text_event(2, &"x".repeat(bytes))).is_err());
+        let queue = receiver.shared.queue.lock().unwrap();
+        assert_eq!(queue.captures.len(), 1);
+        assert_eq!(
+            queue.captures[0].capture.content_identity,
+            ContentIdentity::new("test:1")
+        );
+        drop(queue);
+
+        receiver.resume_ingestion();
+        wait_for_record_count(&records, 1);
+        assert_eq!(stored_texts(&records), ["kept"]);
+    }
+
+    #[test]
+    fn store_and_processing_queue_reservations_stay_within_partitioned_total_budget() {
+        let records = Arc::new(SessionRecordStore::with_test_limits(80, 48, 16));
+        records.capture(text_event(1, "12345678").captured);
+        records.capture(text_event(2, "abcdefgh").captured);
+        let queue_bytes = representation_bytes(&text_event(3, "queue").captured.representations);
+        let (events, receiver) =
+            clipboard_event_channel_with_limits(Arc::clone(&records), queue_bytes, 1);
+        receiver.pause_before_store_commit();
+        events.send(text_event(3, "queue")).unwrap();
+        receiver.wait_until_processing();
+
+        let (store_bytes, _) = records.budget_snapshot();
+        let queue = receiver.shared.queue.lock().unwrap();
+        assert!(store_bytes <= 80);
+        assert!(queue.reserved_bytes <= queue_bytes);
+        assert!(store_bytes + queue.reserved_bytes <= 80 + queue_bytes);
+        drop(queue);
+
+        receiver.resume_store_commit();
+        assert_eq!(receiver.recv_timeout(Duration::from_secs(1)).unwrap(), 1);
     }
 
     #[test]

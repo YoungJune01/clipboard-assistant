@@ -11,7 +11,10 @@ use crate::domain::{
 };
 
 pub(crate) const MAX_SESSION_RECORDS: usize = 500;
-pub(crate) const DEFAULT_TOTAL_BYTES: usize = 64 * 1024 * 1024;
+pub(crate) const TOTAL_SESSION_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
+pub(crate) const INGESTION_QUEUE_BYTES: usize = 16 * 1024 * 1024;
+pub(crate) const INGESTION_QUEUE_EVENTS: usize = 64;
+pub(crate) const DEFAULT_STORE_BYTES: usize = TOTAL_SESSION_PAYLOAD_BYTES - INGESTION_QUEUE_BYTES;
 pub(crate) const MAX_CAPTURE_RECORD_BYTES: usize = 16 * 1024 * 1024;
 pub(crate) const REPRESENTATION_OVERHEAD_BYTES: usize = 32;
 const DEFAULT_RECORD_BYTES: usize = MAX_CAPTURE_RECORD_BYTES;
@@ -55,7 +58,7 @@ pub(crate) enum CaptureStatus {
 impl Default for SessionRecordStore {
     fn default() -> Self {
         Self::with_limits(SessionRecordLimits {
-            total_bytes: DEFAULT_TOTAL_BYTES,
+            total_bytes: DEFAULT_STORE_BYTES,
             record_bytes: DEFAULT_RECORD_BYTES,
             preview_bytes: DEFAULT_PREVIEW_BYTES,
         })
@@ -71,6 +74,19 @@ impl SessionRecordStore {
             }),
             limits,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_limits(
+        total_bytes: usize,
+        record_bytes: usize,
+        preview_bytes: usize,
+    ) -> Self {
+        Self::with_limits(SessionRecordLimits {
+            total_bytes,
+            record_bytes,
+            preview_bytes,
+        })
     }
 
     pub fn capture(&self, capture: CapturedClipboard) -> bool {
@@ -117,15 +133,6 @@ impl SessionRecordStore {
         CaptureStatus::Inserted {
             bytes: capture_bytes,
         }
-    }
-
-    pub(crate) fn evict_oldest(&self) -> bool {
-        let mut state = lock_unpoisoned(&self.state);
-        let Some(removed) = state.records.pop_back() else {
-            return false;
-        };
-        state.total_bytes = state.total_bytes.saturating_sub(record_bytes(&removed));
-        true
     }
 
     pub fn list(&self) -> Vec<SessionRecordView> {
@@ -186,6 +193,12 @@ impl SessionRecordStore {
             .find(|record| record.id == id)
             .map(|record| SessionRecordView::from_record(record, self.limits.preview_bytes))
             .ok_or(SessionRecordError::NotFound)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn budget_snapshot(&self) -> (usize, usize) {
+        let state = lock_unpoisoned(&self.state);
+        (state.total_bytes, state.records.len())
     }
 }
 
@@ -489,6 +502,80 @@ mod tests {
                 text: "a".repeat(40)
             }])
         );
+    }
+
+    #[test]
+    fn refresh_at_record_count_limit_does_not_evict_the_oldest_record() {
+        let store = SessionRecordStore::with_limits(SessionRecordLimits {
+            total_bytes: 64 * 1024,
+            record_bytes: 1024,
+            preview_bytes: 32,
+        });
+        for index in 0..MAX_SESSION_RECORDS {
+            store.capture(capture(
+                &format!("record-{index}"),
+                &format!("value-{index}"),
+            ));
+        }
+        let before = store.list();
+        let newest = before[0].clone();
+
+        assert!(matches!(
+            store.capture_one(capture("record-499", "updated")),
+            CaptureStatus::Refreshed { .. }
+        ));
+
+        let after = store.list();
+        assert_eq!(after.len(), MAX_SESSION_RECORDS);
+        assert_eq!(
+            after.last().map(|record| record.id),
+            before.last().map(|record| record.id)
+        );
+        assert_eq!(after[0].id, newest.id);
+    }
+
+    #[test]
+    fn rejected_refresh_at_capacity_does_not_evict_any_record() {
+        let store = SessionRecordStore::with_limits(SessionRecordLimits {
+            total_bytes: 128,
+            record_bytes: 80,
+            preview_bytes: 16,
+        });
+        store.capture(capture("old", "old"));
+        store.capture(capture("same", &"a".repeat(40)));
+        let before = store.list();
+        let duplicate = CapturedClipboard {
+            content_identity: ContentIdentity::new("same"),
+            captured_at: Utc::now(),
+            source: SourceIdentity::default(),
+            representations: vec![ClipboardRepresentation::Png { bytes: vec![1; 40] }],
+        };
+
+        assert_eq!(
+            store.capture_one(duplicate),
+            CaptureStatus::RejectedTooLarge
+        );
+        assert_eq!(store.list(), before);
+    }
+
+    #[test]
+    fn note_eviction_is_authoritative_for_the_next_capture() {
+        let store = SessionRecordStore::with_limits(SessionRecordLimits {
+            total_bytes: 77,
+            record_bytes: 48,
+            preview_bytes: 16,
+        });
+        store.capture(capture("old", "12345"));
+        store.capture(capture("new", "abcde"));
+        let newest = store.list()[0].id;
+        store.update_note(newest, "note".to_owned()).unwrap();
+        assert_eq!(store.list().len(), 1);
+
+        store.capture(capture("third", "xyz"));
+
+        let listed = store.list();
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[1].id, newest);
     }
 
     #[test]
