@@ -38,8 +38,14 @@ pub struct SessionRecordView {
 pub struct SessionRecordStore {
     state: Mutex<SessionRecordState>,
     limits: SessionRecordLimits,
-    persistence: Option<Arc<dyn RecordPersistence>>,
+    persistence: NotePersistence,
     storage_available: Arc<AtomicBool>,
+}
+
+enum NotePersistence {
+    NotConfigured,
+    Durable(Arc<dyn RecordPersistence>),
+    SessionOnly,
 }
 
 #[derive(Clone, Copy)]
@@ -79,7 +85,7 @@ impl SessionRecordStore {
                 total_bytes: 0,
             }),
             limits,
-            persistence: None,
+            persistence: NotePersistence::NotConfigured,
             storage_available: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -99,7 +105,7 @@ impl SessionRecordStore {
                 record_bytes: DEFAULT_RECORD_BYTES,
                 preview_bytes: DEFAULT_PREVIEW_BYTES,
             },
-            persistence: Some(persistence),
+            persistence: NotePersistence::Durable(persistence),
             storage_available,
         };
         store.replace_loaded(records);
@@ -108,6 +114,27 @@ impl SessionRecordStore {
 
     pub fn with_loaded(records: Vec<ClipboardRecord>) -> Self {
         let store = Self::default();
+        store.replace_loaded(records);
+        store
+    }
+
+    pub fn with_session_only(
+        records: Vec<ClipboardRecord>,
+        storage_available: Arc<AtomicBool>,
+    ) -> Self {
+        let store = Self {
+            state: Mutex::new(SessionRecordState {
+                records: VecDeque::new(),
+                total_bytes: 0,
+            }),
+            limits: SessionRecordLimits {
+                total_bytes: DEFAULT_STORE_BYTES,
+                record_bytes: DEFAULT_RECORD_BYTES,
+                preview_bytes: DEFAULT_PREVIEW_BYTES,
+            },
+            persistence: NotePersistence::SessionOnly,
+            storage_available,
+        };
         store.replace_loaded(records);
         store
     }
@@ -247,12 +274,23 @@ impl SessionRecordStore {
             .find(|record| record.id == id)
             .and_then(|record| record.note.clone());
         drop(state);
-        if let Some(persistence) = &self.persistence
-            && persistence
-                .update_note(id, persisted_note.as_ref())
-                .is_err()
-        {
-            self.storage_available.store(false, Ordering::Release);
+        match &self.persistence {
+            NotePersistence::NotConfigured => {}
+            NotePersistence::SessionOnly => {
+                return Err(SessionRecordError::PersistenceUnavailable);
+            }
+            NotePersistence::Durable(persistence) => {
+                if !self.storage_available.load(Ordering::Acquire) {
+                    return Err(SessionRecordError::PersistenceUnavailable);
+                }
+                if persistence
+                    .update_note(id, persisted_note.as_ref())
+                    .is_err()
+                {
+                    self.storage_available.store(false, Ordering::Release);
+                    return Err(SessionRecordError::PersistenceUnavailable);
+                }
+            }
         }
         Ok(view)
     }
@@ -290,7 +328,8 @@ impl SessionRecordStore {
     }
 
     fn persist_record(&self, record: &ClipboardRecord) {
-        if let Some(persistence) = &self.persistence
+        if let NotePersistence::Durable(persistence) = &self.persistence
+            && self.storage_available.load(Ordering::Acquire)
             && persistence.save_record(record).is_err()
         {
             self.storage_available.store(false, Ordering::Release);
@@ -408,6 +447,7 @@ pub enum SessionRecordError {
     NotFound,
     InvalidNote(RecordNoteError),
     RecordTooLarge,
+    PersistenceUnavailable,
 }
 
 impl std::fmt::Display for SessionRecordError {
@@ -416,6 +456,9 @@ impl std::fmt::Display for SessionRecordError {
             Self::NotFound => formatter.write_str("clipboard record is no longer available"),
             Self::InvalidNote(_) => formatter.write_str("clipboard record note is invalid"),
             Self::RecordTooLarge => formatter.write_str("clipboard record exceeds memory limits"),
+            Self::PersistenceUnavailable => {
+                formatter.write_str("clipboard record note was not saved to local storage")
+            }
         }
     }
 }
@@ -524,12 +567,32 @@ mod tests {
         assert!(!available.load(Ordering::Acquire));
 
         available.store(true, Ordering::Release);
-        assert!(store.update_note(id, "local draft".to_owned()).is_ok());
+        assert!(matches!(
+            store.update_note(id, "local draft".to_owned()),
+            Err(SessionRecordError::PersistenceUnavailable)
+        ));
         assert_eq!(
             store.list()[0].note.as_ref().map(RecordNote::as_str),
             Some("local draft")
         );
         assert!(!available.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn session_only_note_edit_keeps_the_draft_but_reports_it_is_not_durable() {
+        let available = Arc::new(AtomicBool::new(false));
+        let record = ClipboardRecord::from_capture(capture("one", "session text"));
+        let id = record.id;
+        let store = SessionRecordStore::with_session_only(vec![record], available);
+
+        assert!(matches!(
+            store.update_note(id, "retry later".to_owned()),
+            Err(SessionRecordError::PersistenceUnavailable)
+        ));
+        assert_eq!(
+            store.list()[0].note.as_ref().map(RecordNote::as_str),
+            Some("retry later")
+        );
     }
 
     #[test]

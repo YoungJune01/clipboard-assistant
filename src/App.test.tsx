@@ -18,7 +18,7 @@ const record: SessionRecord = {
 };
 
 function commands(records = [record]): AppCommands {
-  const settings: SettingsState = {
+  let settings: SettingsState = {
     language: "zh_cn",
     retention: "thirty_days",
     storageAvailable: true,
@@ -33,8 +33,14 @@ function commands(records = [record]): AppCommands {
       note: note || null,
     })),
     getSettings: vi.fn().mockResolvedValue(settings),
-    updateLanguage: vi.fn().mockImplementation(async (language) => ({ ...settings, language })),
-    updateRetention: vi.fn().mockImplementation(async (retention) => ({ ...settings, retention })),
+    updateLanguage: vi.fn().mockImplementation(async (language) => {
+      settings = { ...settings, language };
+      return settings;
+    }),
+    updateRetention: vi.fn().mockImplementation(async (retention) => {
+      settings = { ...settings, retention };
+      return settings;
+    }),
     setWindowTitle: vi.fn().mockResolvedValue(undefined),
     subscribeRecordsChanged: vi.fn().mockResolvedValue(() => undefined),
     subscribeSettingsChanged: vi.fn().mockResolvedValue(() => undefined),
@@ -248,6 +254,7 @@ describe("window routing", () => {
 
     await user.selectOptions(screen.getByLabelText("Keep history for"), "forever");
     expect(api.updateRetention).toHaveBeenCalledWith("forever");
+    expect(await screen.findByRole("option", { name: "Forever (no time limit; local capacity limits still apply)" })).toBeInTheDocument();
   });
 
   it("synchronizes a language change event into the quick panel", async () => {

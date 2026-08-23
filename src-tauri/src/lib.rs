@@ -13,7 +13,7 @@ use services::panel::PanelController;
 #[cfg(windows)]
 use services::paste::{QuickPanelPasteCoordinator, SafePasteService};
 #[cfg(windows)]
-use services::persistence::{PersistenceWorker, SqliteRepository};
+use services::persistence::{PersistenceWorker, RestoreBudget, SqliteRepository};
 #[cfg(windows)]
 use services::session_records::{SessionRecordCommands, SessionRecordStore, SessionRecordView};
 
@@ -542,7 +542,11 @@ pub fn run() {
                         .prune(settings.retention, chrono::Utc::now())
                         .ok()?;
                     let records = repository
-                        .load_recent(services::session_records::MAX_SESSION_RECORDS)
+                        .load_recent_bounded(RestoreBudget {
+                            max_records: services::session_records::MAX_SESSION_RECORDS,
+                            max_total_bytes: services::session_records::DEFAULT_STORE_BYTES,
+                            max_record_bytes: services::session_records::MAX_CAPTURE_RECORD_BYTES,
+                        })
                         .ok()?;
                     Some((repository, settings, records))
                 })
@@ -565,7 +569,10 @@ pub fn run() {
                     Arc::clone(persistence) as Arc<dyn services::persistence::RecordPersistence>,
                     Arc::clone(&storage_available),
                 )),
-                None => Arc::new(SessionRecordStore::with_loaded(loaded_records)),
+                None => Arc::new(SessionRecordStore::with_session_only(
+                    loaded_records,
+                    Arc::clone(&storage_available),
+                )),
             };
             let (clipboard_events, clipboard_receiver) =
                 platform::windows::clipboard::latest_clipboard_event_channel(Arc::clone(
