@@ -1,22 +1,16 @@
 pub mod activation;
 pub mod clipboard;
+pub mod hotkey;
 mod message_loop;
 pub mod monitor;
 pub mod paste;
 
 use windows::Win32::{
     Foundation::{GetLastError, HWND, WIN32_ERROR},
-    UI::{
-        HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext},
-        WindowsAndMessaging::{
-            GWL_EXSTYLE, GetWindowLongW, SetWindowLongW, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
-        },
+    UI::WindowsAndMessaging::{
+        GWL_EXSTYLE, GetWindowLongW, SetWindowLongW, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
     },
 };
-
-pub fn enable_per_monitor_v2() -> windows::core::Result<()> {
-    unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) }
-}
 
 pub fn configure_quick_panel_style(hwnd: HWND) -> windows::core::Result<()> {
     let current = unsafe { GetWindowLongW(hwnd, GWL_EXSTYLE) };

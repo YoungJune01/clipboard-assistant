@@ -505,9 +505,8 @@ impl PanelController {
                     }
                 }
             });
-        match thread {
-            Ok(thread) => *observer = Some(PanelObserver { stop, thread }),
-            Err(error) => eprintln!("quick-panel display observer could not start: {error}"),
+        if let Ok(thread) = thread {
+            *observer = Some(PanelObserver { stop, thread });
         }
     }
 

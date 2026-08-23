@@ -13,13 +13,13 @@
     "windows": [
       {
         "label": "settings",
-        "title": "Clipboard Assistant",
+        "title": "剪贴板助手",
         "width": 800,
         "height": 600
       },
       {
         "label": "quick-panel",
-        "title": "Quick Panel",
+        "title": "快速剪贴板",
         "width": 420,
         "height": 520,
         "visible": false,

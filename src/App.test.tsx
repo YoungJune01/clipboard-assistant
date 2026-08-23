@@ -5,6 +5,7 @@ import {
   ClipboardAssistantApp,
   type AppCommands,
   type SessionRecord,
+  type SettingsState,
 } from "./App";
 
 const record: SessionRecord = {
@@ -17,6 +18,12 @@ const record: SessionRecord = {
 };
 
 function commands(records = [record]): AppCommands {
+  const settings: SettingsState = {
+    language: "zh_cn",
+    retention: "thirty_days",
+    storageAvailable: true,
+    hotkeyStatus: "available",
+  };
   return {
     listSessionRecords: vi.fn().mockResolvedValue(records),
     pasteSelected: vi.fn().mockResolvedValue("Paste command sent"),
@@ -25,7 +32,12 @@ function commands(records = [record]): AppCommands {
       ...record,
       note: note || null,
     })),
+    getSettings: vi.fn().mockResolvedValue(settings),
+    updateLanguage: vi.fn().mockImplementation(async (language) => ({ ...settings, language })),
+    updateRetention: vi.fn().mockImplementation(async (retention) => ({ ...settings, retention })),
+    setWindowTitle: vi.fn().mockResolvedValue(undefined),
     subscribeRecordsChanged: vi.fn().mockResolvedValue(() => undefined),
+    subscribeSettingsChanged: vi.fn().mockResolvedValue(() => undefined),
   };
 }
 
@@ -43,7 +55,7 @@ describe("quick panel", () => {
   it("shows a real empty state without placeholder records", async () => {
     render(<ClipboardAssistantApp windowLabel="quick-panel" commands={commands([])} />);
 
-    expect(await screen.findByText("Nothing copied this session")).toBeInTheDocument();
+    expect(await screen.findByText("还没有剪贴内容")).toBeInTheDocument();
     expect(screen.queryByText("real clipboard text")).not.toBeInTheDocument();
   });
 
@@ -57,7 +69,7 @@ describe("quick panel", () => {
 
     fireEvent.doubleClick(body);
     await waitFor(() => expect(api.pasteSelected).toHaveBeenCalledWith(record.id));
-    expect(await screen.findByText("Paste command sent")).toBeInTheDocument();
+    expect(await screen.findByText("已发送粘贴命令")).toBeInTheDocument();
 
     fireEvent.keyDown(body.closest("article")!, { key: "Enter" });
     await waitFor(() => expect(api.pasteSelected).toHaveBeenCalledTimes(2));
@@ -66,7 +78,7 @@ describe("quick panel", () => {
   it("keeps note editing isolated from selection paste gestures", async () => {
     const api = commands();
     render(<ClipboardAssistantApp windowLabel="quick-panel" commands={api} />);
-    const note = await screen.findByLabelText("Note for real clipboard text");
+    const note = await screen.findByLabelText("real clipboard text的备注");
 
     fireEvent.click(note);
     fireEvent.doubleClick(note);
@@ -84,7 +96,7 @@ describe("quick panel", () => {
     const api = commands();
     const user = userEvent.setup();
     render(<ClipboardAssistantApp windowLabel="quick-panel" commands={api} />);
-    const note = await screen.findByLabelText("Note for real clipboard text");
+    const note = await screen.findByLabelText("real clipboard text的备注");
 
     await user.click(note);
     await user.paste("😀".repeat(201));
@@ -108,7 +120,7 @@ describe("quick panel", () => {
 
     expect(
       await screen.findByText(
-        "Cannot paste safely; content was copied. Paste it manually.",
+        "无法安全粘贴，内容已复制，请手动粘贴。",
       ),
     ).toBeInTheDocument();
     expect(api.pasteSelected).toHaveBeenCalledWith(record.id);
@@ -122,7 +134,7 @@ describe("quick panel", () => {
 
     fireEvent.doubleClick(body);
 
-    expect(await screen.findByRole("alert")).toHaveTextContent("Paste request failed");
+    expect(await screen.findByRole("alert")).toHaveTextContent("粘贴请求失败");
     expect(
       screen.queryByText(
         "Cannot paste safely; content was copied. Paste it manually.",
@@ -177,7 +189,7 @@ describe("quick panel", () => {
     );
     pending.reject(new Error("list failed"));
     expect(await screen.findByRole("alert")).toHaveTextContent(
-      "Clipboard history is unavailable",
+      "剪贴板历史暂时不可用",
     );
 
     view.unmount();
@@ -194,7 +206,7 @@ describe("quick panel", () => {
       .mockReturnValueOnce(second.promise)
       .mockRejectedValueOnce(new Error("save failed"));
     render(<ClipboardAssistantApp windowLabel="quick-panel" commands={api} />);
-    const note = await screen.findByLabelText("Note for real clipboard text");
+    const note = await screen.findByLabelText("real clipboard text的备注");
 
     fireEvent.change(note, { target: { value: "old" } });
     fireEvent.keyDown(note, { key: "Enter" });
@@ -206,19 +218,49 @@ describe("quick panel", () => {
 
     fireEvent.change(note, { target: { value: "retry me" } });
     fireEvent.keyDown(note, { key: "Enter" });
-    expect(await screen.findByRole("alert")).toHaveTextContent("Note was not saved");
+    expect(await screen.findByRole("alert")).toHaveTextContent("备注保存失败");
     expect(note).toHaveValue("retry me");
   });
 });
 
 describe("window routing", () => {
-  it("renders settings controls without clipboard organization actions", () => {
+  it("renders real Chinese settings controls without clipboard organization actions", async () => {
     render(<ClipboardAssistantApp windowLabel="settings" commands={commands([])} />);
 
-    expect(screen.getByRole("heading", { name: "Startup" })).toBeInTheDocument();
-    expect(screen.getByRole("heading", { name: "Shortcuts" })).toBeInTheDocument();
-    expect(screen.getByRole("heading", { name: "Appearance & sound" })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "设置" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "本地保存" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "快捷键" })).toBeInTheDocument();
+    expect(screen.getByText("快捷键可用")).toBeInTheDocument();
     expect(screen.queryByText("Add group")).not.toBeInTheDocument();
     expect(screen.queryByText("Favorites")).not.toBeInTheDocument();
+  });
+
+  it("switches to English immediately and persists retention choices", async () => {
+    const api = commands([]);
+    render(<ClipboardAssistantApp windowLabel="settings" commands={api} />);
+    const user = userEvent.setup();
+
+    await user.selectOptions(await screen.findByLabelText("语言"), "en");
+    expect(api.updateLanguage).toHaveBeenCalledWith("en");
+    expect(await screen.findByRole("heading", { name: "Settings" })).toBeInTheDocument();
+    await waitFor(() => expect(api.setWindowTitle).toHaveBeenLastCalledWith("Clipboard Assistant"));
+
+    await user.selectOptions(screen.getByLabelText("Keep history for"), "forever");
+    expect(api.updateRetention).toHaveBeenCalledWith("forever");
+  });
+
+  it("synchronizes a language change event into the quick panel", async () => {
+    const api = commands([]);
+    let update: ((settings: SettingsState) => void) | undefined;
+    vi.mocked(api.subscribeSettingsChanged).mockImplementation(async (listener) => {
+      update = listener;
+      return () => undefined;
+    });
+    render(<ClipboardAssistantApp windowLabel="quick-panel" commands={api} />);
+    expect(await screen.findByLabelText("快速剪贴板")).toBeInTheDocument();
+
+    update!({ language: "en", retention: "thirty_days", storageAvailable: true, hotkeyStatus: "available" });
+
+    expect(await screen.findByLabelText("Quick clipboard")).toBeInTheDocument();
   });
 });

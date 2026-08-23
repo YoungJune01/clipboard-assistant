@@ -2,326 +2,102 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import {
-  BellRing,
-  Clipboard,
-  Command,
-  Image,
-  Keyboard,
-  MonitorUp,
-  Palette,
-  Search,
-  Settings2,
-  Sparkles,
-  Upload,
-  Volume2,
-} from "lucide-react";
+import { Clipboard, Database, Image, Keyboard, Languages, Palette, Search, Settings2, Sparkles } from "lucide-react";
+import { dictionary, type Dictionary, type Language } from "./i18n";
 import "./App.css";
 
 const COMMAND_SENT = "Paste command sent";
 const COPY_ONLY = "Cannot paste safely; content was copied. Paste it manually.";
-
-export interface SessionRecord {
-  id: string;
-  capturedAt: string;
-  sourceApplication: string | null;
-  text: string | null;
-  hasImage: boolean;
-  note: string | null;
-}
-
+export type RetentionPeriod = "one_day" | "seven_days" | "thirty_days" | "ninety_days" | "forever";
+export type HotkeyStatus = "available" | "conflict" | "unavailable";
+export interface SettingsState { language: Language; retention: RetentionPeriod; storageAvailable: boolean; hotkeyStatus: HotkeyStatus; }
+export interface SessionRecord { id: string; capturedAt: string; sourceApplication: string | null; text: string | null; hasImage: boolean; note: string | null; }
 export interface AppCommands {
-  listSessionRecords(): Promise<SessionRecord[]>;
-  pasteSelected(recordId: string): Promise<string>;
-  hideQuickPanel(): Promise<void>;
-  updateRecordNote(recordId: string, note: string): Promise<SessionRecord>;
+  listSessionRecords(): Promise<SessionRecord[]>; pasteSelected(recordId: string): Promise<string>;
+  hideQuickPanel(): Promise<void>; updateRecordNote(recordId: string, note: string): Promise<SessionRecord>;
+  getSettings(): Promise<SettingsState>; updateLanguage(language: Language): Promise<SettingsState>;
+  updateRetention(retention: RetentionPeriod): Promise<SettingsState>;
+  setWindowTitle(title: string): Promise<void>;
   subscribeRecordsChanged(refresh: () => void): Promise<() => void>;
+  subscribeSettingsChanged(update: (settings: SettingsState) => void): Promise<() => void>;
 }
-
+const defaults: SettingsState = { language: "zh_cn", retention: "thirty_days", storageAvailable: false, hotkeyStatus: "unavailable" };
 const tauriCommands: AppCommands = {
-  listSessionRecords: () => invoke("list_session_records"),
-  pasteSelected: (recordId) => invoke("paste_selected", { recordId }),
-  hideQuickPanel: () => invoke("hide_quick_panel"),
-  updateRecordNote: (recordId, note) =>
-    invoke("update_record_note", { recordId, note }),
-  subscribeRecordsChanged: async (refresh) =>
-    listen("clipboard-records-changed", refresh),
+  listSessionRecords: () => invoke("list_session_records"), pasteSelected: (recordId) => invoke("paste_selected", { recordId }),
+  hideQuickPanel: () => invoke("hide_quick_panel"), updateRecordNote: (recordId, note) => invoke("update_record_note", { recordId, note }),
+  getSettings: () => invoke("get_settings"), updateLanguage: (language) => invoke("update_language", { language }),
+  updateRetention: (retention) => invoke("update_retention", { retention }),
+  setWindowTitle: (title) => getCurrentWindow().setTitle(title),
+  subscribeRecordsChanged: async (refresh) => listen("clipboard-records-changed", refresh),
+  subscribeSettingsChanged: async (update) => listen<SettingsState>("settings-changed", (event) => update(event.payload)),
 };
 
-interface ClipboardAssistantAppProps {
-  windowLabel: string;
-  commands?: AppCommands;
+export function ClipboardAssistantApp({ windowLabel, commands = tauriCommands }: { windowLabel: string; commands?: AppCommands }) {
+  const { settings, setSettings } = useSettings(commands);
+  const text = dictionary(settings.language);
+  useEffect(() => { void commands.setWindowTitle(windowLabel === "quick-panel" ? text.quickPanel : text.product).catch(() => undefined); }, [commands, text, windowLabel]);
+  return windowLabel === "quick-panel"
+    ? <QuickPanel commands={commands} text={text} language={settings.language} />
+    : <SettingsShell commands={commands} settings={settings} setSettings={setSettings} text={text} />;
 }
+export default function App() { const [label, setLabel] = useState("settings"); useEffect(() => setLabel(getCurrentWindow().label), []); return <ClipboardAssistantApp windowLabel={label} />; }
 
-export function ClipboardAssistantApp({
-  windowLabel,
-  commands = tauriCommands,
-}: ClipboardAssistantAppProps) {
-  return windowLabel === "quick-panel" ? (
-    <QuickPanel commands={commands} />
-  ) : (
-    <SettingsShell />
-  );
-}
-
-export default function App() {
-  const [windowLabel, setWindowLabel] = useState("settings");
-
+function useSettings(commands: AppCommands) {
+  const [settings, setSettings] = useState(defaults);
   useEffect(() => {
-    setWindowLabel(getCurrentWindow().label);
-  }, []);
-
-  return <ClipboardAssistantApp windowLabel={windowLabel} />;
+    let active = true; let unsubscribe: (() => void) | undefined;
+    void commands.getSettings().then((value) => active && setSettings(value)).catch(() => undefined);
+    void commands.subscribeSettingsChanged((value) => active && setSettings(value)).then((stop) => active ? unsubscribe = stop : stop()).catch(() => undefined);
+    return () => { active = false; unsubscribe?.(); };
+  }, [commands]);
+  return { settings, setSettings };
 }
 
-function QuickPanel({ commands }: { commands: AppCommands }) {
-  const [records, setRecords] = useState<SessionRecord[]>([]);
-  const [selectedId, setSelectedId] = useState<string | null>(null);
-  const [query, setQuery] = useState("");
-  const [status, setStatus] = useState<string | null>(null);
-  const [statusIsError, setStatusIsError] = useState(false);
-  const [historyError, setHistoryError] = useState<string | null>(null);
-  const [loading, setLoading] = useState(true);
-  const mounted = useRef(true);
-  const refreshGeneration = useRef(0);
-  const noteRevisions = useRef(new Map<string, number>());
-
+function QuickPanel({ commands, text, language }: { commands: AppCommands; text: Dictionary; language: Language }) {
+  const [records, setRecords] = useState<SessionRecord[]>([]); const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [query, setQuery] = useState(""); const [status, setStatus] = useState<keyof Pick<Dictionary, "pasteSent" | "copyOnly" | "pasteFailed" | "noteSaveFailed"> | null>(null);
+  const [historyError, setHistoryError] = useState(false); const [loading, setLoading] = useState(true);
+  const mounted = useRef(true); const generation = useRef(0); const noteRevisions = useRef(new Map<string, number>());
   const refresh = useCallback(async () => {
-    const generation = ++refreshGeneration.current;
-    try {
-      const next = await commands.listSessionRecords();
-      if (!mounted.current || generation !== refreshGeneration.current) return;
-      setRecords(next);
-      setSelectedId((current) =>
-        current && next.some((record) => record.id === current)
-          ? current
-          : (next[0]?.id ?? null),
-      );
-      setHistoryError(null);
-    } catch {
-      if (!mounted.current || generation !== refreshGeneration.current) return;
-      setHistoryError("Clipboard history is unavailable");
-    } finally {
-      if (mounted.current && generation === refreshGeneration.current) {
-        setLoading(false);
-      }
-    }
+    const current = ++generation.current;
+    try { const next = await commands.listSessionRecords(); if (!mounted.current || current !== generation.current) return; setRecords(next); setSelectedId((id) => id && next.some((item) => item.id === id) ? id : (next[0]?.id ?? null)); setHistoryError(false); }
+    catch { if (mounted.current && current === generation.current) setHistoryError(true); }
+    finally { if (mounted.current && current === generation.current) setLoading(false); }
   }, [commands]);
-
-  useEffect(() => {
-    mounted.current = true;
-    void refresh();
-    let disposed = false;
-    let unsubscribe: (() => void) | undefined;
-    void commands
-      .subscribeRecordsChanged(() => void refresh())
-      .then((stop) => {
-        if (disposed) stop();
-        else unsubscribe = stop;
-      })
-      .catch(() => {
-        if (!disposed && mounted.current) {
-          setHistoryError("Clipboard history is unavailable");
-        }
-      });
-    return () => {
-      disposed = true;
-      mounted.current = false;
-      refreshGeneration.current += 1;
-      unsubscribe?.();
-    };
-  }, [commands, refresh]);
-
-  useEffect(() => {
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") {
-        void commands.hideQuickPanel();
-      }
-    };
-    window.addEventListener("keydown", onKeyDown, true);
-    return () => window.removeEventListener("keydown", onKeyDown, true);
-  }, [commands]);
-
-  const filtered = useMemo(() => {
-    const normalized = query.trim().toLocaleLowerCase();
-    if (!normalized) return records;
-    return records.filter((record) =>
-      [record.text, record.note, record.sourceApplication]
-        .filter(Boolean)
-        .some((value) => value!.toLocaleLowerCase().includes(normalized)),
-    );
-  }, [query, records]);
-
-  const paste = async (recordId: string) => {
-    setStatus(null);
-    setStatusIsError(false);
-    try {
-      const message = await commands.pasteSelected(recordId);
-      if (message !== COMMAND_SENT && message !== COPY_ONLY) {
-        throw new Error("unexpected paste outcome");
-      }
-      setStatus(message);
-    } catch {
-      setStatusIsError(true);
-      setStatus("Paste request failed");
-    }
-  };
-
-  const saveNote = async (recordId: string, note: string) => {
-    const revision = (noteRevisions.current.get(recordId) ?? 0) + 1;
-    noteRevisions.current.set(recordId, revision);
-    try {
-      const updated = await commands.updateRecordNote(recordId, note);
-      if (!mounted.current || noteRevisions.current.get(recordId) !== revision) {
-        return false;
-      }
-      setRecords((current) =>
-        current.map((record) => (record.id === recordId ? updated : record)),
-      );
-      setStatus((current) => current === "Note was not saved" ? null : current);
-      setStatusIsError(false);
-      return true;
-    } catch {
-      if (mounted.current && noteRevisions.current.get(recordId) === revision) {
-        setStatusIsError(true);
-        setStatus("Note was not saved");
-      }
-      return false;
-    }
-  };
-
-  return (
-    <main className="quick-panel" aria-label="Quick clipboard">
-      <header className="quick-header">
-        <div className="brand-mark"><Clipboard size={17} /></div>
-        <div><h1>Clipboard</h1><p>This session</p></div>
-        <span className="record-count">{records.length}</span>
-      </header>
-      <label className="search-field">
-        <Search size={16} />
-        <input value={query} onChange={(event) => setQuery(event.currentTarget.value)} placeholder="Search text or notes" aria-label="Search clipboard" />
-      </label>
-      <section className="record-list" aria-live="polite">
-        {!loading && filtered.length === 0 ? (
-          <div className="empty-state">
-            <div className="empty-icon"><Sparkles size={22} /></div>
-            <h2>{records.length === 0 ? "Nothing copied this session" : "No matching clips"}</h2>
-            <p>{records.length === 0 ? "New clipboard items will appear here." : "Try a different search."}</p>
-          </div>
-        ) : filtered.map((record, index) => (
-          <ClipboardItem key={record.id} record={record} index={index} selected={record.id === selectedId} onSelect={() => setSelectedId(record.id)} onPaste={() => void paste(record.id)} onSaveNote={(note) => saveNote(record.id, note)} />
-        ))}
-      </section>
-      {(status ?? historyError) && <div className={`outcome${statusIsError || historyError ? " error" : ""}`} role={statusIsError || historyError ? "alert" : "status"}>{status ?? historyError}</div>}
-      <footer className="quick-footer"><span>Enter to paste</span><span>Esc to close</span></footer>
-    </main>
-  );
+  useEffect(() => { mounted.current = true; void refresh(); let disposed = false; let stop: (() => void) | undefined; void commands.subscribeRecordsChanged(() => void refresh()).then((value) => disposed ? value() : stop = value).catch(() => !disposed && setHistoryError(true)); return () => { disposed = true; mounted.current = false; generation.current += 1; stop?.(); }; }, [commands, refresh]);
+  useEffect(() => { const key = (event: KeyboardEvent) => { if (event.key === "Escape") void commands.hideQuickPanel(); }; window.addEventListener("keydown", key, true); return () => window.removeEventListener("keydown", key, true); }, [commands]);
+  const filtered = useMemo(() => { const value = query.trim().toLocaleLowerCase(language === "zh_cn" ? "zh-CN" : "en-US"); return value ? records.filter((item) => [item.text, item.note, item.sourceApplication].filter(Boolean).some((field) => field!.toLocaleLowerCase().includes(value))) : records; }, [language, query, records]);
+  const paste = async (id: string) => { setStatus(null); try { const outcome = await commands.pasteSelected(id); if (outcome === COMMAND_SENT) setStatus("pasteSent"); else if (outcome === COPY_ONLY) setStatus("copyOnly"); else throw new Error(); } catch { setStatus("pasteFailed"); } };
+  const saveNote = async (id: string, note: string) => { const revision = (noteRevisions.current.get(id) ?? 0) + 1; noteRevisions.current.set(id, revision); try { const updated = await commands.updateRecordNote(id, note); if (!mounted.current || noteRevisions.current.get(id) !== revision) return false; setRecords((items) => items.map((item) => item.id === id ? updated : item)); setStatus((value) => value === "noteSaveFailed" ? null : value); return true; } catch { if (mounted.current && noteRevisions.current.get(id) === revision) setStatus("noteSaveFailed"); return false; } };
+  const isError = historyError || status === "pasteFailed" || status === "noteSaveFailed";
+  return <main className="quick-panel" aria-label={text.quickPanel}>
+    <header className="quick-header"><div className="brand-mark"><Clipboard size={17} /></div><div><h1>{text.quickPanel}</h1><p>{text.savedHistory}</p></div><span className="record-count">{records.length}</span></header>
+    <label className="search-field"><Search size={16} /><input value={query} onChange={(event) => setQuery(event.currentTarget.value)} placeholder={text.searchPlaceholder} aria-label={text.searchAria} /></label>
+    <section className="record-list" aria-live="polite">{!loading && filtered.length === 0 ? <div className="empty-state"><div className="empty-icon"><Sparkles size={22} /></div><h2>{records.length === 0 ? text.emptyHistory : text.noMatches}</h2><p>{records.length === 0 ? text.emptyHistoryDetail : text.noMatchesDetail}</p></div> : filtered.map((record, index) => <ClipboardItem key={record.id} record={record} index={index} selected={record.id === selectedId} onSelect={() => setSelectedId(record.id)} onPaste={() => void paste(record.id)} onSaveNote={(note) => saveNote(record.id, note)} text={text} language={language} />)}</section>
+    {(status || historyError) && <div className={`outcome${isError ? " error" : ""}`} role={isError ? "alert" : "status"}>{historyError ? text.historyUnavailable : status ? text[status] : null}</div>}
+    <footer className="quick-footer"><span>{text.enterToPaste}</span><span>{text.escToClose}</span></footer>
+  </main>;
 }
 
-function ClipboardItem({ record, index, selected, onSelect, onPaste, onSaveNote }: {
-  record: SessionRecord;
-  index: number;
-  selected: boolean;
-  onSelect(): void;
-  onPaste(): void;
-  onSaveNote(note: string): Promise<boolean>;
-}) {
-  const [note, setNote] = useState(record.note ?? "");
-  const skipNextBlurSave = useRef(false);
-  const noteRef = useRef(note);
-  const dirty = useRef(false);
-  useEffect(() => {
-    const saved = record.note ?? "";
-    if (!dirty.current || saved === noteRef.current) {
-      noteRef.current = saved;
-      setNote(saved);
-      dirty.current = false;
-    }
-  }, [record.note]);
-  const updateNote = (value: string) => {
-    const limited = limitUnicode(value, 200);
-    noteRef.current = limited;
-    dirty.current = limited !== (record.note ?? "");
-    setNote(limited);
-  };
-  const save = async (value: string) => {
-    const saved = await onSaveNote(value);
-    if (saved && noteRef.current === value) dirty.current = false;
-  };
-  const description = record.text ?? (record.hasImage ? "Image clipboard item" : "Clipboard item");
-  return (
-    <article className={`clipboard-item${selected ? " selected" : ""}`} tabIndex={0} aria-selected={selected} onClick={onSelect} onDoubleClick={onPaste} onKeyDown={(event) => {
-      if (event.key === "Enter") { event.preventDefault(); onPaste(); }
-    }}>
-      <div className="item-index">{index + 1}</div>
-      <div className="item-content">
-        <div className="item-meta"><span>{record.sourceApplication ?? "Unknown app"}</span><time>{formatTime(record.capturedAt)}</time>{record.hasImage && <Image size={13} aria-label="Contains image" />}</div>
-        <p className="item-text">{description}</p>
-        <input className="note-input" value={note} placeholder="Add a note" aria-label={`Note for ${description}`} onClick={(event) => event.stopPropagation()} onDoubleClick={(event) => event.stopPropagation()} onChange={(event) => updateNote(event.currentTarget.value)} onKeyDown={(event) => {
-          event.stopPropagation();
-          if (event.key === "Enter") { event.preventDefault(); skipNextBlurSave.current = true; void save(note); event.currentTarget.blur(); }
-          if (event.key === "Escape") { skipNextBlurSave.current = true; updateNote(record.note ?? ""); event.currentTarget.blur(); }
-        }} onBlur={() => {
-          if (skipNextBlurSave.current) { skipNextBlurSave.current = false; return; }
-          if (note !== (record.note ?? "")) void save(note);
-        }} />
-      </div>
-    </article>
-  );
+function ClipboardItem({ record, index, selected, onSelect, onPaste, onSaveNote, text, language }: { record: SessionRecord; index: number; selected: boolean; onSelect(): void; onPaste(): void; onSaveNote(note: string): Promise<boolean>; text: Dictionary; language: Language }) {
+  const [note, setNote] = useState(record.note ?? ""); const skipBlur = useRef(false); const noteRef = useRef(note); const dirty = useRef(false);
+  useEffect(() => { const saved = record.note ?? ""; if (!dirty.current || saved === noteRef.current) { noteRef.current = saved; setNote(saved); dirty.current = false; } }, [record.note]);
+  const update = (value: string) => { const limited = Array.from(value).slice(0, 200).join(""); noteRef.current = limited; dirty.current = limited !== (record.note ?? ""); setNote(limited); };
+  const save = async (value: string) => { const saved = await onSaveNote(value); if (saved && noteRef.current === value) dirty.current = false; };
+  const description = record.text ?? (record.hasImage ? text.imageItem : text.clipboardItem);
+  return <article className={`clipboard-item${selected ? " selected" : ""}`} tabIndex={0} aria-selected={selected} onClick={onSelect} onDoubleClick={onPaste} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); onPaste(); } }}><div className="item-index">{index + 1}</div><div className="item-content"><div className="item-meta"><span>{record.sourceApplication ?? text.unknownApp}</span><time>{formatTime(record.capturedAt, language, text.now)}</time>{record.hasImage && <Image size={13} aria-label={text.containsImage} />}</div><p className="item-text">{description}</p><input className="note-input" value={note} placeholder={text.addNote} aria-label={text.noteFor(description)} onClick={(event) => event.stopPropagation()} onDoubleClick={(event) => event.stopPropagation()} onChange={(event) => update(event.currentTarget.value)} onKeyDown={(event) => { event.stopPropagation(); if (event.key === "Enter") { event.preventDefault(); skipBlur.current = true; void save(note); event.currentTarget.blur(); } if (event.key === "Escape") { skipBlur.current = true; update(record.note ?? ""); event.currentTarget.blur(); } }} onBlur={() => { if (skipBlur.current) { skipBlur.current = false; return; } if (note !== (record.note ?? "")) void save(note); }} /></div></article>;
 }
 
-function SettingsShell() {
-  return (
-    <main className="settings-shell">
-      <aside className="settings-nav">
-        <div className="settings-brand"><Clipboard size={20} /><strong>Clipboard Assistant</strong></div>
-        <nav aria-label="Settings sections">
-          <a href="#startup" className="active"><MonitorUp size={17} />Startup</a>
-          <a href="#appearance"><Palette size={17} />Appearance & sound</a>
-          <a href="#shortcuts"><Keyboard size={17} />Shortcuts</a>
-        </nav>
-        <div className="nav-version"><Settings2 size={15} />Session-only preview</div>
-      </aside>
-      <section className="settings-content">
-        <header className="settings-heading"><p>Clipboard Assistant</p><h1>Settings</h1></header>
-        <SettingsSection id="startup" icon={<MonitorUp size={18} />} title="Startup">
-          <ToggleRow title="Start at sign-in" detail="Open Clipboard Assistant when Windows starts" checked />
-          <ToggleRow title="Start minimized to tray" detail="Keep the settings window out of the way" checked />
-          <ToggleRow title="Show menu bar icon" detail="Keep quick access available in the system tray" checked />
-        </SettingsSection>
-        <SettingsSection id="appearance" icon={<Palette size={18} />} title="Appearance & sound">
-          <div className="setting-row"><div><strong>Accent color</strong><span>Used for selection and focus states</span></div><div className="swatches" aria-label="Accent color">{["#2563eb", "#00897b", "#d9485f", "#7c3aed", "#ca8a04"].map((color) => <button key={color} style={{ background: color }} aria-label={`Use ${color}`} />)}</div></div>
-          <ToggleRow title="Clipboard sound" detail="Play a short sound after a capture" checked icon={<Volume2 size={16} />} />
-          <div className="setting-row"><div><strong>Custom sound</strong><span>Choose a local audio file for capture feedback</span></div><button className="secondary-button"><Upload size={15} />Choose file</button></div>
-        </SettingsSection>
-        <SettingsSection id="shortcuts" icon={<Command size={18} />} title="Shortcuts">
-          <ShortcutRow title="Show or hide quick panel" keys={["Ctrl", "Shift", "V"]} />
-          <ShortcutRow title="Previous group" keys={["Ctrl", "Alt", "←"]} />
-          <ShortcutRow title="Next group" keys={["Ctrl", "Alt", "→"]} />
-          <ToggleRow title="Quick paste 1–9" detail="Use the configured shortcut plus a number key" icon={<BellRing size={16} />} />
-        </SettingsSection>
-      </section>
-    </main>
-  );
+function SettingsShell({ commands, settings, setSettings, text }: { commands: AppCommands; settings: SettingsState; setSettings(value: SettingsState): void; text: Dictionary }) {
+  const hotkey = settings.hotkeyStatus === "available" ? text.shortcutAvailable : settings.hotkeyStatus === "conflict" ? text.shortcutConflict : text.shortcutUnavailable;
+  return <main className="settings-shell"><aside className="settings-nav"><div className="settings-brand"><Clipboard size={20} /><strong>{text.product}</strong></div><nav aria-label={text.settings}><a href="#general" className="active"><Settings2 size={17} />{text.general}</a><a href="#storage"><Database size={17} />{text.storage}</a><a href="#shortcuts"><Keyboard size={17} />{text.shortcuts}</a></nav></aside><section className="settings-content"><header className="settings-heading"><p>{text.product}</p><h1>{text.settings}</h1></header>
+    <SettingsSection id="general" icon={<Languages size={18} />} title={text.general}><SelectRow title={text.language} detail={text.languageDetail} value={settings.language} onChange={(value) => void commands.updateLanguage(value as Language).then(setSettings)} options={[{ value: "zh_cn", label: text.chinese }, { value: "en", label: text.english }]} /></SettingsSection>
+    <SettingsSection id="storage" icon={<Database size={18} />} title={text.storage}><SelectRow title={text.retention} detail={text.retentionDetail} value={settings.retention} onChange={(value) => void commands.updateRetention(value as RetentionPeriod).then(setSettings)} options={[{ value: "one_day", label: text.oneDay }, { value: "seven_days", label: text.sevenDays }, { value: "thirty_days", label: text.thirtyDays }, { value: "ninety_days", label: text.ninetyDays }, { value: "forever", label: text.forever }]} /><StatusRow title={text.storage} detail={settings.storageAvailable ? text.storageAvailable : text.storageUnavailable} ok={settings.storageAvailable} /></SettingsSection>
+    <SettingsSection id="shortcuts" icon={<Keyboard size={18} />} title={text.shortcuts}><div className="setting-row"><div><strong>{text.togglePanel}</strong><span>{hotkey}</span></div><div className="key-combo" aria-label={hotkey}><kbd>Ctrl</kbd><kbd>Shift</kbd><kbd>V</kbd></div></div></SettingsSection>
+    <SettingsSection id="future" icon={<Palette size={18} />} title={text.appearance}><StatusRow title={text.startup} detail={text.comingSoon} /><StatusRow title={text.sound} detail={text.comingSoon} /></SettingsSection>
+  </section></main>;
 }
-
-function SettingsSection({ id, icon, title, children }: { id: string; icon: React.ReactNode; title: string; children: React.ReactNode }) {
-  return <section className="settings-section" id={id}><h2>{icon}{title}</h2><div className="section-rows">{children}</div></section>;
-}
-
-function ToggleRow({ title, detail, checked = false, icon }: { title: string; detail: string; checked?: boolean; icon?: React.ReactNode }) {
-  return <label className="setting-row"><div>{icon}<span><strong>{title}</strong><span>{detail}</span></span></div><input type="checkbox" defaultChecked={checked} /><i className="toggle" /></label>;
-}
-
-function ShortcutRow({ title, keys }: { title: string; keys: string[] }) {
-  return <div className="setting-row"><div><strong>{title}</strong><span>Click the shortcut to edit</span></div><button className="key-combo">{keys.map((key) => <kbd key={key}>{key}</kbd>)}</button></div>;
-}
-
-function formatTime(value: string) {
-  const date = new Date(value);
-  return Number.isNaN(date.getTime()) ? "Now" : date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-}
-
-function limitUnicode(value: string, max: number) {
-  return Array.from(value).slice(0, max).join("");
-}
+function SettingsSection({ id, icon, title, children }: { id: string; icon: React.ReactNode; title: string; children: React.ReactNode }) { return <section className="settings-section" id={id}><h2>{icon}{title}</h2><div className="section-rows">{children}</div></section>; }
+function SelectRow({ title, detail, value, onChange, options }: { title: string; detail: string; value: string; onChange(value: string): void; options: { value: string; label: string }[] }) { return <label className="setting-row"><div><span><strong>{title}</strong><span>{detail}</span></span></div><select aria-label={title} value={value} onChange={(event) => onChange(event.currentTarget.value)}>{options.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></label>; }
+function StatusRow({ title, detail, ok }: { title: string; detail: string; ok?: boolean }) { return <div className="setting-row"><div><span><strong>{title}</strong><span>{detail}</span></span></div><span className={`status-dot${ok === false ? " unavailable" : ""}`} aria-hidden="true" /></div>; }
+function formatTime(value: string, language: Language, fallback: string) { const date = new Date(value); return Number.isNaN(date.getTime()) ? fallback : date.toLocaleTimeString(language === "zh_cn" ? "zh-CN" : "en-US", { hour: "2-digit", minute: "2-digit" }); }

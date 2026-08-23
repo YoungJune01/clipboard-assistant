@@ -1,6 +1,9 @@
 use std::{
     collections::VecDeque,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use serde::Serialize;
@@ -9,6 +12,7 @@ use crate::domain::{
     CapturedClipboard, ClipboardRecord, ClipboardRepresentation, RecordId, RecordNote,
     RecordNoteError,
 };
+use crate::services::persistence::RecordPersistence;
 
 pub(crate) const MAX_SESSION_RECORDS: usize = 500;
 pub(crate) const TOTAL_SESSION_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
@@ -34,6 +38,8 @@ pub struct SessionRecordView {
 pub struct SessionRecordStore {
     state: Mutex<SessionRecordState>,
     limits: SessionRecordLimits,
+    persistence: Option<Arc<dyn RecordPersistence>>,
+    storage_available: Arc<AtomicBool>,
 }
 
 #[derive(Clone, Copy)]
@@ -73,7 +79,37 @@ impl SessionRecordStore {
                 total_bytes: 0,
             }),
             limits,
+            persistence: None,
+            storage_available: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    pub fn with_persistence(
+        records: Vec<ClipboardRecord>,
+        persistence: Arc<dyn RecordPersistence>,
+        storage_available: Arc<AtomicBool>,
+    ) -> Self {
+        let store = Self {
+            state: Mutex::new(SessionRecordState {
+                records: VecDeque::new(),
+                total_bytes: 0,
+            }),
+            limits: SessionRecordLimits {
+                total_bytes: DEFAULT_STORE_BYTES,
+                record_bytes: DEFAULT_RECORD_BYTES,
+                preview_bytes: DEFAULT_PREVIEW_BYTES,
+            },
+            persistence: Some(persistence),
+            storage_available,
+        };
+        store.replace_loaded(records);
+        store
+    }
+
+    pub fn with_loaded(records: Vec<ClipboardRecord>) -> Self {
+        let store = Self::default();
+        store.replace_loaded(records);
+        store
     }
 
     #[cfg(test)]
@@ -121,18 +157,30 @@ impl SessionRecordStore {
                 .saturating_add(refreshed_bytes);
             state.records[0] = Arc::new(refreshed);
             evict_to_limits(&mut state, self.limits);
-            return CaptureStatus::Refreshed {
+            let persisted = state.records.front().cloned();
+            let status = CaptureStatus::Refreshed {
                 previous: previous_bytes,
                 bytes: refreshed_bytes,
             };
+            drop(state);
+            if let Some(record) = persisted {
+                self.persist_record(&record);
+            }
+            return status;
         }
         let record = ClipboardRecord::from_capture(capture);
         state.total_bytes = state.total_bytes.saturating_add(capture_bytes);
         state.records.push_front(Arc::new(record));
         evict_to_limits(&mut state, self.limits);
-        CaptureStatus::Inserted {
+        let persisted = state.records.front().cloned();
+        let status = CaptureStatus::Inserted {
             bytes: capture_bytes,
+        };
+        drop(state);
+        if let Some(record) = persisted {
+            self.persist_record(&record);
         }
+        status
     }
 
     pub fn list(&self) -> Vec<SessionRecordView> {
@@ -187,12 +235,66 @@ impl SessionRecordStore {
         record.note = note;
         state.total_bytes = state.total_bytes - previous_bytes + updated_bytes;
         evict_to_limits(&mut state, self.limits);
-        state
+        let view = state
             .records
             .iter()
             .find(|record| record.id == id)
             .map(|record| SessionRecordView::from_record(record, self.limits.preview_bytes))
-            .ok_or(SessionRecordError::NotFound)
+            .ok_or(SessionRecordError::NotFound)?;
+        let persisted_note = state
+            .records
+            .iter()
+            .find(|record| record.id == id)
+            .and_then(|record| record.note.clone());
+        drop(state);
+        if let Some(persistence) = &self.persistence
+            && persistence
+                .update_note(id, persisted_note.as_ref())
+                .is_err()
+        {
+            self.storage_available.store(false, Ordering::Release);
+        }
+        Ok(view)
+    }
+
+    pub fn prune_before(&self, cutoff: chrono::DateTime<chrono::Utc>) -> usize {
+        let mut state = lock_unpoisoned(&self.state);
+        let before = state.records.len();
+        state.records.retain(|record| record.captured_at >= cutoff);
+        state.total_bytes = state
+            .records
+            .iter()
+            .map(|record| record_bytes(record))
+            .sum();
+        before.saturating_sub(state.records.len())
+    }
+
+    pub fn storage_available_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.storage_available)
+    }
+
+    fn replace_loaded(&self, records: Vec<ClipboardRecord>) {
+        let mut state = lock_unpoisoned(&self.state);
+        for mut record in records {
+            retain_preferred_image(&mut record.representations);
+            let Some(bytes) = checked_record_bytes(&record) else {
+                continue;
+            };
+            if bytes > self.limits.record_bytes {
+                continue;
+            }
+            state.total_bytes = state.total_bytes.saturating_add(bytes);
+            state.records.push_back(Arc::new(record));
+            evict_to_limits(&mut state, self.limits);
+        }
+    }
+
+    fn persist_record(&self, record: &ClipboardRecord) {
+        if let Some(persistence) = &self.persistence
+            && persistence.save_record(record).is_err()
+        {
+            self.storage_available.store(false, Ordering::Release);
+        }
     }
 
     #[cfg(test)]
@@ -360,9 +462,27 @@ fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use chrono::Utc;
+    use std::sync::atomic::AtomicBool;
 
     use super::*;
     use crate::domain::{ContentIdentity, SourceIdentity};
+    use crate::services::persistence::{PersistenceError, RecordPersistence};
+
+    struct FailingPersistence;
+
+    impl RecordPersistence for FailingPersistence {
+        fn save_record(&self, _record: &ClipboardRecord) -> Result<(), PersistenceError> {
+            Err(PersistenceError::WorkerUnavailable)
+        }
+
+        fn update_note(
+            &self,
+            _id: RecordId,
+            _note: Option<&RecordNote>,
+        ) -> Result<(), PersistenceError> {
+            Err(PersistenceError::WorkerUnavailable)
+        }
+    }
 
     #[test]
     fn store_exposes_only_real_session_captures_and_updates_notes_in_memory() {
@@ -387,6 +507,48 @@ mod tests {
                 .map(RecordNote::as_str),
             Some("work account")
         );
+    }
+
+    #[test]
+    fn persistence_failure_keeps_capture_and_note_available_in_memory() {
+        let available = Arc::new(AtomicBool::new(true));
+        let store = SessionRecordStore::with_persistence(
+            Vec::new(),
+            Arc::new(FailingPersistence),
+            Arc::clone(&available),
+        );
+
+        assert!(store.capture(capture("one", "still available")));
+        let id = store.list()[0].id;
+        assert_eq!(store.list()[0].text.as_deref(), Some("still available"));
+        assert!(!available.load(Ordering::Acquire));
+
+        available.store(true, Ordering::Release);
+        assert!(store.update_note(id, "local draft".to_owned()).is_ok());
+        assert_eq!(
+            store.list()[0].note.as_ref().map(RecordNote::as_str),
+            Some("local draft")
+        );
+        assert!(!available.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn loaded_history_obeys_record_count_and_memory_budgets() {
+        let records = (0..(MAX_SESSION_RECORDS + 20))
+            .map(|index| ClipboardRecord::from_capture(capture(&format!("record-{index}"), "x")))
+            .collect();
+        let store = SessionRecordStore::with_loaded(records);
+
+        let (bytes, count) = store.budget_snapshot();
+        assert_eq!(count, MAX_SESSION_RECORDS);
+        assert!(bytes <= DEFAULT_STORE_BYTES);
+
+        let oversized = ClipboardRecord::from_capture(capture(
+            "oversized",
+            &"x".repeat(MAX_CAPTURE_RECORD_BYTES + 1),
+        ));
+        let store = SessionRecordStore::with_loaded(vec![oversized]);
+        assert!(store.list().is_empty());
     }
 
     #[test]
