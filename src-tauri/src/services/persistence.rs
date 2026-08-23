@@ -22,6 +22,8 @@ use crate::services::session_records::REPRESENTATION_OVERHEAD_BYTES;
 
 const SCHEMA_VERSION: i64 = 2;
 const DATABASE_FILE: &str = "clipboard-history.sqlite3";
+const MIGRATION_TEMP_SUFFIX: &str = ".migrate-v2";
+const MIGRATION_BACKUP_SUFFIX: &str = ".migrate-v1-backup";
 pub(crate) const DATABASE_MAX_RECORDS: usize = 10_000;
 pub(crate) const DATABASE_MAX_PAYLOAD_BYTES: usize = 512 * 1024 * 1024;
 const DATABASE_INCREMENTAL_VACUUM_PAGES: usize = 256;
@@ -62,6 +64,7 @@ pub enum StorageAvailability {
 #[derive(Debug)]
 pub enum PersistenceError {
     CreateDirectory(std::io::Error),
+    FileOperation(std::io::Error),
     Database(rusqlite::Error),
     InvalidData,
     UnsupportedSchema(i64),
@@ -74,6 +77,9 @@ impl fmt::Display for PersistenceError {
         match self {
             Self::CreateDirectory(_) => {
                 formatter.write_str("application data directory is unavailable")
+            }
+            Self::FileOperation(_) => {
+                formatter.write_str("local clipboard storage migration is unavailable")
             }
             Self::Database(_) => formatter.write_str("local clipboard storage is unavailable"),
             Self::InvalidData => {
@@ -93,6 +99,7 @@ impl Error for PersistenceError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::CreateDirectory(error) => Some(error),
+            Self::FileOperation(error) => Some(error),
             Self::Database(error) => Some(error),
             Self::WorkerStart(error) => Some(error),
             Self::InvalidData | Self::UnsupportedSchema(_) | Self::WorkerUnavailable => None,
@@ -419,10 +426,20 @@ impl SqliteRepository {
     }
 
     fn open_with_quota(path: PathBuf, quota: DiskQuota) -> Result<Arc<Self>, PersistenceError> {
-        let connection = Connection::open(&path)?;
+        Self::open_with_quota_and_file_ops(path, quota, &StdMigrationFileOps)
+    }
+
+    fn open_with_quota_and_file_ops(
+        path: PathBuf,
+        quota: DiskQuota,
+        file_ops: &dyn MigrationFileOps,
+    ) -> Result<Arc<Self>, PersistenceError> {
+        recover_interrupted_migration(&path, file_ops)?;
+        migrate_legacy_database(&path, quota, Utc::now(), file_ops)?;
+        let mut connection = Connection::open(&path)?;
         connection.busy_timeout(std::time::Duration::from_secs(2))?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
-        migrate(&connection)?;
+        migrate(&mut connection)?;
         Ok(Arc::new(Self {
             path,
             connection: Mutex::new(connection),
@@ -698,16 +715,308 @@ impl PersistenceBackend for SqliteRepository {
     }
 }
 
-fn migrate(connection: &Connection) -> Result<(), PersistenceError> {
+trait MigrationFileOps {
+    fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()>;
+    fn remove_file(&self, path: &Path) -> std::io::Result<()>;
+}
+
+struct StdMigrationFileOps;
+
+impl MigrationFileOps for StdMigrationFileOps {
+    fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+        fs::rename(from, to)
+    }
+
+    fn remove_file(&self, path: &Path) -> std::io::Result<()> {
+        fs::remove_file(path)
+    }
+}
+
+fn migrate_legacy_database(
+    path: &Path,
+    quota: DiskQuota,
+    now: DateTime<Utc>,
+    file_ops: &dyn MigrationFileOps,
+) -> Result<(), PersistenceError> {
+    if !path.exists() || database_version(path)? != 1 {
+        return Ok(());
+    }
+
+    checkpoint_database(path)?;
+    remove_sqlite_sidecars(path, file_ops)?;
+    let temp_path = migration_path(path, MIGRATION_TEMP_SUFFIX);
+    remove_if_exists(&temp_path, file_ops)?;
+    remove_sqlite_sidecars(&temp_path, file_ops)?;
+
+    let retained_ids = select_legacy_records(path, quota, now)?;
+    build_migrated_database(path, &temp_path, &retained_ids)?;
+    install_migrated_database(path, &temp_path, file_ops)
+}
+
+fn recover_interrupted_migration(
+    path: &Path,
+    file_ops: &dyn MigrationFileOps,
+) -> Result<(), PersistenceError> {
+    let temp_path = migration_path(path, MIGRATION_TEMP_SUFFIX);
+    let backup_path = migration_path(path, MIGRATION_BACKUP_SUFFIX);
+    if backup_path.exists() {
+        let backup_valid = database_is_valid(&backup_path);
+        if path.exists() && database_is_valid(path) {
+            remove_if_exists(&backup_path, file_ops)?;
+        } else if backup_valid {
+            remove_if_exists(path, file_ops)?;
+            remove_sqlite_sidecars(path, file_ops)?;
+            file_ops
+                .rename(&backup_path, path)
+                .map_err(PersistenceError::FileOperation)?;
+        } else {
+            return Err(PersistenceError::InvalidData);
+        }
+    }
+    if temp_path.exists() {
+        if path.exists() {
+            remove_if_exists(&temp_path, file_ops)?;
+        } else if database_is_valid(&temp_path) {
+            file_ops
+                .rename(&temp_path, path)
+                .map_err(PersistenceError::FileOperation)?;
+        } else {
+            return Err(PersistenceError::InvalidData);
+        }
+    }
+    remove_sqlite_sidecars(&temp_path, file_ops)?;
+    remove_sqlite_sidecars(&backup_path, file_ops)?;
+    Ok(())
+}
+
+fn select_legacy_records(
+    path: &Path,
+    quota: DiskQuota,
+    now: DateTime<Utc>,
+) -> Result<Vec<String>, PersistenceError> {
+    let connection = Connection::open(path)?;
+    connection.busy_timeout(StdDuration::from_secs(2))?;
+    let retention = setting(&connection, "retention")?.and_then(|value| parse_retention(&value));
+    let cutoff = retention
+        .and_then(RetentionPeriod::days)
+        .map(|days| (now - Duration::days(days)).to_rfc3339());
+    let mut statement = connection.prepare(
+        "SELECT r.id,
+                COALESCE(length(CAST(r.note AS BLOB)), 0) + COALESCE(SUM(
+                    COALESCE(length(CAST(p.text_value AS BLOB)), 0) +
+                    COALESCE(length(p.blob_value), 0) + ?1
+                ), 0) AS payload_bytes
+         FROM clipboard_records r
+         LEFT JOIN clipboard_representations p ON p.record_id = r.id
+         WHERE (?2 IS NULL OR r.captured_at >= ?2)
+         GROUP BY r.id
+         ORDER BY r.captured_at DESC, r.id DESC",
+    )?;
+    let rows = statement.query_map(
+        params![REPRESENTATION_OVERHEAD_BYTES as i64, cutoff],
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+    )?;
+    let mut retained = Vec::new();
+    let mut retained_bytes = 0_usize;
+    for row in rows {
+        let (id, payload_bytes) = row?;
+        let Ok(payload_bytes) = usize::try_from(payload_bytes) else {
+            continue;
+        };
+        if retained.len() >= quota.max_records {
+            break;
+        }
+        let Some(next_bytes) = retained_bytes.checked_add(payload_bytes) else {
+            break;
+        };
+        if next_bytes > quota.max_payload_bytes {
+            continue;
+        }
+        retained.push(id);
+        retained_bytes = next_bytes;
+    }
+    Ok(retained)
+}
+
+fn build_migrated_database(
+    source_path: &Path,
+    temp_path: &Path,
+    retained_ids: &[String],
+) -> Result<(), PersistenceError> {
+    let source_uri = read_only_database_uri(source_path)?;
+    let mut connection = Connection::open(temp_path)?;
+    connection.busy_timeout(StdDuration::from_secs(2))?;
+    connection.pragma_update(None, "foreign_keys", "ON")?;
+    create_schema(&mut connection)?;
+    connection.execute("ATTACH DATABASE ?1 AS legacy", [source_uri])?;
+    let copy_result = (|| {
+        let transaction = connection.transaction()?;
+        transaction.execute_batch(
+            "CREATE TEMP TABLE retained_migration_ids (
+                 id TEXT PRIMARY KEY NOT NULL
+             );",
+        )?;
+        {
+            let mut insert =
+                transaction.prepare("INSERT INTO retained_migration_ids(id) VALUES (?1)")?;
+            for id in retained_ids {
+                insert.execute([id])?;
+            }
+        }
+        transaction.execute_batch(
+            "INSERT INTO clipboard_records
+             SELECT r.* FROM legacy.clipboard_records r
+             JOIN retained_migration_ids keep ON keep.id = r.id;
+             INSERT INTO clipboard_representations
+             SELECT p.* FROM legacy.clipboard_representations p
+             JOIN retained_migration_ids keep ON keep.id = p.record_id;
+             INSERT INTO app_settings SELECT * FROM legacy.app_settings;",
+        )?;
+        transaction.commit()?;
+        Ok::<(), rusqlite::Error>(())
+    })();
+    connection.execute_batch("DETACH DATABASE legacy;")?;
+    copy_result?;
+    connection.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+    let integrity: String = connection.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
+    if integrity != "ok" || database_version_from_connection(&connection)? != SCHEMA_VERSION {
+        return Err(PersistenceError::InvalidData);
+    }
+    connection
+        .close()
+        .map_err(|(_, error)| PersistenceError::Database(error))?;
+    Ok(())
+}
+
+fn read_only_database_uri(path: &Path) -> Result<String, PersistenceError> {
+    let normalized = path
+        .to_str()
+        .ok_or(PersistenceError::InvalidData)?
+        .replace('\\', "/");
+    let mut encoded = String::with_capacity(normalized.len());
+    for byte in normalized.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b':' | b'-' | b'_' | b'.' | b'~') {
+            encoded.push(char::from(byte));
+        } else {
+            use std::fmt::Write;
+            write!(&mut encoded, "%{byte:02X}").map_err(|_| PersistenceError::InvalidData)?;
+        }
+    }
+    Ok(format!("file:{encoded}?mode=ro"))
+}
+
+fn install_migrated_database(
+    path: &Path,
+    temp_path: &Path,
+    file_ops: &dyn MigrationFileOps,
+) -> Result<(), PersistenceError> {
+    let backup_path = migration_path(path, MIGRATION_BACKUP_SUFFIX);
+    remove_if_exists(&backup_path, file_ops)?;
+    remove_sqlite_sidecars(&backup_path, file_ops)?;
+    file_ops
+        .rename(path, &backup_path)
+        .map_err(PersistenceError::FileOperation)?;
+    if let Err(error) = file_ops.rename(temp_path, path) {
+        let rollback = file_ops.rename(&backup_path, path);
+        return Err(PersistenceError::FileOperation(
+            rollback.err().unwrap_or(error),
+        ));
+    }
+    remove_if_exists(&backup_path, file_ops)?;
+    remove_sqlite_sidecars(path, file_ops)?;
+    Ok(())
+}
+
+fn checkpoint_database(path: &Path) -> Result<(), PersistenceError> {
+    let connection = Connection::open(path)?;
+    connection.busy_timeout(StdDuration::from_secs(2))?;
+    let integrity: String = connection.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
+    if integrity != "ok" {
+        return Err(PersistenceError::InvalidData);
+    }
+    let busy: i64 =
+        connection.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))?;
+    if busy != 0 {
+        return Err(PersistenceError::WorkerUnavailable);
+    }
+    connection
+        .close()
+        .map_err(|(_, error)| PersistenceError::Database(error))?;
+    Ok(())
+}
+
+fn database_version(path: &Path) -> Result<i64, PersistenceError> {
+    let connection = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    database_version_from_connection(&connection)
+}
+
+fn database_version_from_connection(connection: &Connection) -> Result<i64, PersistenceError> {
+    connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .map_err(Into::into)
+}
+
+fn database_is_valid(path: &Path) -> bool {
+    let Ok(connection) =
+        Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+    else {
+        return false;
+    };
+    let integrity = connection.query_row("PRAGMA quick_check", [], |row| row.get::<_, String>(0));
+    let version = database_version_from_connection(&connection);
+    integrity.is_ok_and(|value| value == "ok")
+        && version.is_ok_and(|value| (1..=SCHEMA_VERSION).contains(&value))
+}
+
+fn migration_path(path: &Path, suffix: &str) -> PathBuf {
+    let mut value = path.as_os_str().to_os_string();
+    value.push(suffix);
+    PathBuf::from(value)
+}
+
+fn sqlite_sidecar_path(path: &Path, suffix: &str) -> PathBuf {
+    let mut value = path.as_os_str().to_os_string();
+    value.push(suffix);
+    PathBuf::from(value)
+}
+
+fn remove_sqlite_sidecars(
+    path: &Path,
+    file_ops: &dyn MigrationFileOps,
+) -> Result<(), PersistenceError> {
+    for suffix in ["-wal", "-shm", "-journal"] {
+        remove_if_exists(&sqlite_sidecar_path(path, suffix), file_ops)?;
+    }
+    Ok(())
+}
+
+fn remove_if_exists(path: &Path, file_ops: &dyn MigrationFileOps) -> Result<(), PersistenceError> {
+    if path.exists() {
+        file_ops
+            .remove_file(path)
+            .map_err(PersistenceError::FileOperation)?;
+    }
+    Ok(())
+}
+
+fn migrate(connection: &mut Connection) -> Result<(), PersistenceError> {
     let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if version > SCHEMA_VERSION {
         return Err(PersistenceError::UnsupportedSchema(version));
     }
     if version == 0 {
-        connection.pragma_update(None, "auto_vacuum", "INCREMENTAL")?;
-        connection.execute_batch(
-            "BEGIN IMMEDIATE;
-             CREATE TABLE clipboard_records (
+        create_schema(connection)?;
+    } else if version == 1 {
+        return Err(PersistenceError::UnsupportedSchema(version));
+    }
+    Ok(())
+}
+
+fn create_schema(connection: &mut Connection) -> Result<(), PersistenceError> {
+    connection.pragma_update(None, "auto_vacuum", "INCREMENTAL")?;
+    connection.execute_batch(
+        "BEGIN IMMEDIATE;
+         CREATE TABLE clipboard_records (
                 id TEXT PRIMARY KEY NOT NULL,
                 content_identity TEXT NOT NULL,
                 captured_at TEXT NOT NULL,
@@ -718,32 +1027,24 @@ fn migrate(connection: &Connection) -> Result<(), PersistenceError> {
                 pinned INTEGER NOT NULL DEFAULT 0,
                 favorite INTEGER NOT NULL DEFAULT 0,
                 sensitive INTEGER NOT NULL DEFAULT 0
-             );
-             CREATE INDEX clipboard_records_captured_at
+         );
+         CREATE INDEX clipboard_records_captured_at
                 ON clipboard_records(captured_at DESC);
-             CREATE TABLE clipboard_representations (
+         CREATE TABLE clipboard_representations (
                 record_id TEXT NOT NULL REFERENCES clipboard_records(id) ON DELETE CASCADE,
                 position INTEGER NOT NULL,
                 kind TEXT NOT NULL,
                 text_value TEXT,
                 blob_value BLOB,
                 PRIMARY KEY(record_id, position)
-             );
-             CREATE TABLE app_settings (
+         );
+         CREATE TABLE app_settings (
                 key TEXT PRIMARY KEY NOT NULL,
                 value TEXT NOT NULL
-             );
-             PRAGMA user_version = 2;
-             COMMIT;",
-        )?;
-    } else if version == 1 {
-        let auto_vacuum: i64 = connection.query_row("PRAGMA auto_vacuum", [], |row| row.get(0))?;
-        if auto_vacuum != 2 {
-            connection.pragma_update(None, "auto_vacuum", "INCREMENTAL")?;
-            connection.execute_batch("VACUUM;")?;
-        }
-        connection.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-    }
+         );
+         PRAGMA user_version = 2;
+         COMMIT;",
+    )?;
     Ok(())
 }
 
@@ -1050,7 +1351,7 @@ fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 mod tests {
     use super::*;
     use chrono::TimeZone;
-    use std::sync::atomic::AtomicUsize;
+    use std::{io, sync::atomic::AtomicUsize};
     use tempfile::tempdir;
 
     struct TestBackend {
@@ -1103,6 +1404,27 @@ mod tests {
         }
     }
 
+    struct FailSecondRename {
+        renames: AtomicUsize,
+    }
+
+    impl MigrationFileOps for FailSecondRename {
+        fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+            let call = self.renames.fetch_add(1, Ordering::AcqRel) + 1;
+            if call == 2 {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "injected migration install failure",
+                ));
+            }
+            fs::rename(from, to)
+        }
+
+        fn remove_file(&self, path: &Path) -> io::Result<()> {
+            fs::remove_file(path)
+        }
+    }
+
     fn record(identity: &str, captured_at: DateTime<Utc>) -> ClipboardRecord {
         let mut record = ClipboardRecord::from_capture(crate::domain::CapturedClipboard {
             content_identity: ContentIdentity::new(identity),
@@ -1133,6 +1455,84 @@ mod tests {
                 text: text.to_owned(),
             }],
         })
+    }
+
+    fn create_v1_database(
+        path: &Path,
+        records: &[(String, DateTime<Utc>, usize)],
+        retention: RetentionPeriod,
+    ) {
+        let mut connection = Connection::open(path).unwrap();
+        connection
+            .execute_batch(
+                "PRAGMA journal_mode = DELETE;
+                 CREATE TABLE clipboard_records (
+                    id TEXT PRIMARY KEY NOT NULL,
+                    content_identity TEXT NOT NULL,
+                    captured_at TEXT NOT NULL,
+                    source_application TEXT,
+                    source_path TEXT,
+                    note TEXT,
+                    group_id TEXT,
+                    pinned INTEGER NOT NULL DEFAULT 0,
+                    favorite INTEGER NOT NULL DEFAULT 0,
+                    sensitive INTEGER NOT NULL DEFAULT 0
+                 );
+                 CREATE INDEX clipboard_records_captured_at
+                    ON clipboard_records(captured_at DESC);
+                 CREATE TABLE clipboard_representations (
+                    record_id TEXT NOT NULL REFERENCES clipboard_records(id) ON DELETE CASCADE,
+                    position INTEGER NOT NULL,
+                    kind TEXT NOT NULL,
+                    text_value TEXT,
+                    blob_value BLOB,
+                    PRIMARY KEY(record_id, position)
+                 );
+                 CREATE TABLE app_settings (
+                    key TEXT PRIMARY KEY NOT NULL,
+                    value TEXT NOT NULL
+                 );
+                 PRAGMA user_version = 1;",
+            )
+            .unwrap();
+        let transaction = connection.transaction().unwrap();
+        transaction
+            .execute(
+                "INSERT INTO app_settings(key, value) VALUES ('retention', ?1)",
+                [retention_value(retention)],
+            )
+            .unwrap();
+        for (identity, captured_at, payload_bytes) in records {
+            let id = RecordId::new().as_uuid().to_string();
+            transaction
+                .execute(
+                    "INSERT INTO clipboard_records (
+                        id, content_identity, captured_at, pinned, favorite, sensitive
+                     ) VALUES (?1, ?2, ?3, 0, 0, 0)",
+                    params![id, identity, captured_at.to_rfc3339()],
+                )
+                .unwrap();
+            transaction
+                .execute(
+                    "INSERT INTO clipboard_representations
+                     (record_id, position, kind, blob_value)
+                     VALUES (?1, 0, 'png', zeroblob(?2))",
+                    params![id, *payload_bytes as i64],
+                )
+                .unwrap();
+        }
+        transaction.commit().unwrap();
+        connection.close().unwrap();
+    }
+
+    fn record_count_at(path: &Path) -> usize {
+        let connection = Connection::open(path).unwrap();
+        connection
+            .query_row("SELECT COUNT(*) FROM clipboard_records", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .map(|value| value as usize)
+            .unwrap()
     }
 
     #[test]
@@ -1442,6 +1842,139 @@ mod tests {
 
         assert_eq!(version, SCHEMA_VERSION);
         assert_eq!(mode, 2);
+    }
+
+    #[test]
+    fn version_one_migration_copies_only_records_within_retention_and_capacity() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("history.sqlite3");
+        let now = Utc.with_ymd_and_hms(2026, 8, 23, 12, 0, 0).unwrap();
+        create_v1_database(
+            &path,
+            &[
+                ("expired".to_owned(), now - Duration::days(8), 128 * 1024),
+                ("old".to_owned(), now - Duration::hours(3), 128 * 1024),
+                ("new".to_owned(), now - Duration::hours(2), 128 * 1024),
+                ("newest".to_owned(), now - Duration::hours(1), 128 * 1024),
+            ],
+            RetentionPeriod::SevenDays,
+        );
+        let quota = DiskQuota {
+            max_records: 2,
+            max_payload_bytes: 2 * (128 * 1024 + REPRESENTATION_OVERHEAD_BYTES),
+            incremental_vacuum_pages: 1,
+        };
+
+        migrate_legacy_database(&path, quota, now, &StdMigrationFileOps).unwrap();
+        let repository = SqliteRepository::open_with_quota(path, quota).unwrap();
+        let records = repository.load_recent(10).unwrap();
+
+        assert_eq!(repository.schema_version().unwrap(), SCHEMA_VERSION);
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].content_identity.as_str(), "newest");
+        assert_eq!(records[1].content_identity.as_str(), "new");
+        assert_eq!(
+            repository.load_settings().unwrap().retention,
+            RetentionPeriod::SevenDays
+        );
+    }
+
+    #[test]
+    fn version_one_migration_physically_reclaims_space_after_quota_selection() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("history.sqlite3");
+        let now = Utc.with_ymd_and_hms(2026, 8, 23, 12, 0, 0).unwrap();
+        let records = (0..8)
+            .map(|index| {
+                (
+                    format!("record-{index}"),
+                    now + Duration::seconds(index),
+                    192 * 1024,
+                )
+            })
+            .collect::<Vec<_>>();
+        create_v1_database(&path, &records, RetentionPeriod::Forever);
+        let before = fs::metadata(&path).unwrap().len();
+        let quota = DiskQuota {
+            max_records: 1,
+            max_payload_bytes: 192 * 1024 + REPRESENTATION_OVERHEAD_BYTES,
+            incremental_vacuum_pages: 1,
+        };
+
+        migrate_legacy_database(&path, quota, now, &StdMigrationFileOps).unwrap();
+        let after = fs::metadata(&path).unwrap().len();
+
+        assert_eq!(database_version(&path).unwrap(), SCHEMA_VERSION);
+        assert_eq!(record_count_at(&path), 1);
+        assert!(after * 3 < before, "before={before}, after={after}");
+    }
+
+    #[test]
+    fn failed_version_one_install_restores_the_original_and_retries_cleanly() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("history.sqlite3");
+        let now = Utc.with_ymd_and_hms(2026, 8, 23, 12, 0, 0).unwrap();
+        create_v1_database(
+            &path,
+            &[
+                ("old".to_owned(), now, 64 * 1024),
+                ("new".to_owned(), now + Duration::seconds(1), 64 * 1024),
+            ],
+            RetentionPeriod::Forever,
+        );
+        let quota = DiskQuota {
+            max_records: 1,
+            max_payload_bytes: 64 * 1024 + REPRESENTATION_OVERHEAD_BYTES,
+            incremental_vacuum_pages: 1,
+        };
+        let failing_ops = FailSecondRename {
+            renames: AtomicUsize::new(0),
+        };
+
+        assert!(migrate_legacy_database(&path, quota, now, &failing_ops).is_err());
+        assert_eq!(database_version(&path).unwrap(), 1);
+        assert_eq!(record_count_at(&path), 2);
+        assert!(database_is_valid(&path));
+        assert!(!migration_path(&path, MIGRATION_BACKUP_SUFFIX).exists());
+
+        let repository = SqliteRepository::open_with_quota(path.clone(), quota).unwrap();
+        assert_eq!(repository.schema_version().unwrap(), SCHEMA_VERSION);
+        assert_eq!(repository.load_recent(10).unwrap().len(), 1);
+        assert!(!migration_path(&path, MIGRATION_TEMP_SUFFIX).exists());
+        assert!(!migration_path(&path, MIGRATION_BACKUP_SUFFIX).exists());
+    }
+
+    #[test]
+    fn startup_recovers_a_crash_between_migration_renames() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("history.sqlite3");
+        let backup_path = migration_path(&path, MIGRATION_BACKUP_SUFFIX);
+        let temp_path = migration_path(&path, MIGRATION_TEMP_SUFFIX);
+        let now = Utc.with_ymd_and_hms(2026, 8, 23, 12, 0, 0).unwrap();
+        create_v1_database(
+            &path,
+            &[
+                ("old".to_owned(), now, 64 * 1024),
+                ("new".to_owned(), now + Duration::seconds(1), 64 * 1024),
+            ],
+            RetentionPeriod::Forever,
+        );
+        let quota = DiskQuota {
+            max_records: 1,
+            max_payload_bytes: 64 * 1024 + REPRESENTATION_OVERHEAD_BYTES,
+            incremental_vacuum_pages: 1,
+        };
+        let retained = select_legacy_records(&path, quota, now).unwrap();
+        build_migrated_database(&path, &temp_path, &retained).unwrap();
+        fs::rename(&path, &backup_path).unwrap();
+
+        let repository = SqliteRepository::open_with_quota(path.clone(), quota).unwrap();
+
+        assert_eq!(repository.schema_version().unwrap(), SCHEMA_VERSION);
+        assert_eq!(repository.load_recent(10).unwrap().len(), 1);
+        assert!(database_is_valid(&path));
+        assert!(!temp_path.exists());
+        assert!(!backup_path.exists());
     }
 
     #[test]
