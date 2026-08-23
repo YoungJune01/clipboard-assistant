@@ -26,6 +26,9 @@ use windows::{
     core::PCWSTR,
 };
 
+#[cfg(windows)]
+use std::{marker::PhantomData, rc::Rc};
+
 use crate::domain::{
     ClipboardRecord, ClipboardRepresentation, ContentIdentity, GroupId, Language, RecordId,
     RecordNote, RetentionPeriod, SourceIdentity, UserSettings,
@@ -775,7 +778,7 @@ trait MigrationFileOps {
     fn remove_file(&self, path: &Path) -> std::io::Result<()>;
 }
 
-trait MigrationLockGuard: Send {}
+trait MigrationLockGuard {}
 
 trait MigrationLockProvider: Send + Sync {
     fn acquire(
@@ -821,10 +824,10 @@ fn migration_lock_identity(path: &Path) -> u64 {
 }
 
 #[cfg(windows)]
-struct WindowsMigrationLockGuard(windows::Win32::Foundation::HANDLE);
-
-#[cfg(windows)]
-unsafe impl Send for WindowsMigrationLockGuard {}
+struct WindowsMigrationLockGuard {
+    handle: windows::Win32::Foundation::HANDLE,
+    thread_affinity: PhantomData<Rc<()>>,
+}
 
 #[cfg(windows)]
 impl MigrationLockGuard for WindowsMigrationLockGuard {}
@@ -833,8 +836,8 @@ impl MigrationLockGuard for WindowsMigrationLockGuard {}
 impl Drop for WindowsMigrationLockGuard {
     fn drop(&mut self) {
         unsafe {
-            let _ = ReleaseMutex(self.0);
-            let _ = CloseHandle(self.0);
+            let _ = ReleaseMutex(self.handle);
+            let _ = CloseHandle(self.handle);
         }
     }
 }
@@ -858,7 +861,10 @@ impl MigrationLockProvider for StdMigrationLockProvider {
             .map_err(|_| PersistenceError::MigrationLockUnavailable)?;
         let timeout_millis = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX - 1);
         match unsafe { WaitForSingleObject(handle, timeout_millis) } {
-            WAIT_OBJECT_0 | WAIT_ABANDONED => Ok(Box::new(WindowsMigrationLockGuard(handle))),
+            WAIT_OBJECT_0 | WAIT_ABANDONED => Ok(Box::new(WindowsMigrationLockGuard {
+                handle,
+                thread_affinity: PhantomData,
+            })),
             WAIT_TIMEOUT => {
                 let _ = unsafe { CloseHandle(handle) };
                 Err(PersistenceError::MigrationLockTimeout)
@@ -1583,11 +1589,16 @@ fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 mod tests {
     use super::*;
     use chrono::TimeZone;
+    #[cfg(windows)]
+    use static_assertions::assert_not_impl_any;
     use std::{
         io,
         sync::{Barrier, atomic::AtomicUsize},
     };
     use tempfile::tempdir;
+
+    #[cfg(windows)]
+    assert_not_impl_any!(WindowsMigrationLockGuard: Send, Sync);
 
     struct TestBackend {
         writes: AtomicUsize,
@@ -2344,13 +2355,13 @@ mod tests {
             .unwrap();
         let competing_path = path.clone();
         let competing = thread::spawn(move || {
-            StdMigrationLockProvider.acquire(&competing_path, StdDuration::from_millis(50))
+            matches!(
+                StdMigrationLockProvider.acquire(&competing_path, StdDuration::from_millis(50)),
+                Err(PersistenceError::MigrationLockTimeout)
+            )
         });
 
-        assert!(matches!(
-            competing.join().unwrap(),
-            Err(PersistenceError::MigrationLockTimeout)
-        ));
+        assert!(competing.join().unwrap());
         drop(held);
         assert!(
             StdMigrationLockProvider
