@@ -11,8 +11,20 @@ use std::{
     time::Duration as StdDuration,
 };
 
+#[cfg(not(windows))]
+use std::{collections::HashSet, sync::Condvar, time::Instant};
+
 use chrono::{DateTime, Duration, Utc};
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+
+#[cfg(windows)]
+use windows::{
+    Win32::{
+        Foundation::{CloseHandle, WAIT_ABANDONED, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT},
+        System::Threading::{CreateMutexW, ReleaseMutex, WaitForSingleObject},
+    },
+    core::PCWSTR,
+};
 
 use crate::domain::{
     ClipboardRecord, ClipboardRepresentation, ContentIdentity, GroupId, Language, RecordId,
@@ -30,6 +42,8 @@ const DATABASE_INCREMENTAL_VACUUM_PAGES: usize = 256;
 const WORK_QUEUE_CAPACITY: usize = 64;
 const WORKER_TIMEOUT: StdDuration = StdDuration::from_secs(2);
 const CONTROL_POLL_INTERVAL: StdDuration = StdDuration::from_millis(25);
+const MIGRATION_LOCK_TIMEOUT: StdDuration = StdDuration::from_secs(10);
+const MIGRATION_MUTEX_PREFIX: &str = "Local\\ClipboardAssistant.StorageMigration.";
 
 #[derive(Clone, Copy)]
 pub(crate) struct RestoreBudget {
@@ -68,6 +82,8 @@ pub enum PersistenceError {
     Database(rusqlite::Error),
     InvalidData,
     UnsupportedSchema(i64),
+    MigrationLockUnavailable,
+    MigrationLockTimeout,
     WorkerUnavailable,
     WorkerStart(std::io::Error),
 }
@@ -88,6 +104,9 @@ impl fmt::Display for PersistenceError {
             Self::UnsupportedSchema(_) => {
                 formatter.write_str("local clipboard storage schema is unsupported")
             }
+            Self::MigrationLockUnavailable | Self::MigrationLockTimeout => {
+                formatter.write_str("local clipboard storage migration is unavailable")
+            }
             Self::WorkerUnavailable | Self::WorkerStart(_) => {
                 formatter.write_str("local clipboard storage is unavailable")
             }
@@ -102,7 +121,11 @@ impl Error for PersistenceError {
             Self::FileOperation(error) => Some(error),
             Self::Database(error) => Some(error),
             Self::WorkerStart(error) => Some(error),
-            Self::InvalidData | Self::UnsupportedSchema(_) | Self::WorkerUnavailable => None,
+            Self::InvalidData
+            | Self::UnsupportedSchema(_)
+            | Self::MigrationLockUnavailable
+            | Self::MigrationLockTimeout
+            | Self::WorkerUnavailable => None,
         }
     }
 }
@@ -413,6 +436,7 @@ pub struct SqliteRepository {
     path: PathBuf,
     connection: Mutex<Connection>,
     quota: DiskQuota,
+    migration_locks: Arc<dyn MigrationLockProvider>,
 }
 
 impl SqliteRepository {
@@ -434,16 +458,35 @@ impl SqliteRepository {
         quota: DiskQuota,
         file_ops: &dyn MigrationFileOps,
     ) -> Result<Arc<Self>, PersistenceError> {
+        Self::open_with_dependencies(
+            path,
+            quota,
+            file_ops,
+            Arc::new(StdMigrationLockProvider),
+            &NoopMigrationHooks,
+        )
+    }
+
+    fn open_with_dependencies(
+        path: PathBuf,
+        quota: DiskQuota,
+        file_ops: &dyn MigrationFileOps,
+        migration_locks: Arc<dyn MigrationLockProvider>,
+        hooks: &dyn MigrationHooks,
+    ) -> Result<Arc<Self>, PersistenceError> {
+        let migration_guard = migration_locks.acquire(&path, MIGRATION_LOCK_TIMEOUT)?;
         recover_interrupted_migration(&path, file_ops)?;
-        migrate_legacy_database(&path, quota, Utc::now(), file_ops)?;
+        migrate_legacy_database_with_hooks(&path, quota, Utc::now(), file_ops, hooks)?;
         let mut connection = Connection::open(&path)?;
         connection.busy_timeout(std::time::Duration::from_secs(2))?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
         migrate(&mut connection)?;
+        drop(migration_guard);
         Ok(Arc::new(Self {
             path,
             connection: Mutex::new(connection),
             quota,
+            migration_locks,
         }))
     }
 
@@ -472,6 +515,9 @@ impl SqliteRepository {
     }
 
     pub fn save_settings(&self, settings: UserSettings) -> Result<(), PersistenceError> {
+        let _migration_guard = self
+            .migration_locks
+            .acquire(&self.path, MIGRATION_LOCK_TIMEOUT)?;
         let mut connection = lock_unpoisoned(&self.connection);
         let transaction = connection.transaction()?;
         save_setting(&transaction, "language", language_value(settings.language))?;
@@ -489,6 +535,9 @@ impl SqliteRepository {
         retention: RetentionPeriod,
         now: DateTime<Utc>,
     ) -> Result<usize, PersistenceError> {
+        let _migration_guard = self
+            .migration_locks
+            .acquire(&self.path, MIGRATION_LOCK_TIMEOUT)?;
         let mut connection = lock_unpoisoned(&self.connection);
         let transaction = connection.transaction()?;
         let before = record_count(&transaction)?;
@@ -573,6 +622,9 @@ impl SqliteRepository {
     }
 
     fn save_record_inner(&self, record: &ClipboardRecord) -> Result<(), PersistenceError> {
+        let _migration_guard = self
+            .migration_locks
+            .acquire(&self.path, MIGRATION_LOCK_TIMEOUT)?;
         let mut connection = lock_unpoisoned(&self.connection);
         let transaction = connection.transaction()?;
         write_record(&transaction, record)?;
@@ -668,6 +720,9 @@ impl RecordPersistence for SqliteRepository {
     }
 
     fn update_note(&self, id: RecordId, note: Option<&RecordNote>) -> Result<(), PersistenceError> {
+        let _migration_guard = self
+            .migration_locks
+            .acquire(&self.path, MIGRATION_LOCK_TIMEOUT)?;
         let mut connection = lock_unpoisoned(&self.connection);
         let transaction = connection.transaction()?;
         let changed = transaction.execute(
@@ -720,6 +775,161 @@ trait MigrationFileOps {
     fn remove_file(&self, path: &Path) -> std::io::Result<()>;
 }
 
+trait MigrationLockGuard: Send {}
+
+trait MigrationLockProvider: Send + Sync {
+    fn acquire(
+        &self,
+        path: &Path,
+        timeout: StdDuration,
+    ) -> Result<Box<dyn MigrationLockGuard>, PersistenceError>;
+}
+
+struct StdMigrationLockProvider;
+
+fn migration_lock_identity(path: &Path) -> u64 {
+    let absolute = fs::canonicalize(path)
+        .or_else(|_| {
+            let file_name = path.file_name().ok_or(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "database path has no file name",
+            ))?;
+            let parent = path.parent().unwrap_or_else(|| Path::new("."));
+            fs::canonicalize(parent).map(|parent| parent.join(file_name))
+        })
+        .unwrap_or_else(|_| {
+            if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                std::env::current_dir()
+                    .unwrap_or_else(|_| PathBuf::from("."))
+                    .join(path)
+            }
+        });
+    let normalized = absolute.to_string_lossy().replace('/', "\\");
+    let normalized = if cfg!(windows) {
+        normalized.to_lowercase()
+    } else {
+        normalized
+    };
+    normalized
+        .as_bytes()
+        .iter()
+        .fold(0xcbf29ce484222325_u64, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+        })
+}
+
+#[cfg(windows)]
+struct WindowsMigrationLockGuard(windows::Win32::Foundation::HANDLE);
+
+#[cfg(windows)]
+unsafe impl Send for WindowsMigrationLockGuard {}
+
+#[cfg(windows)]
+impl MigrationLockGuard for WindowsMigrationLockGuard {}
+
+#[cfg(windows)]
+impl Drop for WindowsMigrationLockGuard {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = ReleaseMutex(self.0);
+            let _ = CloseHandle(self.0);
+        }
+    }
+}
+
+#[cfg(windows)]
+impl MigrationLockProvider for StdMigrationLockProvider {
+    fn acquire(
+        &self,
+        path: &Path,
+        timeout: StdDuration,
+    ) -> Result<Box<dyn MigrationLockGuard>, PersistenceError> {
+        let name = format!(
+            "{MIGRATION_MUTEX_PREFIX}{:016x}",
+            migration_lock_identity(path)
+        );
+        let wide_name = name
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let handle = unsafe { CreateMutexW(None, false, PCWSTR(wide_name.as_ptr())) }
+            .map_err(|_| PersistenceError::MigrationLockUnavailable)?;
+        let timeout_millis = u32::try_from(timeout.as_millis()).unwrap_or(u32::MAX - 1);
+        match unsafe { WaitForSingleObject(handle, timeout_millis) } {
+            WAIT_OBJECT_0 | WAIT_ABANDONED => Ok(Box::new(WindowsMigrationLockGuard(handle))),
+            WAIT_TIMEOUT => {
+                let _ = unsafe { CloseHandle(handle) };
+                Err(PersistenceError::MigrationLockTimeout)
+            }
+            WAIT_FAILED => {
+                let _ = unsafe { CloseHandle(handle) };
+                Err(PersistenceError::MigrationLockUnavailable)
+            }
+            _ => {
+                let _ = unsafe { CloseHandle(handle) };
+                Err(PersistenceError::MigrationLockUnavailable)
+            }
+        }
+    }
+}
+
+#[cfg(not(windows))]
+static PROCESS_MIGRATION_LOCKS: LazyLock<(Mutex<HashSet<u64>>, Condvar)> =
+    LazyLock::new(|| (Mutex::new(HashSet::new()), Condvar::new()));
+
+#[cfg(not(windows))]
+struct ProcessMigrationLockGuard(u64);
+
+#[cfg(not(windows))]
+impl MigrationLockGuard for ProcessMigrationLockGuard {}
+
+#[cfg(not(windows))]
+impl Drop for ProcessMigrationLockGuard {
+    fn drop(&mut self) {
+        let (locks, available) = &*PROCESS_MIGRATION_LOCKS;
+        lock_unpoisoned(locks).remove(&self.0);
+        available.notify_all();
+    }
+}
+
+#[cfg(not(windows))]
+impl MigrationLockProvider for StdMigrationLockProvider {
+    fn acquire(
+        &self,
+        path: &Path,
+        timeout: StdDuration,
+    ) -> Result<Box<dyn MigrationLockGuard>, PersistenceError> {
+        let identity = migration_lock_identity(path);
+        let deadline = Instant::now() + timeout;
+        let (locks, available) = &*PROCESS_MIGRATION_LOCKS;
+        let mut held = lock_unpoisoned(locks);
+        while held.contains(&identity) {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                return Err(PersistenceError::MigrationLockTimeout);
+            };
+            let (next, wait) = available
+                .wait_timeout(held, remaining)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            held = next;
+            if wait.timed_out() && held.contains(&identity) {
+                return Err(PersistenceError::MigrationLockTimeout);
+            }
+        }
+        held.insert(identity);
+        Ok(Box::new(ProcessMigrationLockGuard(identity)))
+    }
+}
+
+trait MigrationHooks {
+    fn after_selection(&self) {}
+}
+
+struct NoopMigrationHooks;
+
+impl MigrationHooks for NoopMigrationHooks {}
+
 struct StdMigrationFileOps;
 
 impl MigrationFileOps for StdMigrationFileOps {
@@ -732,24 +942,33 @@ impl MigrationFileOps for StdMigrationFileOps {
     }
 }
 
+#[cfg(test)]
 fn migrate_legacy_database(
     path: &Path,
     quota: DiskQuota,
     now: DateTime<Utc>,
     file_ops: &dyn MigrationFileOps,
 ) -> Result<(), PersistenceError> {
+    migrate_legacy_database_with_hooks(path, quota, now, file_ops, &NoopMigrationHooks)
+}
+
+fn migrate_legacy_database_with_hooks(
+    path: &Path,
+    quota: DiskQuota,
+    now: DateTime<Utc>,
+    file_ops: &dyn MigrationFileOps,
+    hooks: &dyn MigrationHooks,
+) -> Result<(), PersistenceError> {
     if !path.exists() || database_version(path)? != 1 {
         return Ok(());
     }
 
     checkpoint_database(path)?;
-    remove_sqlite_sidecars(path, file_ops)?;
     let temp_path = migration_path(path, MIGRATION_TEMP_SUFFIX);
     remove_if_exists(&temp_path, file_ops)?;
     remove_sqlite_sidecars(&temp_path, file_ops)?;
 
-    let retained_ids = select_legacy_records(path, quota, now)?;
-    build_migrated_database(path, &temp_path, &retained_ids)?;
+    build_migrated_database(path, &temp_path, quota, now, hooks)?;
     install_migrated_database(path, &temp_path, file_ops)
 }
 
@@ -790,15 +1009,15 @@ fn recover_interrupted_migration(
 }
 
 fn select_legacy_records(
-    path: &Path,
+    connection: &Connection,
     quota: DiskQuota,
     now: DateTime<Utc>,
-) -> Result<Vec<String>, PersistenceError> {
-    let connection = Connection::open(path)?;
-    connection.busy_timeout(StdDuration::from_secs(2))?;
-    let retention = setting(&connection, "retention")?.and_then(|value| parse_retention(&value));
+) -> Result<(Vec<String>, RetentionPeriod), PersistenceError> {
+    let retention = setting(connection, "retention")?
+        .and_then(|value| parse_retention(&value))
+        .unwrap_or_default();
     let cutoff = retention
-        .and_then(RetentionPeriod::days)
+        .days()
         .map(|days| (now - Duration::days(days)).to_rfc3339());
     let mut statement = connection.prepare(
         "SELECT r.id,
@@ -835,22 +1054,34 @@ fn select_legacy_records(
         retained.push(id);
         retained_bytes = next_bytes;
     }
-    Ok(retained)
+    Ok((retained, retention))
 }
 
 fn build_migrated_database(
     source_path: &Path,
     temp_path: &Path,
-    retained_ids: &[String],
+    quota: DiskQuota,
+    now: DateTime<Utc>,
+    hooks: &dyn MigrationHooks,
 ) -> Result<(), PersistenceError> {
-    let source_uri = read_only_database_uri(source_path)?;
-    let mut connection = Connection::open(temp_path)?;
-    connection.busy_timeout(StdDuration::from_secs(2))?;
-    connection.pragma_update(None, "foreign_keys", "ON")?;
-    create_schema(&mut connection)?;
-    connection.execute("ATTACH DATABASE ?1 AS legacy", [source_uri])?;
+    {
+        let mut temp_connection = Connection::open(temp_path)?;
+        temp_connection.busy_timeout(StdDuration::from_secs(2))?;
+        temp_connection.pragma_update(None, "foreign_keys", "ON")?;
+        create_schema(&mut temp_connection)?;
+        temp_connection
+            .close()
+            .map_err(|(_, error)| PersistenceError::Database(error))?;
+    }
+
+    let mut source = Connection::open(source_path)?;
+    source.busy_timeout(StdDuration::from_secs(2))?;
+    let temp_path_value = temp_path.to_str().ok_or(PersistenceError::InvalidData)?;
+    source.execute("ATTACH DATABASE ?1 AS migrated", [temp_path_value])?;
     let copy_result = (|| {
-        let transaction = connection.transaction()?;
+        let transaction = source.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (retained_ids, retention) = select_legacy_records(&transaction, quota, now)?;
+        hooks.after_selection();
         transaction.execute_batch(
             "CREATE TEMP TABLE retained_migration_ids (
                  id TEXT PRIMARY KEY NOT NULL
@@ -859,24 +1090,38 @@ fn build_migrated_database(
         {
             let mut insert =
                 transaction.prepare("INSERT INTO retained_migration_ids(id) VALUES (?1)")?;
-            for id in retained_ids {
+            for id in &retained_ids {
                 insert.execute([id])?;
             }
         }
         transaction.execute_batch(
-            "INSERT INTO clipboard_records
-             SELECT r.* FROM legacy.clipboard_records r
+            "INSERT INTO migrated.clipboard_records
+             SELECT r.* FROM main.clipboard_records r
              JOIN retained_migration_ids keep ON keep.id = r.id;
-             INSERT INTO clipboard_representations
-             SELECT p.* FROM legacy.clipboard_representations p
+             INSERT INTO migrated.clipboard_representations
+             SELECT p.* FROM main.clipboard_representations p
              JOIN retained_migration_ids keep ON keep.id = p.record_id;
-             INSERT INTO app_settings SELECT * FROM legacy.app_settings;",
+             INSERT INTO migrated.app_settings SELECT * FROM main.app_settings;",
+        )?;
+        transaction.execute(
+            "INSERT INTO migrated.app_settings(key, value) VALUES ('retention', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [retention_value(retention)],
         )?;
         transaction.commit()?;
-        Ok::<(), rusqlite::Error>(())
+        Ok::<(), PersistenceError>(())
     })();
-    connection.execute_batch("DETACH DATABASE legacy;")?;
+    source.execute_batch("DETACH DATABASE migrated;")?;
     copy_result?;
+    let busy: i64 = source.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))?;
+    if busy != 0 {
+        return Err(PersistenceError::WorkerUnavailable);
+    }
+    source
+        .close()
+        .map_err(|(_, error)| PersistenceError::Database(error))?;
+
+    let connection = Connection::open(temp_path)?;
     connection.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
     let integrity: String = connection.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
     if integrity != "ok" || database_version_from_connection(&connection)? != SCHEMA_VERSION {
@@ -886,23 +1131,6 @@ fn build_migrated_database(
         .close()
         .map_err(|(_, error)| PersistenceError::Database(error))?;
     Ok(())
-}
-
-fn read_only_database_uri(path: &Path) -> Result<String, PersistenceError> {
-    let normalized = path
-        .to_str()
-        .ok_or(PersistenceError::InvalidData)?
-        .replace('\\', "/");
-    let mut encoded = String::with_capacity(normalized.len());
-    for byte in normalized.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b':' | b'-' | b'_' | b'.' | b'~') {
-            encoded.push(char::from(byte));
-        } else {
-            use std::fmt::Write;
-            write!(&mut encoded, "%{byte:02X}").map_err(|_| PersistenceError::InvalidData)?;
-        }
-    }
-    Ok(format!("file:{encoded}?mode=ro"))
 }
 
 fn install_migrated_database(
@@ -916,6 +1144,10 @@ fn install_migrated_database(
     file_ops
         .rename(path, &backup_path)
         .map_err(PersistenceError::FileOperation)?;
+    if let Err(error) = remove_sqlite_sidecars(path, file_ops) {
+        let _ = file_ops.rename(&backup_path, path);
+        return Err(error);
+    }
     if let Err(error) = file_ops.rename(temp_path, path) {
         let rollback = file_ops.rename(&backup_path, path);
         return Err(PersistenceError::FileOperation(
@@ -1351,7 +1583,10 @@ fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 mod tests {
     use super::*;
     use chrono::TimeZone;
-    use std::{io, sync::atomic::AtomicUsize};
+    use std::{
+        io,
+        sync::{Barrier, atomic::AtomicUsize},
+    };
     use tempfile::tempdir;
 
     struct TestBackend {
@@ -1408,6 +1643,18 @@ mod tests {
         renames: AtomicUsize,
     }
 
+    struct BlockingMigrationHooks {
+        selected: Arc<Barrier>,
+        resume: Arc<Barrier>,
+    }
+
+    impl MigrationHooks for BlockingMigrationHooks {
+        fn after_selection(&self) {
+            self.selected.wait();
+            self.resume.wait();
+        }
+    }
+
     impl MigrationFileOps for FailSecondRename {
         fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
             let call = self.renames.fetch_add(1, Ordering::AcqRel) + 1;
@@ -1462,6 +1709,14 @@ mod tests {
         records: &[(String, DateTime<Utc>, usize)],
         retention: RetentionPeriod,
     ) {
+        create_v1_database_with_retention(path, records, Some(retention_value(retention)));
+    }
+
+    fn create_v1_database_with_retention(
+        path: &Path,
+        records: &[(String, DateTime<Utc>, usize)],
+        retention: Option<&str>,
+    ) {
         let mut connection = Connection::open(path).unwrap();
         connection
             .execute_batch(
@@ -1496,12 +1751,14 @@ mod tests {
             )
             .unwrap();
         let transaction = connection.transaction().unwrap();
-        transaction
-            .execute(
-                "INSERT INTO app_settings(key, value) VALUES ('retention', ?1)",
-                [retention_value(retention)],
-            )
-            .unwrap();
+        if let Some(retention) = retention {
+            transaction
+                .execute(
+                    "INSERT INTO app_settings(key, value) VALUES ('retention', ?1)",
+                    [retention],
+                )
+                .unwrap();
+        }
         for (identity, captured_at, payload_bytes) in records {
             let id = RecordId::new().as_uuid().to_string();
             transaction
@@ -1523,6 +1780,31 @@ mod tests {
         }
         transaction.commit().unwrap();
         connection.close().unwrap();
+    }
+
+    fn insert_v1_record(
+        connection: &Connection,
+        identity: &str,
+        captured_at: DateTime<Utc>,
+        payload_bytes: usize,
+    ) {
+        let id = RecordId::new().as_uuid().to_string();
+        connection
+            .execute(
+                "INSERT INTO clipboard_records (
+                    id, content_identity, captured_at, pinned, favorite, sensitive
+                 ) VALUES (?1, ?2, ?3, 0, 0, 0)",
+                params![id, identity, captured_at.to_rfc3339()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO clipboard_representations
+                 (record_id, position, kind, blob_value)
+                 VALUES (?1, 0, 'png', zeroblob(?2))",
+                params![id, payload_bytes as i64],
+            )
+            .unwrap();
     }
 
     fn record_count_at(path: &Path) -> usize {
@@ -1880,6 +2162,226 @@ mod tests {
     }
 
     #[test]
+    fn missing_or_invalid_legacy_retention_defaults_to_thirty_days_before_copy() {
+        let now = Utc.with_ymd_and_hms(2026, 8, 23, 12, 0, 0).unwrap();
+        for retention in [None, Some("invalid-retention")] {
+            let directory = tempdir().unwrap();
+            let path = directory.path().join("history.sqlite3");
+            create_v1_database_with_retention(
+                &path,
+                &[
+                    ("expired".to_owned(), now - Duration::days(31), 1024),
+                    ("retained".to_owned(), now - Duration::days(29), 1024),
+                ],
+                retention,
+            );
+
+            migrate_legacy_database(&path, DiskQuota::default(), now, &StdMigrationFileOps)
+                .unwrap();
+            let repository = SqliteRepository::open(path).unwrap();
+            let records = repository.load_recent(10).unwrap();
+
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].content_identity.as_str(), "retained");
+            assert_eq!(
+                repository.load_settings().unwrap().retention,
+                RetentionPeriod::ThirtyDays
+            );
+        }
+    }
+
+    #[test]
+    fn wal_record_committed_before_migration_lock_is_preserved() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("history.sqlite3");
+        let now = Utc.with_ymd_and_hms(2026, 8, 23, 12, 0, 0).unwrap();
+        create_v1_database(
+            &path,
+            &[("original".to_owned(), now, 1024)],
+            RetentionPeriod::Forever,
+        );
+        let writer = Connection::open(&path).unwrap();
+        writer.pragma_update(None, "journal_mode", "WAL").unwrap();
+        insert_v1_record(&writer, "wal-record", now + Duration::seconds(1), 1024);
+        drop(writer);
+
+        let repository = SqliteRepository::open(path).unwrap();
+        let identities = repository
+            .load_recent(10)
+            .unwrap()
+            .into_iter()
+            .map(|record| record.content_identity.as_str().to_owned())
+            .collect::<Vec<_>>();
+
+        assert_eq!(identities, vec!["wal-record", "original"]);
+    }
+
+    #[test]
+    fn migration_lock_serializes_an_independent_writer_after_selection() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("history.sqlite3");
+        let now = Utc.with_ymd_and_hms(2026, 8, 23, 12, 0, 0).unwrap();
+        create_v1_database(
+            &path,
+            &[("original".to_owned(), now, 1024)],
+            RetentionPeriod::Forever,
+        );
+        let selected = Arc::new(Barrier::new(2));
+        let resume = Arc::new(Barrier::new(2));
+        let hooks = BlockingMigrationHooks {
+            selected: Arc::clone(&selected),
+            resume: Arc::clone(&resume),
+        };
+        let migration_path = path.clone();
+        let migration = thread::spawn(move || {
+            SqliteRepository::open_with_dependencies(
+                migration_path,
+                DiskQuota::default(),
+                &StdMigrationFileOps,
+                Arc::new(StdMigrationLockProvider),
+                &hooks,
+            )
+        });
+        selected.wait();
+
+        let writer_path = path.clone();
+        let (attempted_tx, attempted_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let writer = thread::spawn(move || {
+            attempted_tx.send(()).unwrap();
+            let _guard = StdMigrationLockProvider
+                .acquire(&writer_path, StdDuration::from_secs(5))
+                .unwrap();
+            let connection = Connection::open(writer_path).unwrap();
+            connection.busy_timeout(StdDuration::from_secs(5)).unwrap();
+            insert_v1_record(
+                &connection,
+                "after-migration",
+                now + Duration::seconds(1),
+                1024,
+            );
+            finished_tx.send(()).unwrap();
+        });
+        attempted_rx
+            .recv_timeout(StdDuration::from_secs(1))
+            .unwrap();
+        assert!(
+            finished_rx
+                .recv_timeout(StdDuration::from_millis(100))
+                .is_err()
+        );
+
+        resume.wait();
+        migration.join().unwrap().unwrap();
+        writer.join().unwrap();
+        finished_rx.recv_timeout(StdDuration::from_secs(1)).unwrap();
+        assert_eq!(database_version(&path).unwrap(), SCHEMA_VERSION);
+        assert_eq!(record_count_at(&path), 2);
+    }
+
+    #[test]
+    fn same_path_openers_serialize_while_different_paths_do_not_block() {
+        let first_directory = tempdir().unwrap();
+        let second_directory = tempdir().unwrap();
+        let first_path = first_directory.path().join("history.sqlite3");
+        let second_path = second_directory.path().join("history.sqlite3");
+        let now = Utc.with_ymd_and_hms(2026, 8, 23, 12, 0, 0).unwrap();
+        create_v1_database(
+            &first_path,
+            &[("first".to_owned(), now, 1024)],
+            RetentionPeriod::Forever,
+        );
+        create_v1_database(
+            &second_path,
+            &[("second".to_owned(), now, 1024)],
+            RetentionPeriod::Forever,
+        );
+        assert_ne!(
+            migration_lock_identity(&first_path),
+            migration_lock_identity(&second_path)
+        );
+        let selected = Arc::new(Barrier::new(2));
+        let resume = Arc::new(Barrier::new(2));
+        let hooks = BlockingMigrationHooks {
+            selected: Arc::clone(&selected),
+            resume: Arc::clone(&resume),
+        };
+        let first_for_thread = first_path.clone();
+        let first = thread::spawn(move || {
+            SqliteRepository::open_with_dependencies(
+                first_for_thread,
+                DiskQuota::default(),
+                &StdMigrationFileOps,
+                Arc::new(StdMigrationLockProvider),
+                &hooks,
+            )
+        });
+        selected.wait();
+
+        let same_path = first_path.clone();
+        let (same_tx, same_rx) = mpsc::channel();
+        let competing = thread::spawn(move || {
+            let result = SqliteRepository::open(same_path);
+            same_tx.send(result.is_ok()).unwrap();
+        });
+        assert!(same_rx.recv_timeout(StdDuration::from_millis(100)).is_err());
+
+        let different = SqliteRepository::open(second_path).unwrap();
+        assert_eq!(different.schema_version().unwrap(), SCHEMA_VERSION);
+
+        resume.wait();
+        assert!(first.join().unwrap().is_ok());
+        competing.join().unwrap();
+        assert!(same_rx.recv_timeout(StdDuration::from_secs(1)).unwrap());
+    }
+
+    #[test]
+    fn migration_lock_times_out_then_can_be_reacquired_after_release() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("history.sqlite3");
+        let held = StdMigrationLockProvider
+            .acquire(&path, StdDuration::from_secs(1))
+            .unwrap();
+        let competing_path = path.clone();
+        let competing = thread::spawn(move || {
+            StdMigrationLockProvider.acquire(&competing_path, StdDuration::from_millis(50))
+        });
+
+        assert!(matches!(
+            competing.join().unwrap(),
+            Err(PersistenceError::MigrationLockTimeout)
+        ));
+        drop(held);
+        assert!(
+            StdMigrationLockProvider
+                .acquire(&path, StdDuration::from_secs(1))
+                .is_ok()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn abandoned_windows_migration_mutex_is_safely_acquired() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("history.sqlite3");
+        let abandoned_path = path.clone();
+        thread::spawn(move || {
+            let guard = StdMigrationLockProvider
+                .acquire(&abandoned_path, StdDuration::from_secs(1))
+                .unwrap();
+            std::mem::forget(guard);
+        })
+        .join()
+        .unwrap();
+
+        assert!(
+            StdMigrationLockProvider
+                .acquire(&path, StdDuration::from_secs(1))
+                .is_ok()
+        );
+    }
+
+    #[test]
     fn version_one_migration_physically_reclaims_space_after_quota_selection() {
         let directory = tempdir().unwrap();
         let path = directory.path().join("history.sqlite3");
@@ -1964,8 +2466,7 @@ mod tests {
             max_payload_bytes: 64 * 1024 + REPRESENTATION_OVERHEAD_BYTES,
             incremental_vacuum_pages: 1,
         };
-        let retained = select_legacy_records(&path, quota, now).unwrap();
-        build_migrated_database(&path, &temp_path, &retained).unwrap();
+        build_migrated_database(&path, &temp_path, quota, now, &NoopMigrationHooks).unwrap();
         fs::rename(&path, &backup_path).unwrap();
 
         let repository = SqliteRepository::open_with_quota(path.clone(), quota).unwrap();
