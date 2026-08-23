@@ -1,7 +1,11 @@
 use std::{
     error::Error,
     fmt,
-    sync::mpsc::{self, RecvTimeoutError},
+    sync::{
+        Arc, LazyLock,
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, RecvTimeoutError},
+    },
     thread::{self, JoinHandle},
     time::Duration,
 };
@@ -22,6 +26,19 @@ use windows::Win32::{
 const HOTKEY_ID: i32 = 0x4341;
 const READY_TIMEOUT: Duration = Duration::from_secs(2);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+
+static HOTKEY_REAPER: LazyLock<mpsc::Sender<JoinHandle<()>>> = LazyLock::new(|| {
+    let (sender, receiver) = mpsc::channel::<JoinHandle<()>>();
+    thread::Builder::new()
+        .name("global-hotkey-reaper".to_owned())
+        .spawn(move || {
+            while let Ok(thread) = receiver.recv() {
+                let _ = thread.join();
+            }
+        })
+        .expect("global hotkey reaper must start");
+    sender
+});
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HotkeyAvailability {
@@ -78,10 +95,17 @@ impl GlobalHotkey {
         let (thread_id_sender, thread_id_receiver) = mpsc::sync_channel(1);
         let (ready_sender, ready_receiver) = mpsc::sync_channel(1);
         let (done_sender, done) = mpsc::sync_channel(1);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let thread_cancelled = Arc::clone(&cancelled);
         let thread = thread::Builder::new()
             .name("global-hotkey".to_owned())
             .spawn(move || {
-                let result = run_hotkey_loop(on_pressed, &thread_id_sender, &ready_sender);
+                let result = run_hotkey_loop(
+                    on_pressed,
+                    &thread_id_sender,
+                    &ready_sender,
+                    &thread_cancelled,
+                );
                 if result.is_err() {
                     let _ = ready_sender.send(result);
                 }
@@ -91,7 +115,7 @@ impl GlobalHotkey {
         let thread_id = match thread_id_receiver.recv_timeout(READY_TIMEOUT) {
             Ok(thread_id) => thread_id,
             Err(_) => {
-                bounded_cleanup(0, thread, &done);
+                bounded_cleanup(0, thread, &done, &cancelled);
                 return Err(HotkeyError::InitializationTimeout);
             }
         };
@@ -102,15 +126,15 @@ impl GlobalHotkey {
                 done,
             }),
             Ok(Err(error)) => {
-                bounded_cleanup(thread_id, thread, &done);
+                bounded_cleanup(thread_id, thread, &done, &cancelled);
                 Err(error)
             }
             Err(RecvTimeoutError::Timeout) => {
-                bounded_cleanup(thread_id, thread, &done);
+                bounded_cleanup(thread_id, thread, &done, &cancelled);
                 Err(HotkeyError::InitializationTimeout)
             }
             Err(RecvTimeoutError::Disconnected) => {
-                bounded_cleanup(thread_id, thread, &done);
+                bounded_cleanup(thread_id, thread, &done, &cancelled);
                 Err(HotkeyError::UnexpectedThreadExit)
             }
         }
@@ -132,6 +156,8 @@ impl GlobalHotkey {
         let _ = unsafe { PostThreadMessageW(thread_id, WM_QUIT, WPARAM(0), LPARAM(0)) };
         if self.done.recv_timeout(SHUTDOWN_TIMEOUT).is_ok() {
             let _ = thread.join();
+        } else {
+            let _ = HOTKEY_REAPER.send(thread);
         }
     }
 }
@@ -146,6 +172,7 @@ fn run_hotkey_loop(
     on_pressed: impl Fn(),
     thread_id_sender: &mpsc::SyncSender<u32>,
     ready: &mpsc::SyncSender<Result<(), HotkeyError>>,
+    cancelled: &AtomicBool,
 ) -> Result<(), HotkeyError> {
     let thread_id = unsafe { GetCurrentThreadId() };
     let mut pending = MSG::default();
@@ -155,14 +182,33 @@ fn run_hotkey_loop(
     if thread_id_sender.send(thread_id).is_err() {
         return Ok(());
     }
+    if !registration_allowed(cancelled) {
+        return Ok(());
+    }
     let modifiers = MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT;
-    if let Err(error) = unsafe { RegisterHotKey(None, HOTKEY_ID, modifiers, VK_V.0 as u32) } {
-        let error = if unsafe { GetLastError() } == ERROR_HOTKEY_ALREADY_REGISTERED {
-            HotkeyError::Conflict
-        } else {
-            HotkeyError::Windows(error)
-        };
-        let _ = ready.send(Err(error));
+    let registered = register_with_cancellation(
+        cancelled,
+        || {
+            unsafe { RegisterHotKey(None, HOTKEY_ID, modifiers, VK_V.0 as u32) }.map_err(|error| {
+                if unsafe { GetLastError() } == ERROR_HOTKEY_ALREADY_REGISTERED {
+                    HotkeyError::Conflict
+                } else {
+                    HotkeyError::Windows(error)
+                }
+            })
+        },
+        || {
+            let _ = unsafe { UnregisterHotKey(None, HOTKEY_ID) };
+        },
+    );
+    let registered = match registered {
+        Ok(registered) => registered,
+        Err(error) => {
+            let _ = ready.send(Err(error));
+            return Ok(());
+        }
+    };
+    if !registered {
         return Ok(());
     }
     if ready.send(Ok(())).is_err() {
@@ -192,13 +238,41 @@ fn is_activation_message(message: &MSG) -> bool {
     message.message == WM_HOTKEY && message.wParam.0 == HOTKEY_ID as usize
 }
 
-fn bounded_cleanup(thread_id: u32, thread: JoinHandle<()>, done: &mpsc::Receiver<()>) {
+fn bounded_cleanup(
+    thread_id: u32,
+    thread: JoinHandle<()>,
+    done: &mpsc::Receiver<()>,
+    cancelled: &AtomicBool,
+) {
+    cancelled.store(true, Ordering::Release);
     if thread_id != 0 {
         let _ = unsafe { PostThreadMessageW(thread_id, WM_QUIT, WPARAM(0), LPARAM(0)) };
     }
     if done.recv_timeout(SHUTDOWN_TIMEOUT).is_ok() {
         let _ = thread.join();
+    } else {
+        let _ = HOTKEY_REAPER.send(thread);
     }
+}
+
+fn registration_allowed(cancelled: &AtomicBool) -> bool {
+    !cancelled.load(Ordering::Acquire)
+}
+
+fn register_with_cancellation(
+    cancelled: &AtomicBool,
+    register: impl FnOnce() -> Result<(), HotkeyError>,
+    unregister: impl FnOnce(),
+) -> Result<bool, HotkeyError> {
+    if !registration_allowed(cancelled) {
+        return Ok(false);
+    }
+    register()?;
+    if !registration_allowed(cancelled) {
+        unregister();
+        return Ok(false);
+    }
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -245,6 +319,26 @@ mod tests {
 
         assert!(source.contains("let Some(thread) = self.thread.take() else"));
         assert!(source.contains("std::mem::take(&mut self.thread_id)"));
+    }
+
+    #[test]
+    fn initialization_timeout_cancellation_blocks_late_registration() {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancelled_during_registration = Arc::clone(&cancelled);
+        let unregistered = AtomicBool::new(false);
+
+        let registered = register_with_cancellation(
+            &cancelled,
+            move || {
+                cancelled_during_registration.store(true, Ordering::Release);
+                Ok(())
+            },
+            || unregistered.store(true, Ordering::Release),
+        )
+        .unwrap();
+
+        assert!(!registered);
+        assert!(unregistered.load(Ordering::Acquire));
     }
 
     #[test]

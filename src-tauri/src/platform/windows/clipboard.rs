@@ -3,6 +3,7 @@ use std::{
     error::Error,
     fmt,
     mem::size_of,
+    path::Path,
     ptr,
     sync::{
         Arc, Condvar, Mutex,
@@ -16,7 +17,7 @@ use std::{
 use chrono::Utc;
 use windows::Win32::{
     Foundation::{
-        CloseHandle, ERROR_SUCCESS, GetLastError, GlobalFree, HANDLE, HGLOBAL, SetLastError,
+        CloseHandle, ERROR_SUCCESS, GetLastError, GlobalFree, HANDLE, HGLOBAL, HWND, SetLastError,
     },
     System::{
         DataExchange::{
@@ -24,10 +25,14 @@ use windows::Win32::{
             IsClipboardFormatAvailable, OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
         },
         Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock},
-        Threading::{CreateEventW, SetEvent},
+        Threading::{
+            CreateEventW, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+            QueryFullProcessImageNameW, SetEvent,
+        },
     },
+    UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId},
 };
-use windows::core::{PCWSTR, w};
+use windows::core::{PCWSTR, PWSTR, w};
 
 use crate::domain::{CapturedClipboard, ClipboardRepresentation, ContentIdentity, SourceIdentity};
 use crate::services::session_records::{
@@ -779,6 +784,80 @@ fn combine_shutdown_result(
 }
 
 pub(super) fn capture_update(state: &ListenerState) {
+    capture_update_with_source(state, &Win32ForegroundSourceApi);
+}
+
+trait ForegroundSourceApi {
+    fn foreground_window(&self) -> Option<HWND>;
+    fn process_id(&self, window: HWND) -> Option<u32>;
+    fn executable_path(&self, process_id: u32) -> Option<String>;
+}
+
+struct Win32ForegroundSourceApi;
+
+impl ForegroundSourceApi for Win32ForegroundSourceApi {
+    fn foreground_window(&self) -> Option<HWND> {
+        let window = unsafe { GetForegroundWindow() };
+        (!window.0.is_null()).then_some(window)
+    }
+
+    fn process_id(&self, window: HWND) -> Option<u32> {
+        let mut process_id = 0;
+        let thread_id = unsafe { GetWindowThreadProcessId(window, Some(&mut process_id)) };
+        (thread_id != 0 && process_id != 0).then_some(process_id)
+    }
+
+    fn executable_path(&self, process_id: u32) -> Option<String> {
+        let process =
+            unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, process_id).ok()? };
+        let process = SourceProcessHandle(process);
+        let mut buffer = vec![0_u16; 32_768];
+        let mut length = buffer.len() as u32;
+        unsafe {
+            QueryFullProcessImageNameW(
+                process.0,
+                Default::default(),
+                PWSTR(buffer.as_mut_ptr()),
+                &mut length,
+            )
+        }
+        .ok()?;
+        String::from_utf16(&buffer[..length as usize]).ok()
+    }
+}
+
+struct SourceProcessHandle(HANDLE);
+
+impl Drop for SourceProcessHandle {
+    fn drop(&mut self) {
+        if !self.0.is_invalid() {
+            let _ = unsafe { CloseHandle(self.0) };
+        }
+    }
+}
+
+fn capture_source(api: &impl ForegroundSourceApi) -> SourceIdentity {
+    let Some(path) = api
+        .foreground_window()
+        .and_then(|window| api.process_id(window))
+        .and_then(|process_id| api.executable_path(process_id))
+        .filter(|path| !path.is_empty())
+    else {
+        return SourceIdentity::default();
+    };
+    let application_name = Path::new(&path)
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned);
+    SourceIdentity {
+        application_name,
+        executable_path: Some(path),
+    }
+}
+
+fn capture_update_with_source(state: &ListenerState, source_api: &impl ForegroundSourceApi) {
+    let source = capture_source(source_api);
     let Ok((sequence_number, representations)) = read_supported_representations() else {
         return;
     };
@@ -788,7 +867,7 @@ pub(super) fn capture_update(state: &ListenerState) {
     let captured = CapturedClipboard {
         content_identity: ContentIdentity::new(format!("clipboard-sequence:{sequence_number}")),
         captured_at: Utc::now(),
-        source: SourceIdentity::default(),
+        source,
         representations,
     };
     route_event(
@@ -1977,8 +2056,8 @@ mod tests {
         ClipboardReadError, ClipboardWriteError, EventSender, LatestClipboardEventReceiver,
         MAX_CAPTURE_PAYLOAD_BYTES, MAX_IMAGE_PAYLOAD_BYTES, ProductWriteGuard, ProductWriteState,
         ReadyWait, ShutdownFailure, begin_product_write_transaction,
-        begin_product_write_transaction_with_spawner, classify_format_read, classify_global_unlock,
-        classify_registered_format, clipboard_event_channel_with_limits,
+        begin_product_write_transaction_with_spawner, capture_source, classify_format_read,
+        classify_global_unlock, classify_registered_format, clipboard_event_channel_with_limits,
         combine_clipboard_operation_and_close, decode_unicode_text, finish_product_write,
         latest_clipboard_event_channel, orchestrate_listener_initialization,
         read_bounded_representations, representation_bytes, route_event, validate_representations,
@@ -1987,6 +2066,57 @@ mod tests {
         CapturedClipboard, ClipboardRepresentation, ContentIdentity, SourceIdentity,
     };
     use crate::services::session_records::SessionRecordStore;
+    use windows::Win32::Foundation::HWND;
+
+    struct FakeSourceApi {
+        window: Option<HWND>,
+        process_id: Option<u32>,
+        path: Option<String>,
+    }
+
+    impl super::ForegroundSourceApi for FakeSourceApi {
+        fn foreground_window(&self) -> Option<HWND> {
+            self.window
+        }
+
+        fn process_id(&self, _window: HWND) -> Option<u32> {
+            self.process_id
+        }
+
+        fn executable_path(&self, _process_id: u32) -> Option<String> {
+            self.path.clone()
+        }
+    }
+
+    #[test]
+    fn foreground_source_keeps_path_and_derives_displayable_application_name() {
+        let source = capture_source(&FakeSourceApi {
+            window: Some(HWND(std::ptr::dangling_mut())),
+            process_id: Some(42),
+            path: Some(r"C:\Program Files\Editor\editor.exe".to_owned()),
+        });
+
+        assert_eq!(source.application_name.as_deref(), Some("editor"));
+        assert_eq!(
+            source.executable_path.as_deref(),
+            Some(r"C:\Program Files\Editor\editor.exe")
+        );
+    }
+
+    #[test]
+    fn foreground_source_failure_is_an_empty_non_sensitive_fallback() {
+        let source = capture_source(&FakeSourceApi {
+            window: None,
+            process_id: None,
+            path: None,
+        });
+
+        assert_eq!(source, SourceIdentity::default());
+        assert_eq!(
+            format!("{source:?}"),
+            "SourceIdentity { has_application_name: false, has_executable_path: false }"
+        );
+    }
 
     #[test]
     fn finishing_owned_write_replays_interleaved_external_event() {

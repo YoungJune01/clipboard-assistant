@@ -244,6 +244,7 @@ describe("window routing", () => {
     expect(api.updateLanguage).toHaveBeenCalledWith("en");
     expect(await screen.findByRole("heading", { name: "Settings" })).toBeInTheDocument();
     await waitFor(() => expect(api.setWindowTitle).toHaveBeenLastCalledWith("Clipboard Assistant"));
+    expect(document.documentElement.lang).toBe("en");
 
     await user.selectOptions(screen.getByLabelText("Keep history for"), "forever");
     expect(api.updateRetention).toHaveBeenCalledWith("forever");
@@ -258,9 +259,20 @@ describe("window routing", () => {
     });
     render(<ClipboardAssistantApp windowLabel="quick-panel" commands={api} />);
     expect(await screen.findByLabelText("快速剪贴板")).toBeInTheDocument();
+    expect(document.documentElement.lang).toBe("zh-CN");
 
     update!({ language: "en", retention: "thirty_days", storageAvailable: true, hotkeyStatus: "available" });
 
     expect(await screen.findByLabelText("Quick clipboard")).toBeInTheDocument();
+    expect(document.documentElement.lang).toBe("en");
+  });
+
+  it("renders coming-soon settings as planned rather than available", async () => {
+    render(<ClipboardAssistantApp windowLabel="settings" commands={commands([])} />);
+
+    const planned = await screen.findAllByRole("img", { name: "即将支持" });
+    expect(planned).toHaveLength(2);
+    expect(planned.every((item) => item.classList.contains("planned"))).toBe(true);
+    expect(planned.every((item) => !item.classList.contains("available"))).toBe(true);
   });
 });

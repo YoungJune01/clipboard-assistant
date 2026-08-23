@@ -57,6 +57,7 @@ button { color: inherit; }
 .setting-row select:focus { border-color: rgba(37,99,235,.5); box-shadow: 0 0 0 3px rgba(37,99,235,.1); }
 .status-dot { flex: 0 0 auto; width: 9px; height: 9px; border-radius: 50%; background: #15946f; box-shadow: 0 0 0 4px rgba(21,148,111,.1); }
 .status-dot.unavailable { background: #d9485f; box-shadow: 0 0 0 4px rgba(217,72,95,.1); }
+.status-dot.planned { background: #7d8794; box-shadow: 0 0 0 4px rgba(125,135,148,.12); }
 .setting-row input[type=checkbox] { position: absolute; opacity: 0; }
 .toggle { flex: 0 0 auto; width: 34px; height: 19px; padding: 2px; border-radius: 999px; background: #b6c0cd; transition: background .15s; }
 .toggle::after { content: ""; display: block; width: 15px; height: 15px; border-radius: 50%; background: #fff; box-shadow: 0 1px 3px rgba(0,0,0,.2); transition: transform .15s; }

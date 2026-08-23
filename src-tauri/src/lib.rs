@@ -43,6 +43,8 @@ struct ClipboardRuntime {
     listener: std::sync::Mutex<Option<platform::windows::clipboard::ClipboardListener>>,
     event_drain_stop: std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>>,
     event_drain: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
+    retention_stop: std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    retention: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 #[cfg(windows)]
@@ -117,7 +119,7 @@ impl ApplicationSettings {
         self.view()
     }
 
-    fn prune_expired(&self) {
+    fn prune_expired(&self) -> usize {
         let retention = lock_unpoisoned(&self.current).retention;
         let now = chrono::Utc::now();
         if let Some(persistence) = &self.persistence
@@ -125,10 +127,10 @@ impl ApplicationSettings {
         {
             self.storage_available.store(false, Ordering::Release);
         }
-        if let Some(days) = retention.days() {
+        retention.days().map_or(0, |days| {
             self.records
-                .prune_before(now - chrono::Duration::days(days));
-        }
+                .prune_before(now - chrono::Duration::days(days))
+        })
     }
 
     fn persist_settings(&self) {
@@ -175,7 +177,42 @@ impl Drop for ClipboardRuntime {
         if let Some(drain) = drain {
             let _ = drain.join();
         }
+        if let Some(stop) = self
+            .retention_stop
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            let _ = stop.send(());
+        }
+        if let Some(retention) = self
+            .retention
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            let _ = retention.join();
+        }
     }
+}
+
+#[cfg(windows)]
+fn spawn_periodic_retention(
+    interval: std::time::Duration,
+    on_tick: impl Fn() + Send + 'static,
+) -> std::io::Result<(std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>)> {
+    let (stop, stopped) = std::sync::mpsc::channel();
+    let thread = std::thread::Builder::new()
+        .name("clipboard-retention".to_owned())
+        .spawn(move || {
+            loop {
+                match stopped.recv_timeout(interval) {
+                    Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => on_tick(),
+                }
+            }
+        })?;
+    Ok((stop, thread))
 }
 
 #[cfg(windows)]
@@ -203,7 +240,9 @@ fn spawn_clipboard_event_drain(
 
 #[cfg(all(test, windows))]
 mod runtime_tests {
-    use super::{ApplicationSettings, HotkeyStatus, spawn_clipboard_event_drain};
+    use super::{
+        ApplicationSettings, HotkeyStatus, spawn_clipboard_event_drain, spawn_periodic_retention,
+    };
     use crate::{
         domain::{
             CapturedClipboard, ClipboardRepresentation, ContentIdentity, RetentionPeriod,
@@ -316,6 +355,62 @@ mod runtime_tests {
         assert_eq!(records.list().len(), 1);
         assert_eq!(repository.load_recent(10).unwrap().len(), 1);
         assert!(storage_available.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn periodic_retention_runs_while_idle_and_stops_promptly() {
+        let (ticks, observed) = std::sync::mpsc::channel();
+        let (stop, thread) =
+            spawn_periodic_retention(std::time::Duration::from_millis(10), move || {
+                let _ = ticks.send(());
+            })
+            .unwrap();
+
+        observed
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        stop.send(()).unwrap();
+        thread.join().unwrap();
+    }
+
+    #[test]
+    fn periodic_retention_prunes_expired_memory_without_clipboard_activity() {
+        let records = Arc::new(SessionRecordStore::default());
+        assert!(records.capture(CapturedClipboard {
+            content_identity: ContentIdentity::new("idle-expired"),
+            captured_at: Utc::now() - Duration::days(2),
+            source: SourceIdentity::default(),
+            representations: vec![ClipboardRepresentation::UnicodeText {
+                text: "expired".to_owned(),
+            }],
+        }));
+        let settings = Arc::new(ApplicationSettings {
+            current: Mutex::new(UserSettings {
+                retention: RetentionPeriod::OneDay,
+                ..UserSettings::default()
+            }),
+            persistence: None,
+            records: Arc::clone(&records),
+            storage_available: Arc::new(AtomicBool::new(false)),
+            hotkey_status: Mutex::new(HotkeyStatus::Unavailable),
+        });
+        let (pruned, observed) = std::sync::mpsc::channel();
+        let settings_for_tick = Arc::clone(&settings);
+        let (stop, thread) =
+            spawn_periodic_retention(std::time::Duration::from_millis(10), move || {
+                let _ = pruned.send(settings_for_tick.prune_expired());
+            })
+            .unwrap();
+
+        assert_eq!(
+            observed
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap(),
+            1
+        );
+        stop.send(()).unwrap();
+        thread.join().unwrap();
+        assert!(records.list().is_empty());
     }
 }
 
@@ -493,6 +588,16 @@ pub fn run() {
                     let _ = app_handle.emit("clipboard-records-changed", ());
                     let _ = app_handle.emit("settings-changed", settings_for_drain.view());
                 })?;
+            let retention_app = app.handle().clone();
+            let settings_for_retention = Arc::clone(&settings_state);
+            let (retention_stop, retention) =
+                spawn_periodic_retention(std::time::Duration::from_secs(60 * 60), move || {
+                    let removed = settings_for_retention.prune_expired();
+                    if removed > 0 {
+                        let _ = retention_app.emit("clipboard-records-changed", ());
+                    }
+                    let _ = retention_app.emit("settings-changed", settings_for_retention.view());
+                })?;
             let paste = SafePasteService::new(
                 platform::windows::paste::Win32PasteTarget::new(),
                 listener.publisher(),
@@ -527,6 +632,8 @@ pub fn run() {
                 listener: std::sync::Mutex::new(Some(listener)),
                 event_drain_stop: std::sync::Mutex::new(Some(event_drain_stop)),
                 event_drain: std::sync::Mutex::new(Some(event_drain)),
+                retention_stop: std::sync::Mutex::new(Some(retention_stop)),
+                retention: std::sync::Mutex::new(Some(retention)),
             });
             Ok(())
         })

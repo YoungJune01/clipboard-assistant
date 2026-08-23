@@ -3,9 +3,9 @@ use std::{
     fmt, fs,
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-        mpsc::{self, Receiver, SyncSender, TrySendError},
+        Arc, LazyLock, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        mpsc::{self, Receiver, Sender, SyncSender},
     },
     thread::{self, JoinHandle},
     time::Duration as StdDuration,
@@ -23,6 +23,7 @@ const SCHEMA_VERSION: i64 = 1;
 const DATABASE_FILE: &str = "clipboard-history.sqlite3";
 const WORK_QUEUE_CAPACITY: usize = 64;
 const WORKER_TIMEOUT: StdDuration = StdDuration::from_secs(2);
+const CONTROL_POLL_INTERVAL: StdDuration = StdDuration::from_millis(25);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StorageAvailability {
@@ -98,36 +99,78 @@ enum PersistenceCommand {
         DateTime<Utc>,
         mpsc::SyncSender<Result<usize, PersistenceError>>,
     ),
-    Shutdown,
+}
+
+enum PersistenceControl {
+    FlushAndShutdown {
+        accepted: usize,
+        flushed: Sender<()>,
+    },
 }
 
 pub struct PersistenceWorker {
     sender: Mutex<Option<SyncSender<PersistenceCommand>>>,
-    done: Mutex<Receiver<()>>,
+    control: Sender<PersistenceControl>,
     thread: Mutex<Option<JoinHandle<()>>>,
     storage_available: Arc<AtomicBool>,
+    accepted: AtomicUsize,
+    response_timeout: StdDuration,
 }
+
+trait PersistenceBackend: Send + Sync {
+    fn persist_record(&self, record: &ClipboardRecord) -> Result<(), PersistenceError>;
+    fn persist_note(&self, id: RecordId, note: Option<&RecordNote>)
+    -> Result<(), PersistenceError>;
+    fn persist_settings(&self, settings: UserSettings) -> Result<(), PersistenceError>;
+    fn prune_records(
+        &self,
+        retention: RetentionPeriod,
+        now: DateTime<Utc>,
+    ) -> Result<usize, PersistenceError>;
+}
+
+static THREAD_REAPER: LazyLock<Sender<JoinHandle<()>>> = LazyLock::new(|| {
+    let (sender, receiver) = mpsc::channel::<JoinHandle<()>>();
+    thread::Builder::new()
+        .name("clipboard-thread-reaper".to_owned())
+        .spawn(move || {
+            while let Ok(thread) = receiver.recv() {
+                let _ = thread.join();
+            }
+        })
+        .expect("clipboard thread reaper must start");
+    sender
+});
 
 impl PersistenceWorker {
     pub fn start(
         repository: Arc<SqliteRepository>,
         storage_available: Arc<AtomicBool>,
     ) -> Result<Arc<Self>, PersistenceError> {
+        Self::start_backend(repository, storage_available, WORKER_TIMEOUT)
+    }
+
+    fn start_backend(
+        repository: Arc<dyn PersistenceBackend>,
+        storage_available: Arc<AtomicBool>,
+        response_timeout: StdDuration,
+    ) -> Result<Arc<Self>, PersistenceError> {
         let (sender, receiver) = mpsc::sync_channel(WORK_QUEUE_CAPACITY);
-        let (done_sender, done) = mpsc::sync_channel(1);
+        let (control, controls) = mpsc::channel();
         let availability = Arc::clone(&storage_available);
         let thread = thread::Builder::new()
             .name("clipboard-persistence".to_owned())
             .spawn(move || {
-                run_persistence_worker(repository, receiver, availability);
-                let _ = done_sender.send(());
+                run_persistence_worker(repository, receiver, controls, availability);
             })
             .map_err(PersistenceError::WorkerStart)?;
         Ok(Arc::new(Self {
             sender: Mutex::new(Some(sender)),
-            done: Mutex::new(done),
+            control,
             thread: Mutex::new(Some(thread)),
             storage_available,
+            accepted: AtomicUsize::new(0),
+            response_timeout,
         }))
     }
 
@@ -135,12 +178,9 @@ impl PersistenceWorker {
         let (reply, response) = mpsc::sync_channel(1);
         self.enqueue(PersistenceCommand::SaveSettings(settings, reply))?;
         let result = response
-            .recv_timeout(WORKER_TIMEOUT)
-            .map_err(|_| PersistenceError::WorkerUnavailable)?;
-        if result.is_err() {
-            self.storage_available.store(false, Ordering::Release);
-        }
-        result
+            .recv_timeout(self.response_timeout)
+            .map_err(|_| self.degrade())?;
+        result.map_err(|error| self.degrade_with(error))
     }
 
     pub fn prune(
@@ -151,23 +191,25 @@ impl PersistenceWorker {
         let (reply, response) = mpsc::sync_channel(1);
         self.enqueue(PersistenceCommand::Prune(retention, now, reply))?;
         let result = response
-            .recv_timeout(WORKER_TIMEOUT)
-            .map_err(|_| PersistenceError::WorkerUnavailable)?;
-        if result.is_err() {
-            self.storage_available.store(false, Ordering::Release);
-        }
-        result
+            .recv_timeout(self.response_timeout)
+            .map_err(|_| self.degrade())?;
+        result.map_err(|error| self.degrade_with(error))
     }
 
     fn enqueue(&self, command: PersistenceCommand) -> Result<(), PersistenceError> {
+        if !self.storage_available.load(Ordering::Acquire) {
+            return Err(PersistenceError::WorkerUnavailable);
+        }
         let sender = lock_unpoisoned(&self.sender);
         let result = sender
             .as_ref()
             .ok_or(PersistenceError::WorkerUnavailable)?
             .try_send(command)
             .map_err(|_| PersistenceError::WorkerUnavailable);
-        if result.is_err() {
-            self.storage_available.store(false, Ordering::Release);
+        if result.is_ok() {
+            self.accepted.fetch_add(1, Ordering::AcqRel);
+        } else {
+            let _ = self.degrade();
         }
         result
     }
@@ -179,31 +221,45 @@ impl PersistenceWorker {
         let (reply, response) = mpsc::sync_channel(1);
         self.enqueue(command(reply))?;
         let result = response
-            .recv_timeout(WORKER_TIMEOUT)
-            .map_err(|_| PersistenceError::WorkerUnavailable)?;
-        if result.is_err() {
-            self.storage_available.store(false, Ordering::Release);
-        }
-        result
+            .recv_timeout(self.response_timeout)
+            .map_err(|_| self.degrade())?;
+        result.map_err(|error| self.degrade_with(error))
     }
 
     fn stop(&self) {
         let sender = lock_unpoisoned(&self.sender).take();
-        if let Some(sender) = sender {
-            match sender.try_send(PersistenceCommand::Shutdown) {
-                Ok(()) | Err(TrySendError::Disconnected(_)) => {}
-                Err(TrySendError::Full(_)) => {
-                    self.storage_available.store(false, Ordering::Release);
-                }
+        let mut acknowledged = false;
+        if sender.is_some() {
+            let (flushed, flush_ack) = mpsc::channel();
+            if self
+                .control
+                .send(PersistenceControl::FlushAndShutdown {
+                    accepted: self.accepted.load(Ordering::Acquire),
+                    flushed,
+                })
+                .is_ok()
+            {
+                acknowledged = flush_ack.recv_timeout(self.response_timeout).is_ok();
             }
         }
-        if lock_unpoisoned(&self.done)
-            .recv_timeout(WORKER_TIMEOUT)
-            .is_ok()
-            && let Some(thread) = lock_unpoisoned(&self.thread).take()
-        {
-            let _ = thread.join();
+        if let Some(thread) = lock_unpoisoned(&self.thread).take() {
+            if acknowledged {
+                let _ = thread.join();
+            } else {
+                self.storage_available.store(false, Ordering::Release);
+                let _ = THREAD_REAPER.send(thread);
+            }
         }
+    }
+
+    fn degrade(&self) -> PersistenceError {
+        self.storage_available.store(false, Ordering::Release);
+        PersistenceError::WorkerUnavailable
+    }
+
+    fn degrade_with(&self, error: PersistenceError) -> PersistenceError {
+        self.storage_available.store(false, Ordering::Release);
+        error
     }
 }
 
@@ -224,49 +280,96 @@ impl Drop for PersistenceWorker {
 }
 
 fn run_persistence_worker(
-    repository: Arc<SqliteRepository>,
+    repository: Arc<dyn PersistenceBackend>,
     receiver: Receiver<PersistenceCommand>,
+    controls: Receiver<PersistenceControl>,
     storage_available: Arc<AtomicBool>,
 ) {
-    while let Ok(command) = receiver.recv() {
+    let mut processed = 0_usize;
+    let mut shutdown = None;
+    let mut repository_healthy = true;
+    loop {
+        if shutdown.is_none()
+            && let Ok(control) = controls.try_recv()
+        {
+            let PersistenceControl::FlushAndShutdown { accepted, flushed } = control;
+            shutdown = Some((accepted, flushed));
+        }
+        if shutdown
+            .as_ref()
+            .is_some_and(|(accepted, _)| processed >= *accepted)
+        {
+            if let Some((_, flushed)) = shutdown.take() {
+                let _ = flushed.send(());
+            }
+            break;
+        }
+        let command = match receiver.recv_timeout(CONTROL_POLL_INTERVAL) {
+            Ok(command) => command,
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                if let Some((_, flushed)) = shutdown.take() {
+                    let _ = flushed.send(());
+                }
+                break;
+            }
+        };
+        if !repository_healthy {
+            reply_unavailable(command);
+            processed = processed.saturating_add(1);
+            continue;
+        }
         match command {
             PersistenceCommand::SaveRecord(record, reply) => {
-                let result = repository.save_record(&record);
+                let result = repository.persist_record(&record);
                 let failed = result.is_err();
                 let _ = reply.send(result);
                 if failed {
                     storage_available.store(false, Ordering::Release);
+                    repository_healthy = false;
                 }
-                continue;
             }
             PersistenceCommand::UpdateNote(id, note, reply) => {
-                let result = repository.update_note(id, note.as_ref());
+                let result = repository.persist_note(id, note.as_ref());
                 let failed = result.is_err();
                 let _ = reply.send(result);
                 if failed {
                     storage_available.store(false, Ordering::Release);
+                    repository_healthy = false;
                 }
-                continue;
             }
             PersistenceCommand::SaveSettings(settings, reply) => {
-                let result = repository.save_settings(settings);
+                let result = repository.persist_settings(settings);
                 let failed = result.is_err();
                 let _ = reply.send(result);
                 if failed {
                     storage_available.store(false, Ordering::Release);
+                    repository_healthy = false;
                 }
-                continue;
             }
             PersistenceCommand::Prune(retention, now, reply) => {
-                let result = repository.prune(retention, now);
+                let result = repository.prune_records(retention, now);
                 let failed = result.is_err();
                 let _ = reply.send(result);
                 if failed {
                     storage_available.store(false, Ordering::Release);
+                    repository_healthy = false;
                 }
-                continue;
             }
-            PersistenceCommand::Shutdown => break,
+        }
+        processed = processed.saturating_add(1);
+    }
+}
+
+fn reply_unavailable(command: PersistenceCommand) {
+    match command {
+        PersistenceCommand::SaveRecord(_, reply)
+        | PersistenceCommand::UpdateNote(_, _, reply)
+        | PersistenceCommand::SaveSettings(_, reply) => {
+            let _ = reply.send(Err(PersistenceError::WorkerUnavailable));
+        }
+        PersistenceCommand::Prune(_, _, reply) => {
+            let _ = reply.send(Err(PersistenceError::WorkerUnavailable));
         }
     }
 }
@@ -455,6 +558,32 @@ impl RecordPersistence for SqliteRepository {
             return Err(PersistenceError::InvalidData);
         }
         Ok(())
+    }
+}
+
+impl PersistenceBackend for SqliteRepository {
+    fn persist_record(&self, record: &ClipboardRecord) -> Result<(), PersistenceError> {
+        self.save_record_inner(record)
+    }
+
+    fn persist_note(
+        &self,
+        id: RecordId,
+        note: Option<&RecordNote>,
+    ) -> Result<(), PersistenceError> {
+        RecordPersistence::update_note(self, id, note)
+    }
+
+    fn persist_settings(&self, settings: UserSettings) -> Result<(), PersistenceError> {
+        SqliteRepository::save_settings(self, settings)
+    }
+
+    fn prune_records(
+        &self,
+        retention: RetentionPeriod,
+        now: DateTime<Utc>,
+    ) -> Result<usize, PersistenceError> {
+        SqliteRepository::prune(self, retention, now)
     }
 }
 
@@ -647,7 +776,58 @@ fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 mod tests {
     use super::*;
     use chrono::TimeZone;
+    use std::sync::atomic::AtomicUsize;
     use tempfile::tempdir;
+
+    struct TestBackend {
+        writes: AtomicUsize,
+        fail_first: AtomicBool,
+        delay: StdDuration,
+    }
+
+    impl TestBackend {
+        fn new(fail_first: bool, delay: StdDuration) -> Self {
+            Self {
+                writes: AtomicUsize::new(0),
+                fail_first: AtomicBool::new(fail_first),
+                delay,
+            }
+        }
+    }
+
+    impl PersistenceBackend for TestBackend {
+        fn persist_record(&self, _record: &ClipboardRecord) -> Result<(), PersistenceError> {
+            self.writes.fetch_add(1, Ordering::AcqRel);
+            if !self.delay.is_zero() {
+                thread::sleep(self.delay);
+            }
+            if self.fail_first.swap(false, Ordering::AcqRel) {
+                Err(PersistenceError::WorkerUnavailable)
+            } else {
+                Ok(())
+            }
+        }
+
+        fn persist_note(
+            &self,
+            _id: RecordId,
+            _note: Option<&RecordNote>,
+        ) -> Result<(), PersistenceError> {
+            Ok(())
+        }
+
+        fn persist_settings(&self, _settings: UserSettings) -> Result<(), PersistenceError> {
+            Ok(())
+        }
+
+        fn prune_records(
+            &self,
+            _retention: RetentionPeriod,
+            _now: DateTime<Utc>,
+        ) -> Result<usize, PersistenceError> {
+            Ok(0)
+        }
+    }
 
     fn record(identity: &str, captured_at: DateTime<Utc>) -> ClipboardRecord {
         let mut record = ClipboardRecord::from_capture(crate::domain::CapturedClipboard {
@@ -790,5 +970,62 @@ mod tests {
         );
         assert_eq!(reopened.load_settings().unwrap().language, Language::En);
         assert!(available.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn shutdown_flushes_an_accumulated_backlog_before_acknowledging() {
+        let backend = Arc::new(TestBackend::new(false, StdDuration::from_millis(2)));
+        let available = Arc::new(AtomicBool::new(true));
+        let worker = PersistenceWorker::start_backend(
+            Arc::clone(&backend) as Arc<dyn PersistenceBackend>,
+            Arc::clone(&available),
+            StdDuration::from_secs(2),
+        )
+        .unwrap();
+        let sender = lock_unpoisoned(&worker.sender)
+            .as_ref()
+            .expect("worker sender")
+            .clone();
+        let mut responses = Vec::new();
+        for _ in 0..96 {
+            let (reply, response) = mpsc::sync_channel(1);
+            sender
+                .send(PersistenceCommand::SaveRecord(
+                    record("backlog", Utc::now()),
+                    reply,
+                ))
+                .unwrap();
+            worker.accepted.fetch_add(1, Ordering::AcqRel);
+            responses.push(response);
+        }
+
+        worker.stop();
+
+        assert_eq!(backend.writes.load(Ordering::Acquire), 96);
+        assert!(
+            responses
+                .into_iter()
+                .all(|response| response.recv().unwrap().is_ok())
+        );
+        assert!(available.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn first_worker_failure_enters_terminal_session_only_mode() {
+        let backend = Arc::new(TestBackend::new(false, StdDuration::ZERO));
+        backend.fail_first.store(true, Ordering::Release);
+        let available = Arc::new(AtomicBool::new(true));
+        let worker = PersistenceWorker::start_backend(
+            Arc::clone(&backend) as Arc<dyn PersistenceBackend>,
+            Arc::clone(&available),
+            StdDuration::from_secs(1),
+        )
+        .unwrap();
+        let item = record("failure", Utc::now());
+
+        assert!(worker.save_record(&item).is_err());
+        assert!(!available.load(Ordering::Acquire));
+        assert!(worker.save_record(&item).is_err());
+        assert_eq!(backend.writes.load(Ordering::Acquire), 1);
     }
 }
