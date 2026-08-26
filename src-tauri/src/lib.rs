@@ -18,7 +18,8 @@ use services::persistence::{
 };
 #[cfg(windows)]
 use services::session_records::{
-    ImagePreviewView, SessionRecordCommands, SessionRecordStore, SessionRecordView,
+    HistoryPageView, ImagePreviewView, RecordDetailsView, SessionRecordCommands,
+    SessionRecordStore, SessionRecordView,
 };
 
 #[cfg(windows)]
@@ -676,8 +677,8 @@ fn spawn_clipboard_event_drain(
 mod runtime_tests {
     use super::{
         ActiveGroup, ActiveGroupState, ApplicationSettings, ClipboardGroupView, ClipboardGroups,
-        HotkeyStatus, delete_clipboard_group_state, spawn_clipboard_event_drain,
-        spawn_periodic_retention, update_record_group_state,
+        HotkeyStatus, create_text_record_state, delete_clipboard_group_state,
+        spawn_clipboard_event_drain, spawn_periodic_retention, update_record_group_state,
     };
     use crate::{
         domain::{
@@ -723,6 +724,44 @@ mod runtime_tests {
         assert_eq!(
             active.switch(1, std::slice::from_ref(&group)),
             ActiveGroup::Group(group.id)
+        );
+    }
+
+    #[test]
+    fn manual_record_rejects_a_missing_group_without_persisting() {
+        let directory = tempdir().unwrap();
+        let repository = SqliteRepository::open(directory.path().join("history.sqlite3")).unwrap();
+        let coordinator = Arc::new(PersistenceMutationCoordinator::default());
+        let records = SessionRecordStore::with_persistence_page_and_coordinator(
+            repository
+                .load_page(crate::domain::HistoryQuery::default())
+                .unwrap(),
+            Arc::clone(&repository) as Arc<dyn RecordPersistence>,
+            Arc::new(AtomicBool::new(true)),
+            Arc::clone(&coordinator),
+        );
+        let groups = ClipboardGroups {
+            groups: Mutex::new(Vec::new()),
+            repository: Some(Arc::clone(&repository)),
+            mutation_coordinator: coordinator,
+        };
+
+        assert!(
+            create_text_record_state(
+                "secret".to_owned(),
+                Some("account".to_owned()),
+                Some(crate::domain::GroupId::new()),
+                &groups,
+                &records,
+            )
+            .is_err()
+        );
+        assert!(
+            repository
+                .load_page(crate::domain::HistoryQuery::default())
+                .unwrap()
+                .records
+                .is_empty()
         );
     }
 
@@ -1352,6 +1391,105 @@ fn list_session_records(
     records: tauri::State<'_, Arc<SessionRecordStore>>,
 ) -> Vec<SessionRecordView> {
     SessionRecordCommands::new(records.inner()).list()
+}
+
+#[cfg(windows)]
+#[tauri::command]
+fn list_history_page(
+    query: domain::HistoryQuery,
+    records: tauri::State<'_, Arc<SessionRecordStore>>,
+) -> Result<HistoryPageView, String> {
+    SessionRecordCommands::new(records.inner())
+        .history_page(query)
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(windows)]
+#[tauri::command]
+fn get_record_details(
+    record_id: domain::RecordId,
+    records: tauri::State<'_, Arc<SessionRecordStore>>,
+) -> Result<RecordDetailsView, String> {
+    SessionRecordCommands::new(records.inner())
+        .record_details(record_id)
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(windows)]
+#[tauri::command]
+fn set_record_pinned(
+    record_id: domain::RecordId,
+    pinned: bool,
+    records: tauri::State<'_, Arc<SessionRecordStore>>,
+    app: tauri::AppHandle,
+) -> Result<RecordDetailsView, String> {
+    let updated = SessionRecordCommands::new(records.inner())
+        .set_pinned(record_id, pinned)
+        .map_err(|error| error.to_string())?;
+    let _ = app.emit("clipboard-records-changed", ());
+    Ok(updated)
+}
+
+#[cfg(windows)]
+#[tauri::command]
+fn set_record_favorite(
+    record_id: domain::RecordId,
+    favorite: bool,
+    records: tauri::State<'_, Arc<SessionRecordStore>>,
+    app: tauri::AppHandle,
+) -> Result<RecordDetailsView, String> {
+    let updated = SessionRecordCommands::new(records.inner())
+        .set_favorite(record_id, favorite)
+        .map_err(|error| error.to_string())?;
+    let _ = app.emit("clipboard-records-changed", ());
+    Ok(updated)
+}
+
+#[cfg(windows)]
+#[tauri::command]
+fn update_record_content(
+    record_id: domain::RecordId,
+    text: String,
+    records: tauri::State<'_, Arc<SessionRecordStore>>,
+    app: tauri::AppHandle,
+) -> Result<RecordDetailsView, String> {
+    let updated = SessionRecordCommands::new(records.inner())
+        .update_text(record_id, text)
+        .map_err(|error| error.to_string())?;
+    let _ = app.emit("clipboard-records-changed", ());
+    Ok(updated)
+}
+
+#[cfg(windows)]
+#[tauri::command]
+fn create_text_record(
+    text: String,
+    note: Option<String>,
+    group_id: Option<domain::GroupId>,
+    groups: tauri::State<'_, Arc<ClipboardGroups>>,
+    records: tauri::State<'_, Arc<SessionRecordStore>>,
+    app: tauri::AppHandle,
+) -> Result<RecordDetailsView, String> {
+    let created = create_text_record_state(text, note, group_id, groups.inner(), records.inner())?;
+    let _ = app.emit("clipboard-records-changed", ());
+    Ok(created)
+}
+
+#[cfg(windows)]
+fn create_text_record_state(
+    text: String,
+    note: Option<String>,
+    group_id: Option<domain::GroupId>,
+    groups: &ClipboardGroups,
+    records: &SessionRecordStore,
+) -> Result<RecordDetailsView, String> {
+    let _coordinated = groups.mutation_coordinator.lock();
+    if group_id.is_some_and(|id| !groups.contains_coordinated(id)) {
+        return Err("clipboard group is no longer available".to_owned());
+    }
+    records
+        .create_text_coordinated(text, note, group_id)
+        .map_err(|error| error.to_string())
 }
 
 #[cfg(windows)]
@@ -2469,6 +2607,12 @@ pub fn run() {
             finish_quick_panel_drag,
             paste_selected,
             list_session_records,
+            list_history_page,
+            get_record_details,
+            set_record_pinned,
+            set_record_favorite,
+            update_record_content,
+            create_text_record,
             get_record_image_preview,
             update_record_note,
             delete_session_record,

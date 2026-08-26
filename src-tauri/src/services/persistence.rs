@@ -200,6 +200,9 @@ impl From<rusqlite::Error> for PersistenceError {
 
 pub trait RecordPersistence: Send + Sync {
     fn save_record(&self, record: &ClipboardRecord) -> Result<(), PersistenceError>;
+    fn update_record(&self, record: &ClipboardRecord) -> Result<(), PersistenceError> {
+        self.save_record(record)
+    }
     fn update_note(&self, id: RecordId, note: Option<&RecordNote>) -> Result<(), PersistenceError>;
     fn delete_record(&self, id: RecordId) -> Result<(), PersistenceError>;
     fn clear_records(&self) -> Result<usize, PersistenceError>;
@@ -465,6 +468,10 @@ impl RecordPersistence for PersistenceWorker {
 
     fn update_note(&self, id: RecordId, note: Option<&RecordNote>) -> Result<(), PersistenceError> {
         self.request(|reply| PersistenceCommand::UpdateNote(id, note.cloned(), reply))
+    }
+
+    fn update_record(&self, record: &ClipboardRecord) -> Result<(), PersistenceError> {
+        self.request(|reply| PersistenceCommand::SaveRecord(record.clone(), reply))
     }
 
     fn delete_record(&self, id: RecordId) -> Result<(), PersistenceError> {
@@ -1326,6 +1333,10 @@ impl RecordPersistence for SqliteRepository {
             incremental_vacuum(&connection, self.quota)?;
         }
         Ok(())
+    }
+
+    fn update_record(&self, record: &ClipboardRecord) -> Result<(), PersistenceError> {
+        self.save_record_inner(record)
     }
 
     fn delete_record(&self, id: RecordId) -> Result<(), PersistenceError> {

@@ -64,7 +64,8 @@ pub struct HistoryCursor {
     pub id: RecordId,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct HistoryQuery {
     pub cursor: Option<HistoryCursor>,
     pub limit: usize,

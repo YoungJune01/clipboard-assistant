@@ -10,8 +10,8 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use serde::Serialize;
 
 use crate::domain::{
-    CapturedClipboard, ClipboardRecord, ClipboardRepresentation, GroupId, HistoryCursor,
-    HistoryQuery, RecordId, RecordNote, RecordNoteError,
+    CapturedClipboard, ClipboardRecord, ClipboardRepresentation, ContentIdentity, ContentKind,
+    GroupId, HistoryCursor, HistoryQuery, RecordId, RecordNote, RecordNoteError, SourceIdentity,
 };
 use crate::services::persistence::{
     HistoryPage, HistoryRecordSummary, PersistenceMutationCoordinator, RecordPersistence,
@@ -43,6 +43,34 @@ pub struct SessionRecordView {
     pub has_image: bool,
     pub note: Option<RecordNote>,
     pub group_id: Option<GroupId>,
+    pub content_kind: ContentKind,
+    pub pinned: bool,
+    pub favorite: bool,
+    pub sensitive: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryPageView {
+    pub items: Vec<SessionRecordView>,
+    pub next_cursor: Option<HistoryCursor>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordDetailsView {
+    pub id: RecordId,
+    pub content_identity: ContentIdentity,
+    pub captured_at: chrono::DateTime<chrono::Utc>,
+    pub source_application: Option<String>,
+    pub text: Option<String>,
+    pub representations: Vec<ClipboardRepresentation>,
+    pub note: Option<RecordNote>,
+    pub group_id: Option<GroupId>,
+    pub content_kind: ContentKind,
+    pub pinned: bool,
+    pub favorite: bool,
+    pub sensitive: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -409,6 +437,164 @@ impl SessionRecordStore {
                 Err(SessionRecordError::NotFound)
             }
         }
+    }
+
+    pub fn history_page(&self, query: HistoryQuery) -> Result<HistoryPageView, SessionRecordError> {
+        let page = self.load_page(query)?;
+        Ok(HistoryPageView {
+            items: page
+                .records
+                .into_iter()
+                .map(SessionRecordView::from_summary)
+                .collect(),
+            next_cursor: page.next_cursor,
+        })
+    }
+
+    pub fn record_details_view(
+        &self,
+        id: RecordId,
+    ) -> Result<RecordDetailsView, SessionRecordError> {
+        self.record_details(id).map(RecordDetailsView::from_record)
+    }
+
+    pub fn set_pinned(
+        &self,
+        id: RecordId,
+        pinned: bool,
+    ) -> Result<RecordDetailsView, SessionRecordError> {
+        let _serial = self.mutation_coordinator.lock();
+        self.update_record_coordinated(id, |record| record.pinned = pinned)
+    }
+
+    pub fn set_favorite(
+        &self,
+        id: RecordId,
+        favorite: bool,
+    ) -> Result<RecordDetailsView, SessionRecordError> {
+        let _serial = self.mutation_coordinator.lock();
+        self.update_record_coordinated(id, |record| record.favorite = favorite)
+    }
+
+    pub fn update_text(
+        &self,
+        id: RecordId,
+        text: String,
+    ) -> Result<RecordDetailsView, SessionRecordError> {
+        let _serial = self.mutation_coordinator.lock();
+        self.update_record_coordinated(id, move |record| {
+            record.representations.retain(|representation| {
+                !matches!(representation, ClipboardRepresentation::UnicodeText { .. })
+            });
+            record
+                .representations
+                .insert(0, ClipboardRepresentation::UnicodeText { text });
+            record.content_identity = manual_content_identity();
+        })
+    }
+
+    pub fn create_text(
+        &self,
+        text: String,
+        note: Option<String>,
+        group_id: Option<GroupId>,
+    ) -> Result<RecordDetailsView, SessionRecordError> {
+        let _serial = self.mutation_coordinator.lock();
+        self.create_text_coordinated(text, note, group_id)
+    }
+
+    pub(crate) fn create_text_coordinated(
+        &self,
+        text: String,
+        note: Option<String>,
+        group_id: Option<GroupId>,
+    ) -> Result<RecordDetailsView, SessionRecordError> {
+        self.require_durable_storage()?;
+        let note = note
+            .filter(|value| !value.is_empty())
+            .map(RecordNote::new)
+            .transpose()
+            .map_err(SessionRecordError::InvalidNote)?;
+        let record = ClipboardRecord {
+            id: RecordId::new(),
+            content_identity: manual_content_identity(),
+            captured_at: chrono::Utc::now(),
+            source: SourceIdentity {
+                application_name: Some("Clipboard Assistant".to_owned()),
+                executable_path: None,
+            },
+            representations: vec![ClipboardRepresentation::UnicodeText { text }],
+            note,
+            group_id,
+            pinned: false,
+            favorite: false,
+            sensitive: false,
+        };
+        self.validate_record_budget(&record)?;
+        self.persist_updated_record(&record)?;
+        self.cache_updated_record(record.clone());
+        self.refresh_loaded_window()?;
+        Ok(RecordDetailsView::from_record(record))
+    }
+
+    fn update_record_coordinated(
+        &self,
+        id: RecordId,
+        update: impl FnOnce(&mut ClipboardRecord),
+    ) -> Result<RecordDetailsView, SessionRecordError> {
+        self.require_durable_storage()?;
+        self.load_record_for_mutation(id)?;
+        let mut record = {
+            let state = lock_unpoisoned(&self.state);
+            state
+                .records
+                .iter()
+                .find(|record| record.id == id)
+                .map(|record| record.as_ref().clone())
+                .ok_or(SessionRecordError::NotFound)?
+        };
+        update(&mut record);
+        self.validate_record_budget(&record)?;
+        self.persist_updated_record(&record)?;
+        self.cache_updated_record(record.clone());
+        self.refresh_loaded_window()?;
+        Ok(RecordDetailsView::from_record(record))
+    }
+
+    fn validate_record_budget(&self, record: &ClipboardRecord) -> Result<(), SessionRecordError> {
+        let bytes = checked_record_bytes(record).ok_or(SessionRecordError::RecordTooLarge)?;
+        if bytes > self.limits.record_bytes {
+            return Err(SessionRecordError::RecordTooLarge);
+        }
+        Ok(())
+    }
+
+    fn persist_updated_record(&self, record: &ClipboardRecord) -> Result<(), SessionRecordError> {
+        match &self.persistence {
+            NotePersistence::Durable(persistence) => {
+                persistence.update_record(record).map_err(|_| {
+                    self.storage_available.store(false, Ordering::Release);
+                    SessionRecordError::PersistenceUnavailable
+                })
+            }
+            NotePersistence::NotConfigured | NotePersistence::SessionOnly => {
+                Err(SessionRecordError::PersistenceUnavailable)
+            }
+        }
+    }
+
+    fn cache_updated_record(&self, record: ClipboardRecord) {
+        let mut state = lock_unpoisoned(&self.state);
+        if let Some(index) = state.records.iter().position(|value| value.id == record.id) {
+            let previous_bytes = record_bytes(&state.records[index]);
+            state.total_bytes = state.total_bytes.saturating_sub(previous_bytes);
+            state.records[index] = Arc::new(record.clone());
+        } else {
+            state.records.push_front(Arc::new(record.clone()));
+        }
+        state.total_bytes = state.total_bytes.saturating_add(record_bytes(&record));
+        sort_records(&mut state.records);
+        evict_to_limits(&mut state, self.limits);
     }
 
     pub fn replace_page(&self, page: HistoryPage) {
@@ -1034,6 +1220,10 @@ impl SessionRecordView {
             has_image,
             note: record.note.clone(),
             group_id: record.group_id,
+            content_kind: record.content_kind(),
+            pinned: record.pinned,
+            favorite: record.favorite,
+            sensitive: record.sensitive,
         }
     }
 
@@ -1046,8 +1236,47 @@ impl SessionRecordView {
             has_image: summary.has_image,
             note: summary.note,
             group_id: summary.group_id,
+            content_kind: summary.content_kind,
+            pinned: summary.pinned,
+            favorite: summary.favorite,
+            sensitive: summary.sensitive,
         }
     }
+}
+
+impl RecordDetailsView {
+    fn from_record(record: ClipboardRecord) -> Self {
+        let content_kind = record.content_kind();
+        let text = record
+            .representations
+            .iter()
+            .find_map(|representation| match representation {
+                ClipboardRepresentation::UnicodeText { text } => Some(text.clone()),
+                ClipboardRepresentation::Rtf { .. }
+                | ClipboardRepresentation::Html { .. }
+                | ClipboardRepresentation::Png { .. }
+                | ClipboardRepresentation::DibV5 { .. }
+                | ClipboardRepresentation::FileList { .. } => None,
+            });
+        Self {
+            id: record.id,
+            content_identity: record.content_identity,
+            captured_at: record.captured_at,
+            source_application: record.source.application_name,
+            text,
+            representations: record.representations,
+            note: record.note,
+            group_id: record.group_id,
+            content_kind,
+            pinned: record.pinned,
+            favorite: record.favorite,
+            sensitive: record.sensitive,
+        }
+    }
+}
+
+fn manual_content_identity() -> ContentIdentity {
+    ContentIdentity::new(format!("manual-text:{}", RecordId::new().as_uuid()))
 }
 
 pub(crate) fn checked_representation_bytes(
@@ -1191,6 +1420,38 @@ impl<'a> SessionRecordCommands<'a> {
 
     pub fn list(&self) -> Vec<SessionRecordView> {
         self.store.list()
+    }
+
+    pub fn history_page(&self, query: HistoryQuery) -> Result<HistoryPageView, SessionRecordError> {
+        self.store.history_page(query)
+    }
+
+    pub fn record_details(&self, id: RecordId) -> Result<RecordDetailsView, SessionRecordError> {
+        self.store.record_details_view(id)
+    }
+
+    pub fn set_pinned(
+        &self,
+        id: RecordId,
+        pinned: bool,
+    ) -> Result<RecordDetailsView, SessionRecordError> {
+        self.store.set_pinned(id, pinned)
+    }
+
+    pub fn set_favorite(
+        &self,
+        id: RecordId,
+        favorite: bool,
+    ) -> Result<RecordDetailsView, SessionRecordError> {
+        self.store.set_favorite(id, favorite)
+    }
+
+    pub fn update_text(
+        &self,
+        id: RecordId,
+        text: String,
+    ) -> Result<RecordDetailsView, SessionRecordError> {
+        self.store.update_text(id, text)
     }
 
     pub fn update_note(
@@ -1596,6 +1857,143 @@ mod tests {
         assert_eq!(store.delete(delete_record.id).unwrap().id, delete_record.id);
         assert!(store.list().iter().all(|view| view.id != delete_record.id));
         assert!(repository.record_details(delete_record.id).is_err());
+    }
+
+    #[test]
+    fn manual_text_record_can_be_created_edited_favorited_and_pinned() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("history.sqlite3");
+        let repository = SqliteRepository::open(path.clone()).unwrap();
+        let store = SessionRecordStore::with_persistence_page(
+            repository.load_page(HistoryQuery::default()).unwrap(),
+            Arc::clone(&repository) as Arc<dyn RecordPersistence>,
+            Arc::new(AtomicBool::new(true)),
+        );
+
+        let created = store
+            .create_text("first".to_owned(), Some("account".to_owned()), None)
+            .unwrap();
+        let original_identity = created.content_identity.clone();
+        let edited = store.update_text(created.id, "second".to_owned()).unwrap();
+        store.set_favorite(created.id, true).unwrap();
+        store.set_pinned(created.id, true).unwrap();
+
+        assert_eq!(edited.text.as_deref(), Some("second"));
+        assert_ne!(edited.content_identity, original_identity);
+        assert_eq!(
+            edited.source_application.as_deref(),
+            Some("Clipboard Assistant")
+        );
+        assert_eq!(
+            edited.note.as_ref().map(RecordNote::as_str),
+            Some("account")
+        );
+
+        drop(store);
+        drop(repository);
+        let reopened = SqliteRepository::open(path).unwrap();
+        let restored = reopened.record_details(created.id).unwrap();
+        assert!(restored.favorite);
+        assert!(restored.pinned);
+        assert_eq!(
+            restored.representations,
+            vec![ClipboardRepresentation::UnicodeText {
+                text: "second".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn text_edit_replaces_only_unicode_text_and_refreshes_filtered_page() {
+        let directory = tempdir().unwrap();
+        let repository = SqliteRepository::open(directory.path().join("history.sqlite3")).unwrap();
+        let mut record = ClipboardRecord::from_capture(capture("rich", "old text"));
+        record.representations.extend([
+            ClipboardRepresentation::Rtf {
+                bytes: br"{\rtf1 old}".to_vec(),
+            },
+            ClipboardRepresentation::Html {
+                bytes: b"<b>old</b>".to_vec(),
+            },
+        ]);
+        record.favorite = true;
+        repository.save_record(&record).unwrap();
+        let query = HistoryQuery {
+            favorites_only: true,
+            ..HistoryQuery::default()
+        };
+        let store = SessionRecordStore::with_persistence_query_page(
+            query.clone(),
+            repository.load_page(query).unwrap(),
+            Arc::clone(&repository) as Arc<dyn RecordPersistence>,
+            Arc::new(AtomicBool::new(true)),
+        );
+
+        let edited = store.update_text(record.id, "new text".to_owned()).unwrap();
+        assert_eq!(edited.text.as_deref(), Some("new text"));
+        let details = store.record_details(record.id).unwrap();
+        assert!(details.representations.iter().any(
+            |value| matches!(value, ClipboardRepresentation::Rtf { bytes } if bytes == br"{\rtf1 old}")
+        ));
+        assert!(details.representations.iter().any(
+            |value| matches!(value, ClipboardRepresentation::Html { bytes } if bytes == b"<b>old</b>")
+        ));
+        assert!(details.representations.iter().any(
+            |value| matches!(value, ClipboardRepresentation::UnicodeText { text } if text == "new text")
+        ));
+
+        store.set_favorite(record.id, false).unwrap();
+        assert!(store.list().is_empty());
+        assert!(!repository.record_details(record.id).unwrap().favorite);
+    }
+
+    #[test]
+    fn text_edit_rejects_the_existing_per_record_limit_without_mutation() {
+        let directory = tempdir().unwrap();
+        let repository = SqliteRepository::open(directory.path().join("history.sqlite3")).unwrap();
+        let record = ClipboardRecord::from_capture(capture("bounded", "original"));
+        repository.save_record(&record).unwrap();
+        let store = SessionRecordStore::with_persistence_page(
+            repository.load_page(HistoryQuery::default()).unwrap(),
+            Arc::clone(&repository) as Arc<dyn RecordPersistence>,
+            Arc::new(AtomicBool::new(true)),
+        );
+
+        assert!(matches!(
+            store.update_text(record.id, "x".repeat(MAX_CAPTURE_RECORD_BYTES + 1)),
+            Err(SessionRecordError::RecordTooLarge)
+        ));
+        assert_eq!(
+            repository
+                .record_details(record.id)
+                .unwrap()
+                .representations,
+            record.representations
+        );
+    }
+
+    #[test]
+    fn history_page_is_summary_only_and_details_load_binary_payload_on_demand() {
+        let directory = tempdir().unwrap();
+        let repository = SqliteRepository::open(directory.path().join("history.sqlite3")).unwrap();
+        let mut record = ClipboardRecord::from_capture(capture("binary-details", "caption"));
+        record.representations.push(ClipboardRepresentation::Png {
+            bytes: vec![231; 4096],
+        });
+        repository.save_record(&record).unwrap();
+        let store = SessionRecordStore::with_persistence_page(
+            repository.load_page(HistoryQuery::default()).unwrap(),
+            Arc::clone(&repository) as Arc<dyn RecordPersistence>,
+            Arc::new(AtomicBool::new(true)),
+        );
+
+        let page = store.history_page(HistoryQuery::default()).unwrap();
+        let serialized = serde_json::to_string(&page).unwrap();
+        assert!(serialized.len() < 2048);
+        assert!(!serialized.contains("231,231,231"));
+        assert!(store.record_details_view(record.id).unwrap().representations.iter().any(
+            |value| matches!(value, ClipboardRepresentation::Png { bytes } if bytes.len() == 4096)
+        ));
     }
 
     #[test]
