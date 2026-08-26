@@ -65,6 +65,7 @@ pub(crate) struct RestoredData {
     pub(crate) settings: UserSettings,
     pub(crate) excluded_applications: Vec<String>,
     pub(crate) groups: Vec<(GroupId, String)>,
+    pub(crate) page: HistoryPage,
 }
 
 #[derive(Clone, Copy)]
@@ -628,6 +629,8 @@ pub struct SqliteRepository {
     connection: Mutex<Connection>,
     quota: DiskQuota,
     migration_locks: Arc<dyn MigrationLockProvider>,
+    #[cfg(test)]
+    fail_next_restore_snapshot: AtomicBool,
 }
 
 impl SqliteRepository {
@@ -681,6 +684,8 @@ impl SqliteRepository {
             connection: Mutex::new(connection),
             quota,
             migration_locks,
+            #[cfg(test)]
+            fail_next_restore_snapshot: AtomicBool::new(false),
         }))
     }
 
@@ -727,9 +732,9 @@ impl SqliteRepository {
         validate_backup_file(source)?;
         let source_repository =
             SqliteRepository::open_with_quota(source.to_path_buf(), self.quota)?;
-        source_repository.load_settings()?;
-        source_repository.load_excluded_applications()?;
-        source_repository.load_groups()?;
+        let settings = source_repository.load_settings()?;
+        let excluded_applications = source_repository.load_excluded_applications()?;
+        let groups = source_repository.load_groups()?;
         source_repository.validate_restore_representation_kinds(budget.max_record_bytes)?;
         source_repository.load_recent_bounded(budget)?;
         drop(source_repository);
@@ -754,25 +759,48 @@ impl SqliteRepository {
             let transaction = connection.transaction()?;
             enforce_disk_quota(&transaction, self.quota)?;
             transaction.commit()?;
-            Ok(())
+            #[cfg(test)]
+            if self
+                .fail_next_restore_snapshot
+                .swap(false, Ordering::AcqRel)
+            {
+                return Err(PersistenceError::WorkerUnavailable);
+            }
+            let page = load_page_from_connection(
+                &connection,
+                HistoryQuery {
+                    limit: 100,
+                    ..HistoryQuery::default()
+                },
+            )?;
+            Ok(page)
         })();
-        if let Err(error) = restore_result {
-            let rollback_result = connection.restore(
-                rusqlite::MAIN_DB,
-                &rollback,
-                None::<fn(rusqlite::backup::Progress)>,
-            );
-            let _ = remove_path_and_sidecars(&rollback);
-            return rollback_result
-                .map_or(Err(PersistenceError::WorkerUnavailable), |_| Err(error));
-        }
-        remove_path_and_sidecars(&rollback)?;
-        drop(connection);
+        let page = match restore_result {
+            Ok(page) => page,
+            Err(error) => {
+                let rollback_result = connection.restore(
+                    rusqlite::MAIN_DB,
+                    &rollback,
+                    None::<fn(rusqlite::backup::Progress)>,
+                );
+                let _ = remove_path_and_sidecars(&rollback);
+                return rollback_result
+                    .map_or(Err(PersistenceError::WorkerUnavailable), |_| Err(error));
+            }
+        };
+        let _ = remove_path_and_sidecars(&rollback);
         Ok(RestoredData {
-            settings: self.load_settings()?,
-            excluded_applications: self.load_excluded_applications()?,
-            groups: self.load_groups()?,
+            settings,
+            excluded_applications,
+            groups,
+            page,
         })
+    }
+
+    #[cfg(test)]
+    fn fail_next_restore_snapshot(&self) {
+        self.fail_next_restore_snapshot
+            .store(true, Ordering::Release);
     }
 
     fn validate_restore_representation_kinds(
@@ -1097,87 +1125,8 @@ impl SqliteRepository {
     }
 
     pub fn load_page(&self, query: HistoryQuery) -> Result<HistoryPage, PersistenceError> {
-        let requested = if query.limit == 0 {
-            DEFAULT_HISTORY_PAGE_LIMIT
-        } else {
-            query.limit.min(MAX_HISTORY_PAGE_LIMIT)
-        };
         let connection = lock_unpoisoned(&self.connection);
-        let mut sql = String::from(
-            "SELECT r.id, r.captured_at, r.source_application, r.note, r.group_id, \
-                    r.pinned, r.favorite, r.sensitive, r.content_kind, \
-                    (SELECT substr(p.text_value, 1, 4096) FROM clipboard_representations p \
-                     WHERE p.record_id = r.id AND p.kind = 'unicode_text' \
-                     ORDER BY p.position LIMIT 1), \
-                    EXISTS(SELECT 1 FROM clipboard_representations p \
-                           WHERE p.record_id = r.id AND p.kind IN ('png', 'dib_v5')) \
-             FROM clipboard_records r WHERE 1 = 1",
-        );
-        let mut values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-        if let Some(cursor) = query.cursor {
-            sql.push_str(" AND (r.captured_at < ? OR (r.captured_at = ? AND r.id < ?))");
-            values.push(Box::new(cursor.captured_at.to_rfc3339()));
-            values.push(Box::new(cursor.captured_at.to_rfc3339()));
-            values.push(Box::new(cursor.id.as_uuid().to_string()));
-        }
-        if let Some(kind) = query.content_kind {
-            sql.push_str(" AND r.content_kind = ?");
-            values.push(Box::new(content_kind_value(kind).to_owned()));
-        }
-        if let Some(group_id) = query.group_id {
-            sql.push_str(" AND r.group_id = ?");
-            values.push(Box::new(group_id.as_uuid().to_string()));
-        }
-        if query.ungrouped_only {
-            sql.push_str(" AND r.group_id IS NULL");
-        }
-        if query.favorites_only {
-            sql.push_str(" AND r.favorite = 1");
-        }
-        sql.push_str(" ORDER BY r.captured_at DESC, r.id DESC");
-        let params = values.iter().map(|value| value.as_ref());
-        let mut statement = connection.prepare(&sql)?;
-        let rows = statement.query_map(rusqlite::params_from_iter(params), |row| {
-            Ok(DbSummary {
-                id: row.get(0)?,
-                captured_at: row.get(1)?,
-                source_application: row.get(2)?,
-                note: row.get(3)?,
-                group_id: row.get(4)?,
-                pinned: row.get(5)?,
-                favorite: row.get(6)?,
-                sensitive: row.get(7)?,
-                content_kind: row.get(8)?,
-                text: row.get(9)?,
-                has_image: row.get(10)?,
-            })
-        })?;
-        let mut records = Vec::with_capacity(requested);
-        for row in rows {
-            let Ok(row) = row else {
-                continue;
-            };
-            let Ok(summary) = row.into_summary() else {
-                continue;
-            };
-            records.push(summary);
-            if records.len() > requested {
-                break;
-            }
-        }
-        let has_more = records.len() > requested;
-        records.truncate(requested);
-        let next_cursor = has_more.then(|| {
-            let last = records.last().expect("non-empty page with lookahead");
-            HistoryCursor {
-                captured_at: last.captured_at,
-                id: last.id,
-            }
-        });
-        Ok(HistoryPage {
-            records,
-            next_cursor,
-        })
+        load_page_from_connection(&connection, query)
     }
 
     pub fn record_details(&self, id: RecordId) -> Result<ClipboardRecord, PersistenceError> {
@@ -2154,6 +2103,92 @@ fn setting(connection: &Connection, key: &str) -> Result<Option<String>, Persist
         .map_err(Into::into)
 }
 
+fn load_page_from_connection(
+    connection: &Connection,
+    query: HistoryQuery,
+) -> Result<HistoryPage, PersistenceError> {
+    let requested = if query.limit == 0 {
+        DEFAULT_HISTORY_PAGE_LIMIT
+    } else {
+        query.limit.min(MAX_HISTORY_PAGE_LIMIT)
+    };
+    let mut sql = String::from(
+        "SELECT r.id, r.captured_at, r.source_application, r.note, r.group_id, \
+                r.pinned, r.favorite, r.sensitive, r.content_kind, \
+                (SELECT substr(p.text_value, 1, 4096) FROM clipboard_representations p \
+                 WHERE p.record_id = r.id AND p.kind = 'unicode_text' \
+                 ORDER BY p.position LIMIT 1), \
+                EXISTS(SELECT 1 FROM clipboard_representations p \
+                       WHERE p.record_id = r.id AND p.kind IN ('png', 'dib_v5')) \
+         FROM clipboard_records r WHERE 1 = 1",
+    );
+    let mut values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+    if let Some(cursor) = query.cursor {
+        sql.push_str(" AND (r.captured_at < ? OR (r.captured_at = ? AND r.id < ?))");
+        values.push(Box::new(cursor.captured_at.to_rfc3339()));
+        values.push(Box::new(cursor.captured_at.to_rfc3339()));
+        values.push(Box::new(cursor.id.as_uuid().to_string()));
+    }
+    if let Some(kind) = query.content_kind {
+        sql.push_str(" AND r.content_kind = ?");
+        values.push(Box::new(content_kind_value(kind).to_owned()));
+    }
+    if let Some(group_id) = query.group_id {
+        sql.push_str(" AND r.group_id = ?");
+        values.push(Box::new(group_id.as_uuid().to_string()));
+    }
+    if query.ungrouped_only {
+        sql.push_str(" AND r.group_id IS NULL");
+    }
+    if query.favorites_only {
+        sql.push_str(" AND r.favorite = 1");
+    }
+    sql.push_str(" ORDER BY r.captured_at DESC, r.id DESC");
+    let params = values.iter().map(|value| value.as_ref());
+    let mut statement = connection.prepare(&sql)?;
+    let rows = statement.query_map(rusqlite::params_from_iter(params), |row| {
+        Ok(DbSummary {
+            id: row.get(0)?,
+            captured_at: row.get(1)?,
+            source_application: row.get(2)?,
+            note: row.get(3)?,
+            group_id: row.get(4)?,
+            pinned: row.get(5)?,
+            favorite: row.get(6)?,
+            sensitive: row.get(7)?,
+            content_kind: row.get(8)?,
+            text: row.get(9)?,
+            has_image: row.get(10)?,
+        })
+    })?;
+    let mut records = Vec::with_capacity(requested);
+    for row in rows {
+        let Ok(row) = row else {
+            continue;
+        };
+        let Ok(summary) = row.into_summary() else {
+            continue;
+        };
+        records.push(summary);
+        if records.len() > requested {
+            break;
+        }
+    }
+    let has_more = records.len() > requested;
+    records.truncate(requested);
+    let next_cursor = has_more.then(|| {
+        let last = records.last().expect("non-empty page with lookahead");
+        HistoryCursor {
+            captured_at: last.captured_at,
+            id: last.id,
+        }
+    });
+    Ok(HistoryPage {
+        records,
+        next_cursor,
+    })
+}
+
 fn save_setting(transaction: &Transaction<'_>, key: &str, value: &str) -> rusqlite::Result<()> {
     transaction.execute(
         "INSERT INTO app_settings(key, value) VALUES (?1, ?2) \
@@ -2782,6 +2817,10 @@ mod tests {
                 settings: UserSettings::default(),
                 excluded_applications: Vec::new(),
                 groups: Vec::new(),
+                page: HistoryPage {
+                    records: Vec::new(),
+                    next_cursor: None,
+                },
             })
         }
     }
@@ -2895,6 +2934,42 @@ mod tests {
         assert_eq!(restored.settings.retention, RetentionPeriod::Forever);
         assert_eq!(restored.settings.accent_color, AccentColor::Rose);
         assert_eq!(repository.load_recent(10).unwrap(), vec![expected]);
+    }
+
+    #[test]
+    fn restore_snapshot_failure_rolls_back_and_keeps_the_worker_available() {
+        let directory = tempdir().unwrap();
+        let live = SqliteRepository::open(directory.path().join("live.sqlite3")).unwrap();
+        let source_path = directory.path().join("source.clipbackup");
+        let source = SqliteRepository::open(source_path.clone()).unwrap();
+        let old = record("old", Utc::now());
+        let restored = record("restored", Utc::now() + Duration::seconds(1));
+        live.save_record(&old).unwrap();
+        source.save_record(&restored).unwrap();
+        drop(source);
+        let available = Arc::new(AtomicBool::new(true));
+        let worker = PersistenceWorker::start(Arc::clone(&live), Arc::clone(&available)).unwrap();
+        live.fail_next_restore_snapshot();
+
+        assert!(
+            worker
+                .restore(
+                    source_path,
+                    RestoreBudget {
+                        max_records: 500,
+                        max_total_bytes: 64 * 1024 * 1024,
+                        max_record_bytes: 16 * 1024 * 1024,
+                    },
+                )
+                .is_err()
+        );
+
+        assert!(available.load(Ordering::Acquire));
+        assert_eq!(live.record_details(old.id).unwrap(), old);
+        assert!(live.record_details(restored.id).is_err());
+        let after = record("after", Utc::now() + Duration::seconds(2));
+        worker.save_record(&after).unwrap();
+        assert_eq!(live.record_details(after.id).unwrap(), after);
     }
 
     #[test]

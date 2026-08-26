@@ -10,8 +10,8 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use serde::Serialize;
 
 use crate::domain::{
-    CapturedClipboard, ClipboardRecord, ClipboardRepresentation, GroupId, RecordId, RecordNote,
-    RecordNoteError,
+    CapturedClipboard, ClipboardRecord, ClipboardRepresentation, GroupId, HistoryCursor,
+    HistoryQuery, RecordId, RecordNote, RecordNoteError,
 };
 use crate::services::persistence::{HistoryPage, HistoryRecordSummary, RecordPersistence};
 
@@ -57,6 +57,7 @@ pub struct SessionRecordStore {
     limits: SessionRecordLimits,
     persistence: NotePersistence,
     storage_available: Arc<AtomicBool>,
+    mutation_refresh: Mutex<()>,
 }
 
 enum NotePersistence {
@@ -77,6 +78,9 @@ struct SessionRecordState {
     page: VecDeque<SessionRecordView>,
     total_bytes: usize,
     paged: bool,
+    base_query: HistoryQuery,
+    next_cursor: Option<HistoryCursor>,
+    loaded_target: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -104,11 +108,15 @@ impl SessionRecordStore {
                 page: VecDeque::new(),
                 total_bytes: 0,
                 paged: false,
+                base_query: HistoryQuery::default(),
+                next_cursor: None,
+                loaded_target: 0,
             }),
             last_deleted: Mutex::new(None),
             limits,
             persistence: NotePersistence::NotConfigured,
             storage_available: Arc::new(AtomicBool::new(false)),
+            mutation_refresh: Mutex::new(()),
         }
     }
 
@@ -123,6 +131,9 @@ impl SessionRecordStore {
                 page: VecDeque::new(),
                 total_bytes: 0,
                 paged: false,
+                base_query: HistoryQuery::default(),
+                next_cursor: None,
+                loaded_target: 0,
             }),
             last_deleted: Mutex::new(None),
             limits: SessionRecordLimits {
@@ -132,6 +143,7 @@ impl SessionRecordStore {
             },
             persistence: NotePersistence::Durable(persistence),
             storage_available,
+            mutation_refresh: Mutex::new(()),
         };
         store.replace_loaded(records);
         store
@@ -142,12 +154,32 @@ impl SessionRecordStore {
         persistence: Arc<dyn RecordPersistence>,
         storage_available: Arc<AtomicBool>,
     ) -> Self {
+        Self::with_persistence_query_page(
+            HistoryQuery {
+                limit: STARTUP_HISTORY_RECORDS,
+                ..HistoryQuery::default()
+            },
+            page,
+            persistence,
+            storage_available,
+        )
+    }
+
+    pub fn with_persistence_query_page(
+        query: HistoryQuery,
+        page: HistoryPage,
+        persistence: Arc<dyn RecordPersistence>,
+        storage_available: Arc<AtomicBool>,
+    ) -> Self {
         let store = Self {
             state: Mutex::new(SessionRecordState {
                 records: VecDeque::new(),
                 page: VecDeque::new(),
                 total_bytes: 0,
                 paged: true,
+                base_query: base_history_query(&query),
+                next_cursor: None,
+                loaded_target: 0,
             }),
             last_deleted: Mutex::new(None),
             limits: SessionRecordLimits {
@@ -157,8 +189,9 @@ impl SessionRecordStore {
             },
             persistence: NotePersistence::Durable(persistence),
             storage_available,
+            mutation_refresh: Mutex::new(()),
         };
-        store.replace_page(page);
+        store.replace_page_for_query(query, page);
         store
     }
 
@@ -178,6 +211,9 @@ impl SessionRecordStore {
                 page: VecDeque::new(),
                 total_bytes: 0,
                 paged: false,
+                base_query: HistoryQuery::default(),
+                next_cursor: None,
+                loaded_target: 0,
             }),
             last_deleted: Mutex::new(None),
             limits: SessionRecordLimits {
@@ -187,6 +223,7 @@ impl SessionRecordStore {
             },
             persistence: NotePersistence::SessionOnly,
             storage_available,
+            mutation_refresh: Mutex::new(()),
         };
         store.replace_loaded(records);
         store
@@ -218,6 +255,7 @@ impl SessionRecordStore {
         if capture_bytes > self.limits.record_bytes {
             return CaptureStatus::RejectedTooLarge;
         }
+        let _serial = lock_unpoisoned(&self.mutation_refresh);
         self.load_page_front_for_capture();
         let mut state = lock_unpoisoned(&self.state);
         if let Some(current) = state.records.front()
@@ -316,8 +354,23 @@ impl SessionRecordStore {
     }
 
     pub fn replace_page(&self, page: HistoryPage) {
+        let query = {
+            let state = lock_unpoisoned(&self.state);
+            HistoryQuery {
+                limit: page.records.len(),
+                ..state.base_query.clone()
+            }
+        };
+        self.replace_page_for_query(query, page);
+    }
+
+    pub fn replace_page_for_query(&self, query: HistoryQuery, page: HistoryPage) {
+        let _serial = lock_unpoisoned(&self.mutation_refresh);
         let mut state = lock_unpoisoned(&self.state);
         state.paged = true;
+        state.base_query = base_history_query(&query);
+        state.next_cursor = page.next_cursor.clone();
+        state.loaded_target = page.records.len().min(MAX_SESSION_RECORDS);
         state.page = page
             .records
             .into_iter()
@@ -327,8 +380,10 @@ impl SessionRecordStore {
     }
 
     pub fn append_page(&self, page: HistoryPage) {
+        let _serial = lock_unpoisoned(&self.mutation_refresh);
         let mut state = lock_unpoisoned(&self.state);
         state.paged = true;
+        state.next_cursor = page.next_cursor.clone();
         for summary in page.records {
             if state.page.len() >= MAX_SESSION_RECORDS {
                 break;
@@ -340,6 +395,16 @@ impl SessionRecordStore {
                 .page
                 .push_back(SessionRecordView::from_summary(summary));
         }
+        state.loaded_target = state.page.len();
+    }
+
+    pub fn next_page_query(&self) -> Option<HistoryQuery> {
+        let state = lock_unpoisoned(&self.state);
+        state.next_cursor.clone().map(|cursor| HistoryQuery {
+            cursor: Some(cursor),
+            limit: STARTUP_HISTORY_RECORDS,
+            ..state.base_query.clone()
+        })
     }
 
     pub fn image_preview(&self, id: RecordId) -> Result<ImagePreviewView, SessionRecordError> {
@@ -369,6 +434,7 @@ impl SessionRecordStore {
         } else {
             Some(RecordNote::new(value).map_err(SessionRecordError::InvalidNote)?)
         };
+        let _serial = lock_unpoisoned(&self.mutation_refresh);
         self.load_record_for_mutation(id)?;
         let mut state = lock_unpoisoned(&self.state);
         let index = state
@@ -432,7 +498,7 @@ impl SessionRecordStore {
                     self.storage_available.store(false, Ordering::Release);
                     return Err(SessionRecordError::PersistenceUnavailable);
                 }
-                self.refresh_first_page()?;
+                self.refresh_loaded_window()?;
             }
         }
         Ok(view)
@@ -443,6 +509,7 @@ impl SessionRecordStore {
         id: RecordId,
         group_id: Option<GroupId>,
     ) -> Result<SessionRecordView, SessionRecordError> {
+        let _serial = lock_unpoisoned(&self.mutation_refresh);
         self.load_record_for_mutation(id)?;
         let mut state = lock_unpoisoned(&self.state);
         let record = state
@@ -467,7 +534,7 @@ impl SessionRecordStore {
                     self.storage_available.store(false, Ordering::Release);
                     return Err(SessionRecordError::PersistenceUnavailable);
                 }
-                self.refresh_first_page()?;
+                self.refresh_loaded_window()?;
             }
         }
         Ok(view)
@@ -491,6 +558,7 @@ impl SessionRecordStore {
     }
 
     pub fn delete(&self, id: RecordId) -> Result<ClipboardRecord, SessionRecordError> {
+        let _serial = lock_unpoisoned(&self.mutation_refresh);
         self.require_durable_storage()?;
         self.load_record_for_mutation(id)?;
         let mut state = lock_unpoisoned(&self.state);
@@ -515,7 +583,7 @@ impl SessionRecordStore {
         lock_unpoisoned(&self.state)
             .page
             .retain(|view| view.id != id);
-        self.refresh_first_page()?;
+        self.refresh_loaded_window()?;
         let removed = removed.as_ref().clone();
         *lock_unpoisoned(&self.last_deleted) = Some(removed.clone());
         Ok(removed)
@@ -525,6 +593,7 @@ impl SessionRecordStore {
         &self,
         id: RecordId,
     ) -> Result<SessionRecordView, SessionRecordError> {
+        let _serial = lock_unpoisoned(&self.mutation_refresh);
         self.require_durable_storage()?;
         let mut deleted = lock_unpoisoned(&self.last_deleted);
         if deleted.as_ref().is_none_or(|record| record.id != id) {
@@ -541,11 +610,12 @@ impl SessionRecordStore {
             return Err(SessionRecordError::PersistenceUnavailable);
         }
         self.restore_in_memory(record);
-        self.refresh_first_page()?;
+        self.refresh_loaded_window()?;
         Ok(view)
     }
 
     pub fn clear(&self) -> Result<usize, SessionRecordError> {
+        let _serial = lock_unpoisoned(&self.mutation_refresh);
         self.require_durable_storage()?;
         let removed = match &self.persistence {
             NotePersistence::Durable(persistence) => persistence.clear_records().map_err(|_| {
@@ -560,6 +630,8 @@ impl SessionRecordStore {
         state.records.clear();
         state.page.clear();
         state.total_bytes = 0;
+        state.next_cursor = None;
+        state.loaded_target = 0;
         *lock_unpoisoned(&self.last_deleted) = None;
         Ok(removed)
     }
@@ -587,6 +659,9 @@ impl SessionRecordStore {
         state.page.clear();
         state.total_bytes = 0;
         state.paged = false;
+        state.base_query = HistoryQuery::default();
+        state.next_cursor = None;
+        state.loaded_target = 0;
         *lock_unpoisoned(&self.last_deleted) = None;
         for mut record in records {
             retain_preferred_image(&mut record.representations);
@@ -606,37 +681,64 @@ impl SessionRecordStore {
         self.replace_all(records);
     }
 
+    #[cfg(test)]
     pub(crate) fn reload_first_page(&self) -> Result<(), SessionRecordError> {
-        let page = self.load_first_page()?;
+        let _serial = lock_unpoisoned(&self.mutation_refresh);
+        let query = HistoryQuery {
+            limit: STARTUP_HISTORY_RECORDS,
+            ..HistoryQuery::default()
+        };
+        let page = self.load_page(query.clone())?;
+        self.apply_page_state(query, page);
+        Ok(())
+    }
+
+    pub(crate) fn apply_restored_page(&self, query: HistoryQuery, page: HistoryPage) {
+        let _serial = lock_unpoisoned(&self.mutation_refresh);
+        self.apply_page_state(query, page);
+    }
+
+    fn apply_page_state(&self, query: HistoryQuery, page: HistoryPage) {
         let mut state = lock_unpoisoned(&self.state);
         state.records.clear();
         state.total_bytes = 0;
         state.paged = true;
+        state.base_query = base_history_query(&query);
+        state.next_cursor = page.next_cursor.clone();
+        state.loaded_target = page.records.len().min(MAX_SESSION_RECORDS);
         state.page = page
             .records
             .into_iter()
             .map(SessionRecordView::from_summary)
             .collect();
         *lock_unpoisoned(&self.last_deleted) = None;
-        Ok(())
     }
 
     fn persist_record(&self, record: &ClipboardRecord) {
         if let NotePersistence::Durable(persistence) = &self.persistence
             && self.storage_available.load(Ordering::Acquire)
-            && (persistence.save_record(record).is_err() || self.refresh_first_page().is_err())
         {
-            self.storage_available.store(false, Ordering::Release);
+            if persistence.save_record(record).is_err() {
+                self.storage_available.store(false, Ordering::Release);
+            } else {
+                let _ = self.refresh_loaded_window();
+            }
         }
     }
 
-    fn refresh_first_page(&self) -> Result<(), SessionRecordError> {
-        if !lock_unpoisoned(&self.state).paged {
+    fn refresh_loaded_window(&self) -> Result<(), SessionRecordError> {
+        let (base_query, loaded_target, paged) = {
+            let state = lock_unpoisoned(&self.state);
+            (state.base_query.clone(), state.loaded_target, state.paged)
+        };
+        if !paged {
             return Ok(());
         }
-        let page = self.load_first_page()?;
-        let page_ids: Vec<_> = page.records.iter().map(|summary| summary.id).collect();
+        let page = self.load_window(base_query, loaded_target)?;
+        let page_ids: std::collections::HashSet<_> =
+            page.records.iter().map(|summary| summary.id).collect();
         let mut state = lock_unpoisoned(&self.state);
+        state.next_cursor = page.next_cursor.clone();
         state.page = page
             .records
             .into_iter()
@@ -651,17 +753,40 @@ impl SessionRecordStore {
         Ok(())
     }
 
-    fn load_first_page(&self) -> Result<HistoryPage, SessionRecordError> {
+    fn load_window(
+        &self,
+        base_query: HistoryQuery,
+        loaded_target: usize,
+    ) -> Result<HistoryPage, SessionRecordError> {
+        let target = loaded_target.clamp(1, MAX_SESSION_RECORDS);
+        let mut records = Vec::with_capacity(target);
+        let mut cursor = None;
+        let mut next_cursor = None;
+        while records.len() < target {
+            let query = HistoryQuery {
+                cursor: cursor.clone(),
+                limit: (target - records.len()).min(100),
+                ..base_query.clone()
+            };
+            let page = self.load_page(query)?;
+            records.extend(page.records);
+            next_cursor = page.next_cursor;
+            let Some(next) = next_cursor.clone() else {
+                break;
+            };
+            cursor = Some(next);
+        }
+        Ok(HistoryPage {
+            records,
+            next_cursor,
+        })
+    }
+
+    fn load_page(&self, query: HistoryQuery) -> Result<HistoryPage, SessionRecordError> {
         match &self.persistence {
             NotePersistence::Durable(persistence) => persistence
-                .load_page(crate::domain::HistoryQuery {
-                    limit: STARTUP_HISTORY_RECORDS,
-                    ..crate::domain::HistoryQuery::default()
-                })
-                .map_err(|_| {
-                    self.storage_available.store(false, Ordering::Release);
-                    SessionRecordError::PersistenceUnavailable
-                }),
+                .load_page(query)
+                .map_err(|_| SessionRecordError::PersistenceUnavailable),
             NotePersistence::NotConfigured | NotePersistence::SessionOnly => {
                 Err(SessionRecordError::PersistenceUnavailable)
             }
@@ -896,6 +1021,17 @@ fn sort_records(records: &mut VecDeque<Arc<ClipboardRecord>>) {
     });
 }
 
+fn base_history_query(query: &HistoryQuery) -> HistoryQuery {
+    HistoryQuery {
+        cursor: None,
+        limit: 0,
+        content_kind: query.content_kind,
+        group_id: query.group_id,
+        ungrouped_only: query.ungrouped_only,
+        favorites_only: query.favorites_only,
+    }
+}
+
 fn record_order(
     left_at: chrono::DateTime<chrono::Utc>,
     left_id: RecordId,
@@ -1117,13 +1253,55 @@ fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use chrono::{Duration, TimeZone, Utc};
-    use std::sync::atomic::AtomicBool;
+    use std::sync::{Barrier, atomic::AtomicBool};
 
     use super::*;
     use crate::domain::{ContentIdentity, SourceIdentity};
     use crate::services::persistence::{PersistenceError, RecordPersistence};
     use crate::{domain::HistoryQuery, services::persistence::SqliteRepository};
     use tempfile::tempdir;
+
+    struct BlockingPagePersistence {
+        repository: Arc<SqliteRepository>,
+        block_next_page: AtomicBool,
+        page_loaded: Barrier,
+        resume_page: Barrier,
+    }
+
+    impl RecordPersistence for BlockingPagePersistence {
+        fn save_record(&self, record: &ClipboardRecord) -> Result<(), PersistenceError> {
+            self.repository.save_record(record)
+        }
+
+        fn update_note(
+            &self,
+            id: RecordId,
+            note: Option<&RecordNote>,
+        ) -> Result<(), PersistenceError> {
+            self.repository.update_note(id, note)
+        }
+
+        fn delete_record(&self, id: RecordId) -> Result<(), PersistenceError> {
+            self.repository.delete_record(id)
+        }
+
+        fn clear_records(&self) -> Result<usize, PersistenceError> {
+            self.repository.clear_records()
+        }
+
+        fn load_page(&self, query: HistoryQuery) -> Result<HistoryPage, PersistenceError> {
+            let page = self.repository.load_page(query)?;
+            if self.block_next_page.swap(false, Ordering::AcqRel) {
+                self.page_loaded.wait();
+                self.resume_page.wait();
+            }
+            Ok(page)
+        }
+
+        fn record_details(&self, id: RecordId) -> Result<ClipboardRecord, PersistenceError> {
+            self.repository.record_details(id)
+        }
+    }
 
     fn png_bytes(width: u32, height: u32) -> Vec<u8> {
         let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
@@ -1330,6 +1508,172 @@ mod tests {
         assert_eq!(store.delete(delete_record.id).unwrap().id, delete_record.id);
         assert!(store.list().iter().all(|view| view.id != delete_record.id));
         assert!(repository.record_details(delete_record.id).is_err());
+    }
+
+    #[test]
+    fn paged_mutation_preserves_appended_range_and_next_cursor() {
+        let directory = tempdir().unwrap();
+        let repository = SqliteRepository::open(directory.path().join("history.sqlite3")).unwrap();
+        let base = Utc.with_ymd_and_hms(2026, 8, 27, 8, 0, 0).unwrap();
+        for index in 0..35 {
+            repository
+                .save_record(&ClipboardRecord::from_capture(capture_at(
+                    &format!("range-{index}"),
+                    "range",
+                    base + Duration::seconds(index),
+                )))
+                .unwrap();
+        }
+        let query = HistoryQuery {
+            limit: 10,
+            ..HistoryQuery::default()
+        };
+        let first = repository.load_page(query.clone()).unwrap();
+        let second = repository
+            .load_page(HistoryQuery {
+                cursor: first.next_cursor.clone(),
+                ..query.clone()
+            })
+            .unwrap();
+        let store = SessionRecordStore::with_persistence_query_page(
+            query,
+            first,
+            Arc::clone(&repository) as Arc<dyn RecordPersistence>,
+            Arc::new(AtomicBool::new(true)),
+        );
+        store.append_page(second);
+        let mutate = store.list()[15].id;
+
+        store.update_note(mutate, "kept range".to_owned()).unwrap();
+
+        assert_eq!(store.list().len(), 20);
+        assert_eq!(
+            store
+                .list()
+                .iter()
+                .find(|view| view.id == mutate)
+                .and_then(|view| view.note.as_ref())
+                .map(RecordNote::as_str),
+            Some("kept range")
+        );
+        let next = store.next_page_query().expect("more history remains");
+        assert!(next.cursor.is_some());
+        assert_eq!(next.content_kind, None);
+        assert!(!repository.load_page(next).unwrap().records.is_empty());
+    }
+
+    #[test]
+    fn filtered_paged_mutation_preserves_the_base_query() {
+        let directory = tempdir().unwrap();
+        let repository = SqliteRepository::open(directory.path().join("history.sqlite3")).unwrap();
+        let included = GroupId::new();
+        let excluded = GroupId::new();
+        let mut included_records = Vec::new();
+        for index in 0..12 {
+            let mut record = ClipboardRecord::from_capture(capture(
+                &format!("included-{index}"),
+                &format!("included-{index}"),
+            ));
+            record.group_id = Some(included);
+            repository.save_record(&record).unwrap();
+            included_records.push(record);
+        }
+        for index in 0..8 {
+            let mut record = ClipboardRecord::from_capture(capture(
+                &format!("excluded-{index}"),
+                &format!("excluded-{index}"),
+            ));
+            record.group_id = Some(excluded);
+            repository.save_record(&record).unwrap();
+        }
+        let query = HistoryQuery {
+            limit: 6,
+            group_id: Some(included),
+            ..HistoryQuery::default()
+        };
+        let page = repository.load_page(query.clone()).unwrap();
+        let store = SessionRecordStore::with_persistence_query_page(
+            query,
+            page,
+            Arc::clone(&repository) as Arc<dyn RecordPersistence>,
+            Arc::new(AtomicBool::new(true)),
+        );
+        let mutate = store.list()[2].id;
+
+        store.update_note(mutate, "filtered".to_owned()).unwrap();
+
+        assert_eq!(store.list().len(), 6);
+        assert!(
+            store
+                .list()
+                .iter()
+                .all(|view| view.group_id == Some(included))
+        );
+        let next = store
+            .next_page_query()
+            .expect("filtered history has another page");
+        assert_eq!(next.group_id, Some(included));
+        assert!(
+            repository
+                .load_page(next)
+                .unwrap()
+                .records
+                .iter()
+                .all(|summary| summary.group_id == Some(included))
+        );
+        assert!(included_records.iter().any(|record| record.id == mutate));
+    }
+
+    #[test]
+    fn serialized_refresh_cannot_publish_an_old_snapshot_after_a_new_mutation() {
+        let directory = tempdir().unwrap();
+        let repository = SqliteRepository::open(directory.path().join("history.sqlite3")).unwrap();
+        let first = ClipboardRecord::from_capture(capture("first", "first"));
+        let second = ClipboardRecord::from_capture(capture("second", "second"));
+        repository.save_record(&first).unwrap();
+        repository.save_record(&second).unwrap();
+        let persistence = Arc::new(BlockingPagePersistence {
+            repository: Arc::clone(&repository),
+            block_next_page: AtomicBool::new(true),
+            page_loaded: Barrier::new(2),
+            resume_page: Barrier::new(2),
+        });
+        let store = Arc::new(SessionRecordStore::with_persistence_page(
+            repository.load_page(HistoryQuery::default()).unwrap(),
+            Arc::clone(&persistence) as Arc<dyn RecordPersistence>,
+            Arc::new(AtomicBool::new(true)),
+        ));
+        let old_refresh = {
+            let store = Arc::clone(&store);
+            std::thread::spawn(move || store.update_note(first.id, "old".to_owned()))
+        };
+        persistence.page_loaded.wait();
+        let newer_mutation = {
+            let store = Arc::clone(&store);
+            std::thread::spawn(move || store.update_note(first.id, "new".to_owned()))
+        };
+        persistence.resume_page.wait();
+        old_refresh.join().unwrap().unwrap();
+        newer_mutation.join().unwrap().unwrap();
+
+        assert_eq!(
+            store
+                .list()
+                .iter()
+                .find(|view| view.id == first.id)
+                .and_then(|view| view.note.as_ref())
+                .map(RecordNote::as_str),
+            Some("new")
+        );
+        assert_eq!(
+            repository
+                .record_details(first.id)
+                .unwrap()
+                .note
+                .as_ref()
+                .map(RecordNote::as_str),
+            Some("new")
+        );
     }
 
     #[test]

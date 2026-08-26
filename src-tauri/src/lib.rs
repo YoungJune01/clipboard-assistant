@@ -1382,9 +1382,13 @@ fn restore_backup(
         effective.quick_paste_modifiers = previous.quick_paste_modifiers;
     }
 
-    records
-        .reload_first_page()
-        .map_err(|error| error.to_string())?;
+    records.apply_restored_page(
+        crate::domain::HistoryQuery {
+            limit: services::session_records::STARTUP_HISTORY_RECORDS,
+            ..crate::domain::HistoryQuery::default()
+        },
+        restored.page,
+    );
     groups.replace_all(restored.groups);
     active.set(ActiveGroup::All);
     let startup_updated = std::env::current_exe()
