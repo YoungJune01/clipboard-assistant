@@ -1997,6 +1997,33 @@ mod tests {
     }
 
     #[test]
+    fn history_page_next_cursor_json_can_be_used_for_the_next_request() {
+        let cursor = HistoryCursor {
+            captured_at: Utc.with_ymd_and_hms(2026, 8, 27, 8, 9, 10).unwrap(),
+            id: RecordId::new(),
+        };
+        let page = HistoryPageView {
+            items: Vec::new(),
+            next_cursor: Some(cursor.clone()),
+        };
+
+        let response = serde_json::to_value(&page).unwrap();
+        assert_eq!(response["nextCursor"]["capturedAt"], "2026-08-27T08:09:10Z");
+        assert!(response["nextCursor"].get("captured_at").is_none());
+
+        let request = serde_json::json!({
+            "cursor": response["nextCursor"].clone(),
+            "limit": 25,
+            "contentKind": null,
+            "groupId": null,
+            "ungroupedOnly": false,
+            "favoritesOnly": false
+        });
+        let query: HistoryQuery = serde_json::from_value(request).unwrap();
+        assert_eq!(query.cursor, Some(cursor));
+    }
+
+    #[test]
     fn paged_mutation_preserves_appended_range_and_next_cursor() {
         let directory = tempdir().unwrap();
         let repository = SqliteRepository::open(directory.path().join("history.sqlite3")).unwrap();

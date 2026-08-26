@@ -59,6 +59,7 @@ impl Default for GroupId {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct HistoryCursor {
     pub captured_at: DateTime<Utc>,
     pub id: RecordId,
@@ -245,7 +246,10 @@ impl Error for RefreshError {}
 
 #[cfg(test)]
 mod tests {
-    use super::{ClipboardRecord, GroupId, RecordNote, RecordNoteError, RefreshError};
+    use super::{
+        ClipboardRecord, GroupId, HistoryCursor, HistoryQuery, RecordId, RecordNote,
+        RecordNoteError, RefreshError,
+    };
     use crate::domain::{
         CapturedClipboard, ClipboardRepresentation, ContentIdentity, ContentKind, SourceIdentity,
     };
@@ -298,6 +302,34 @@ mod tests {
 
         assert!(serde_json::from_str::<RecordNote>(&too_long).is_err());
         assert!(serde_json::from_str::<RecordNote>(r#""first\nsecond""#).is_err());
+    }
+
+    #[test]
+    fn history_query_cursor_round_trips_with_camel_case_fields() {
+        let id = RecordId::new();
+        let json = format!(
+            r#"{{"cursor":{{"capturedAt":"2026-08-27T08:09:10Z","id":"{id}"}},"limit":25,"contentKind":null,"groupId":null,"ungroupedOnly":false,"favoritesOnly":false}}"#,
+            id = id.as_uuid()
+        );
+
+        let query: HistoryQuery = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            query.cursor,
+            Some(HistoryCursor {
+                captured_at: Utc.with_ymd_and_hms(2026, 8, 27, 8, 9, 10).unwrap(),
+                id,
+            })
+        );
+
+        let serialized = serde_json::to_value(&query).unwrap();
+        assert_eq!(serialized["cursor"]["capturedAt"], "2026-08-27T08:09:10Z");
+        assert!(serialized["cursor"].get("captured_at").is_none());
+        assert_eq!(
+            serde_json::from_value::<HistoryQuery>(serialized)
+                .unwrap()
+                .cursor,
+            query.cursor
+        );
     }
 
     #[test]
