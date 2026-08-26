@@ -283,12 +283,21 @@ impl SessionRecordStore {
             .iter()
             .position(|record| record.id == id)
             .ok_or(SessionRecordError::NotFound)?;
-        let previous_bytes = record_bytes(&state.records[index]);
-        let updated_bytes = representation_bytes(&state.records[index].representations)
-            + note.as_ref().map_or(0, |note| note.as_str().len());
+        let previous_bytes = checked_record_bytes(&state.records[index])
+            .ok_or(SessionRecordError::RecordTooLarge)?;
+        let updated_bytes = checked_representation_bytes(&state.records[index].representations)
+            .and_then(|bytes| {
+                bytes.checked_add(note.as_ref().map_or(0, |note| note.as_str().len()))
+            })
+            .ok_or(SessionRecordError::RecordTooLarge)?;
         if updated_bytes > self.limits.record_bytes {
             return Err(SessionRecordError::RecordTooLarge);
         }
+        let updated_total_bytes = state
+            .total_bytes
+            .checked_sub(previous_bytes)
+            .and_then(|bytes| bytes.checked_add(updated_bytes))
+            .ok_or(SessionRecordError::RecordTooLarge)?;
         let record = Arc::make_mut(
             state
                 .records
@@ -296,7 +305,7 @@ impl SessionRecordStore {
                 .ok_or(SessionRecordError::NotFound)?,
         );
         record.note = note;
-        state.total_bytes = state.total_bytes - previous_bytes + updated_bytes;
+        state.total_bytes = updated_total_bytes;
         evict_to_limits(&mut state, self.limits);
         let view = state
             .records
@@ -1247,6 +1256,36 @@ mod tests {
             Err(SessionRecordError::RecordTooLarge)
         ));
         assert_eq!(store.list()[0].note, None);
+    }
+
+    #[test]
+    fn note_update_rejects_total_budget_overflow_without_mutating_file_list_record() {
+        let record = ClipboardRecord::from_capture(CapturedClipboard {
+            content_identity: ContentIdentity::new("file-list"),
+            captured_at: Utc::now(),
+            source: SourceIdentity::default(),
+            representations: vec![ClipboardRepresentation::FileList {
+                paths: vec![r"C:\Temp\one.txt".to_owned()],
+            }],
+        });
+        let id = record.id;
+        let store = SessionRecordStore::with_test_limits(usize::MAX, usize::MAX, 32);
+        {
+            let mut state = lock_unpoisoned(&store.state);
+            state.records.push_back(Arc::new(record.clone()));
+            state.total_bytes = usize::MAX;
+        }
+        let before_budget = store.budget_snapshot();
+        let before_records = store.list();
+        let before_representations = store.representations(id);
+
+        assert!(matches!(
+            store.update_note(id, "note".to_owned()),
+            Err(SessionRecordError::RecordTooLarge)
+        ));
+        assert_eq!(store.list(), before_records);
+        assert_eq!(store.representations(id), before_representations);
+        assert_eq!(store.budget_snapshot(), before_budget);
     }
 
     fn capture(identity: &str, text: &str) -> CapturedClipboard {
