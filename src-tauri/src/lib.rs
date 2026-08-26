@@ -1336,86 +1336,90 @@ fn restore_backup(
         .persistence
         .as_ref()
         .ok_or_else(|| "local clipboard storage is unavailable".to_owned())?;
-    let restored = persistence
-        .restore(
-            source,
-            RestoreBudget {
-                max_records: services::session_records::MAX_SESSION_RECORDS,
-                max_total_bytes: services::session_records::DEFAULT_STORE_BYTES,
-                max_record_bytes: services::session_records::MAX_CAPTURE_RECORD_BYTES,
-            },
-        )
-        .map_err(|error| error.to_string())?;
+    let view = records.with_restore_guard(|restore_guard| {
+        let restored = persistence
+            .restore(
+                source,
+                RestoreBudget {
+                    max_records: services::session_records::MAX_SESSION_RECORDS,
+                    max_total_bytes: services::session_records::DEFAULT_STORE_BYTES,
+                    max_record_bytes: services::session_records::MAX_CAPTURE_RECORD_BYTES,
+                },
+            )
+            .map_err(|error| error.to_string())?;
 
-    let previous = settings.current();
-    let mut effective = restored.settings;
-    if effective.capture_sound == CaptureSound::Custom && !settings.custom_sound_path.is_file() {
-        effective.capture_sound = CaptureSound::Default;
-    }
-    if !effective.show_tray_icon {
-        effective.start_minimized = false;
-    }
-    if validate_shortcuts(
-        effective.activation_shortcut,
-        effective.group_shortcut_modifiers,
-        effective.quick_paste_modifiers,
-    )
-    .is_err()
-        || reconfigure_hotkeys(
+        let previous = settings.current();
+        let mut effective = restored.settings;
+        if effective.capture_sound == CaptureSound::Custom && !settings.custom_sound_path.is_file()
+        {
+            effective.capture_sound = CaptureSound::Default;
+        }
+        if !effective.show_tray_icon {
+            effective.start_minimized = false;
+        }
+        if validate_shortcuts(
             effective.activation_shortcut,
             effective.group_shortcut_modifiers,
-            effective.quick_paste_enabled,
             effective.quick_paste_modifiers,
-            previous,
-            &runtime,
-            groups.inner(),
-            records.inner(),
-            active.inner(),
-            coordinator.inner(),
-            &app,
         )
         .is_err()
-    {
-        effective.activation_shortcut = previous.activation_shortcut;
-        effective.group_shortcut_modifiers = previous.group_shortcut_modifiers;
-        effective.quick_paste_enabled = previous.quick_paste_enabled;
-        effective.quick_paste_modifiers = previous.quick_paste_modifiers;
-    }
-
-    records.apply_restored_page(
-        crate::domain::HistoryQuery {
-            limit: services::session_records::STARTUP_HISTORY_RECORDS,
-            ..crate::domain::HistoryQuery::default()
-        },
-        restored.page,
-    );
-    groups.replace_all(restored.groups);
-    active.set(ActiveGroup::All);
-    let startup_updated = std::env::current_exe()
-        .ok()
-        .and_then(|executable| {
-            platform::windows::startup::set_start_at_sign_in(
-                effective.start_at_sign_in,
-                &executable,
+            || reconfigure_hotkeys(
+                effective.activation_shortcut,
+                effective.group_shortcut_modifiers,
+                effective.quick_paste_enabled,
+                effective.quick_paste_modifiers,
+                previous,
+                &runtime,
+                groups.inner(),
+                records.inner(),
+                active.inner(),
+                coordinator.inner(),
+                &app,
             )
+            .is_err()
+        {
+            effective.activation_shortcut = previous.activation_shortcut;
+            effective.group_shortcut_modifiers = previous.group_shortcut_modifiers;
+            effective.quick_paste_enabled = previous.quick_paste_enabled;
+            effective.quick_paste_modifiers = previous.quick_paste_modifiers;
+        }
+
+        restore_guard.apply_page(
+            crate::domain::HistoryQuery {
+                limit: services::session_records::STARTUP_HISTORY_RECORDS,
+                ..crate::domain::HistoryQuery::default()
+            },
+            restored.page,
+        );
+        groups.replace_all(restored.groups);
+        active.set(ActiveGroup::All);
+        let startup_updated = std::env::current_exe()
             .ok()
-        })
-        .is_some();
-    if !startup_updated {
-        effective.start_at_sign_in = previous.start_at_sign_in;
-    }
-    if desktop.tray.set_visible(effective.show_tray_icon).is_err() {
-        effective.show_tray_icon = previous.show_tray_icon;
-        effective.start_minimized = previous.start_minimized;
-    }
-    desktop.set_language(effective.language);
-    settings
-        .capture_policy
-        .set_excluded_applications(normalize_excluded_applications(
-            restored.excluded_applications,
-        )?);
-    let view = settings.replace_current(effective);
-    settings.persist_settings();
+            .and_then(|executable| {
+                platform::windows::startup::set_start_at_sign_in(
+                    effective.start_at_sign_in,
+                    &executable,
+                )
+                .ok()
+            })
+            .is_some();
+        if !startup_updated {
+            effective.start_at_sign_in = previous.start_at_sign_in;
+        }
+        if desktop.tray.set_visible(effective.show_tray_icon).is_err() {
+            effective.show_tray_icon = previous.show_tray_icon;
+            effective.start_minimized = previous.start_minimized;
+        }
+        desktop.set_language(effective.language);
+        settings
+            .capture_policy
+            .set_excluded_applications(normalize_excluded_applications(
+                restored.excluded_applications,
+            )?);
+        let view = settings.replace_current(effective);
+        settings.persist_settings();
+        Ok::<_, String>(view)
+    })?;
     let _ = app.emit("clipboard-records-changed", ());
     let _ = app.emit("clipboard-groups-changed", ());
     let _ = app.emit(

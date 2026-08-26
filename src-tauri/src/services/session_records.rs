@@ -60,6 +60,17 @@ pub struct SessionRecordStore {
     mutation_refresh: Mutex<()>,
 }
 
+pub(crate) struct SessionRestoreGuard<'a> {
+    store: &'a SessionRecordStore,
+    _serial: std::sync::MutexGuard<'a, ()>,
+}
+
+impl SessionRestoreGuard<'_> {
+    pub(crate) fn apply_page(&self, query: HistoryQuery, page: HistoryPage) {
+        self.store.apply_page_state(query, page);
+    }
+}
+
 enum NotePersistence {
     NotConfigured,
     Durable(Arc<dyn RecordPersistence>),
@@ -693,9 +704,15 @@ impl SessionRecordStore {
         Ok(())
     }
 
-    pub(crate) fn apply_restored_page(&self, query: HistoryQuery, page: HistoryPage) {
-        let _serial = lock_unpoisoned(&self.mutation_refresh);
-        self.apply_page_state(query, page);
+    pub(crate) fn with_restore_guard<T>(
+        &self,
+        operation: impl FnOnce(&SessionRestoreGuard<'_>) -> T,
+    ) -> T {
+        let guard = SessionRestoreGuard {
+            store: self,
+            _serial: lock_unpoisoned(&self.mutation_refresh),
+        };
+        operation(&guard)
     }
 
     fn apply_page_state(&self, query: HistoryQuery, page: HistoryPage) {
@@ -1673,6 +1690,67 @@ mod tests {
                 .as_ref()
                 .map(RecordNote::as_str),
             Some("new")
+        );
+    }
+
+    #[test]
+    fn restore_guard_blocks_capture_until_the_restored_page_is_applied() {
+        let directory = tempdir().unwrap();
+        let repository = SqliteRepository::open(directory.path().join("history.sqlite3")).unwrap();
+        let restored = ClipboardRecord::from_capture(capture("restored", "restored"));
+        repository.save_record(&restored).unwrap();
+        let store = Arc::new(SessionRecordStore::with_persistence_page(
+            HistoryPage {
+                records: Vec::new(),
+                next_cursor: None,
+            },
+            Arc::clone(&repository) as Arc<dyn RecordPersistence>,
+            Arc::new(AtomicBool::new(true)),
+        ));
+        let restore_started = Arc::new(Barrier::new(2));
+        let apply_restore = Arc::new(Barrier::new(2));
+        let restoring = {
+            let store = Arc::clone(&store);
+            let restore_started = Arc::clone(&restore_started);
+            let apply_restore = Arc::clone(&apply_restore);
+            let page = repository.load_page(HistoryQuery::default()).unwrap();
+            std::thread::spawn(move || {
+                store.with_restore_guard(|guard| {
+                    restore_started.wait();
+                    apply_restore.wait();
+                    guard.apply_page(HistoryQuery::default(), page);
+                });
+            })
+        };
+        restore_started.wait();
+        let capture_finished = Arc::new(AtomicBool::new(false));
+        let capturing = {
+            let store = Arc::clone(&store);
+            let capture_finished = Arc::clone(&capture_finished);
+            std::thread::spawn(move || {
+                store.capture(capture("captured-after-restore", "captured"));
+                capture_finished.store(true, Ordering::Release);
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(25));
+        assert!(!capture_finished.load(Ordering::Acquire));
+        apply_restore.wait();
+        restoring.join().unwrap();
+        capturing.join().unwrap();
+
+        let views = store.list();
+        assert!(
+            views
+                .iter()
+                .any(|view| view.text.as_deref() == Some("captured"))
+        );
+        assert_eq!(
+            repository
+                .load_page(HistoryQuery::default())
+                .unwrap()
+                .records
+                .len(),
+            2
         );
     }
 

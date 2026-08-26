@@ -11,6 +11,9 @@ use std::{
     time::Duration as StdDuration,
 };
 
+#[cfg(test)]
+use std::sync::Barrier;
+
 #[cfg(not(windows))]
 use std::{collections::HashSet, sync::Condvar, time::Instant};
 
@@ -123,6 +126,7 @@ pub enum PersistenceError {
     UnsupportedSchema(i64),
     MigrationLockUnavailable,
     MigrationLockTimeout,
+    RestoreRollbackFailed,
     WorkerUnavailable,
     WorkerStart(std::io::Error),
 }
@@ -152,7 +156,7 @@ impl fmt::Display for PersistenceError {
             Self::MigrationLockUnavailable | Self::MigrationLockTimeout => {
                 formatter.write_str("local clipboard storage migration is unavailable")
             }
-            Self::WorkerUnavailable | Self::WorkerStart(_) => {
+            Self::RestoreRollbackFailed | Self::WorkerUnavailable | Self::WorkerStart(_) => {
                 formatter.write_str("local clipboard storage is unavailable")
             }
         }
@@ -171,6 +175,7 @@ impl Error for PersistenceError {
             | Self::UnsupportedSchema(_)
             | Self::MigrationLockUnavailable
             | Self::MigrationLockTimeout
+            | Self::RestoreRollbackFailed
             | Self::WorkerUnavailable => None,
         }
     }
@@ -593,7 +598,13 @@ fn run_persistence_worker(
                 let _ = reply.send(repository.backup_database(&destination));
             }
             PersistenceCommand::Restore(source, budget, reply) => {
-                let _ = reply.send(repository.restore_database(&source, budget));
+                let result = repository.restore_database(&source, budget);
+                let terminal = matches!(result, Err(PersistenceError::RestoreRollbackFailed));
+                if terminal {
+                    storage_available.store(false, Ordering::Release);
+                    repository_healthy = false;
+                }
+                let _ = reply.send(result);
             }
         }
         processed = processed.saturating_add(1);
@@ -631,6 +642,10 @@ pub struct SqliteRepository {
     migration_locks: Arc<dyn MigrationLockProvider>,
     #[cfg(test)]
     fail_next_restore_snapshot: AtomicBool,
+    #[cfg(test)]
+    fail_next_restore_rollback: AtomicBool,
+    #[cfg(test)]
+    pause_after_restore_source_snapshot: Mutex<Option<Arc<(Barrier, Barrier)>>>,
 }
 
 impl SqliteRepository {
@@ -686,6 +701,10 @@ impl SqliteRepository {
             migration_locks,
             #[cfg(test)]
             fail_next_restore_snapshot: AtomicBool::new(false),
+            #[cfg(test)]
+            fail_next_restore_rollback: AtomicBool::new(false),
+            #[cfg(test)]
+            pause_after_restore_source_snapshot: Mutex::new(None),
         }))
     }
 
@@ -729,15 +748,28 @@ impl SqliteRepository {
         if same_file_path(&self.path, source) {
             return Err(PersistenceError::InvalidData);
         }
-        validate_backup_file(source)?;
-        let source_repository =
-            SqliteRepository::open_with_quota(source.to_path_buf(), self.quota)?;
-        let settings = source_repository.load_settings()?;
-        let excluded_applications = source_repository.load_excluded_applications()?;
-        let groups = source_repository.load_groups()?;
-        source_repository.validate_restore_representation_kinds(budget.max_record_bytes)?;
-        source_repository.load_recent_bounded(budget)?;
-        drop(source_repository);
+        let source_snapshot = backup_work_path(&self.path, ".restore-source");
+        remove_path_and_sidecars(&source_snapshot)?;
+        let snapshot_result = snapshot_backup_file(source, &source_snapshot);
+        if let Err(error) = snapshot_result {
+            let _ = remove_path_and_sidecars(&source_snapshot);
+            return Err(error);
+        }
+        #[cfg(test)]
+        if let Some(pause) = lock_unpoisoned(&self.pause_after_restore_source_snapshot).take() {
+            pause.0.wait();
+            pause.1.wait();
+        }
+        let preflight = SqliteRepository::open_with_quota(source_snapshot.clone(), self.quota)
+            .and_then(|source_repository| {
+                source_repository
+                    .validate_restore_representation_kinds(budget.max_record_bytes)
+                    .and_then(|()| source_repository.load_recent_bounded(budget).map(drop))
+            });
+        if let Err(error) = preflight {
+            let _ = remove_path_and_sidecars(&source_snapshot);
+            return Err(error);
+        }
 
         let rollback = backup_work_path(&self.path, ".restore-rollback");
         remove_path_and_sidecars(&rollback)?;
@@ -746,7 +778,7 @@ impl SqliteRepository {
         let restore_result = (|| {
             connection.restore(
                 rusqlite::MAIN_DB,
-                source,
+                &source_snapshot,
                 None::<fn(rusqlite::backup::Progress)>,
             )?;
             connection.pragma_update(None, "foreign_keys", "ON")?;
@@ -756,6 +788,7 @@ impl SqliteRepository {
             {
                 return Err(PersistenceError::InvalidData);
             }
+            validate_restore_connection(&connection, budget.max_record_bytes)?;
             let transaction = connection.transaction()?;
             enforce_disk_quota(&transaction, self.quota)?;
             transaction.commit()?;
@@ -766,6 +799,9 @@ impl SqliteRepository {
             {
                 return Err(PersistenceError::WorkerUnavailable);
             }
+            let settings = load_settings_from_connection(&connection)?;
+            let excluded_applications = load_excluded_applications_from_connection(&connection)?;
+            let groups = load_groups_from_connection(&connection)?;
             let page = load_page_from_connection(
                 &connection,
                 HistoryQuery {
@@ -773,28 +809,44 @@ impl SqliteRepository {
                     ..HistoryQuery::default()
                 },
             )?;
-            Ok(page)
+            Ok(RestoredData {
+                settings,
+                excluded_applications,
+                groups,
+                page,
+            })
         })();
-        let page = match restore_result {
-            Ok(page) => page,
+        let restored = match restore_result {
+            Ok(restored) => restored,
             Err(error) => {
+                #[cfg(test)]
+                let rollback_result = if self
+                    .fail_next_restore_rollback
+                    .swap(false, Ordering::AcqRel)
+                {
+                    Err(rusqlite::Error::InvalidQuery)
+                } else {
+                    connection.restore(
+                        rusqlite::MAIN_DB,
+                        &rollback,
+                        None::<fn(rusqlite::backup::Progress)>,
+                    )
+                };
+                #[cfg(not(test))]
                 let rollback_result = connection.restore(
                     rusqlite::MAIN_DB,
                     &rollback,
                     None::<fn(rusqlite::backup::Progress)>,
                 );
                 let _ = remove_path_and_sidecars(&rollback);
+                let _ = remove_path_and_sidecars(&source_snapshot);
                 return rollback_result
-                    .map_or(Err(PersistenceError::WorkerUnavailable), |_| Err(error));
+                    .map_or(Err(PersistenceError::RestoreRollbackFailed), |_| Err(error));
             }
         };
         let _ = remove_path_and_sidecars(&rollback);
-        Ok(RestoredData {
-            settings,
-            excluded_applications,
-            groups,
-            page,
-        })
+        let _ = remove_path_and_sidecars(&source_snapshot);
+        Ok(restored)
     }
 
     #[cfg(test)]
@@ -803,136 +855,31 @@ impl SqliteRepository {
             .store(true, Ordering::Release);
     }
 
+    #[cfg(test)]
+    fn fail_next_restore_rollback(&self) {
+        self.fail_next_restore_rollback
+            .store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    fn pause_after_restore_source_snapshot(&self, pause: Arc<(Barrier, Barrier)>) {
+        *lock_unpoisoned(&self.pause_after_restore_source_snapshot) = Some(pause);
+    }
+
     fn validate_restore_representation_kinds(
         &self,
         max_record_bytes: usize,
     ) -> Result<(), PersistenceError> {
         let connection = lock_unpoisoned(&self.connection);
-        let unsupported = connection
-            .query_row(
-                "SELECT kind FROM clipboard_representations
-                 WHERE kind NOT IN ('unicode_text', 'rtf', 'html', 'png', 'dib_v5', 'file_list')
-                 ORDER BY kind LIMIT 1",
-                [],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?;
-        if let Some(kind) = unsupported {
-            return Err(PersistenceError::UnsupportedRepresentationKind(kind));
-        }
-        let mut ids = connection.prepare(
-            "SELECT id, typeof(note), length(CAST(note AS BLOB))
-             FROM clipboard_records ORDER BY captured_at DESC, id DESC",
-        )?;
-        let rows = ids.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, Option<i64>>(2)?,
-            ))
-        })?;
-        for id in rows {
-            let (id, note_storage_type, note_length) = id?;
-            let note_bytes = note_metadata_bytes(&note_storage_type, note_length)
-                .ok_or(PersistenceError::InvalidData)?;
-            let representation_bytes = representation_metadata_bytes_for_id(&connection, &id)?
-                .ok_or(PersistenceError::InvalidData)?;
-            let record_bytes = note_bytes
-                .checked_add(representation_bytes)
-                .ok_or(PersistenceError::InvalidData)?;
-            if record_bytes > max_record_bytes {
-                return Err(PersistenceError::InvalidData);
-            }
-        }
-        validate_restore_file_lists(&connection)?;
-        Ok(())
+        validate_restore_connection(&connection, max_record_bytes)
     }
 
     pub fn load_settings(&self) -> Result<UserSettings, PersistenceError> {
-        let connection = lock_unpoisoned(&self.connection);
-        let language = setting(&connection, "language")?
-            .and_then(|value| parse_language(&value))
-            .unwrap_or_default();
-        let retention = setting(&connection, "retention")?
-            .and_then(|value| parse_retention(&value))
-            .unwrap_or_default();
-        let storage_limit = setting(&connection, "storage_limit")?
-            .and_then(|value| parse_storage_limit(&value))
-            .unwrap_or_default();
-        let evict_favorites_when_full = setting(&connection, "evict_favorites_when_full")?
-            .and_then(|value| parse_bool(&value))
-            .unwrap_or(false);
-        let start_at_sign_in = setting(&connection, "start_at_sign_in")?
-            .and_then(|value| parse_bool(&value))
-            .unwrap_or(false);
-        let start_minimized = setting(&connection, "start_minimized")?
-            .and_then(|value| parse_bool(&value))
-            .unwrap_or(false);
-        let show_tray_icon = setting(&connection, "show_tray_icon")?
-            .and_then(|value| parse_bool(&value))
-            .unwrap_or(true);
-        let accent_color = setting(&connection, "accent_color")?
-            .and_then(|value| parse_accent_color(&value))
-            .unwrap_or_default();
-        let sound_enabled = setting(&connection, "sound_enabled")?
-            .and_then(|value| parse_bool(&value))
-            .unwrap_or(true);
-        let capture_sound = setting(&connection, "capture_sound")?
-            .and_then(|value| parse_capture_sound(&value))
-            .unwrap_or_default();
-        let quick_paste_enabled = setting(&connection, "quick_paste_enabled")?
-            .and_then(|value| parse_bool(&value))
-            .unwrap_or(false);
-        let activation_shortcut = setting(&connection, "activation_shortcut")?
-            .and_then(|value| serde_json::from_str(&value).ok())
-            .unwrap_or_default();
-        let group_shortcut_modifiers = setting(&connection, "group_shortcut_modifiers")?
-            .and_then(|value| serde_json::from_str(&value).ok())
-            .unwrap_or(ShortcutModifiers::CTRL_ALT);
-        let quick_paste_modifiers = setting(&connection, "quick_paste_modifiers")?
-            .and_then(|value| serde_json::from_str(&value).ok())
-            .or_else(|| {
-                setting(&connection, "quick_paste_modifier")
-                    .ok()
-                    .flatten()
-                    .and_then(|value| legacy_quick_paste_modifiers(&value))
-            })
-            .unwrap_or(ShortcutModifiers::CTRL_ALT);
-        Ok(UserSettings {
-            language,
-            retention,
-            storage_limit,
-            evict_favorites_when_full,
-            start_at_sign_in,
-            start_minimized,
-            show_tray_icon,
-            accent_color,
-            sound_enabled,
-            capture_sound,
-            activation_shortcut,
-            group_shortcut_modifiers,
-            quick_paste_enabled,
-            quick_paste_modifiers,
-        })
+        load_settings_from_connection(&lock_unpoisoned(&self.connection))
     }
 
     pub fn load_groups(&self) -> Result<Vec<(GroupId, String)>, PersistenceError> {
-        let connection = lock_unpoisoned(&self.connection);
-        let mut statement = connection.prepare(
-            "SELECT id, name FROM clipboard_groups ORDER BY position, name COLLATE NOCASE",
-        )?;
-        let rows = statement.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?;
-        let mut groups = Vec::new();
-        for row in rows {
-            let (id, name) = row?;
-            groups.push((
-                GroupId::parse(&id).map_err(|_| PersistenceError::InvalidData)?,
-                name,
-            ));
-        }
-        Ok(groups)
+        load_groups_from_connection(&lock_unpoisoned(&self.connection))
     }
 
     pub fn save_group(&self, id: GroupId, name: &str) -> Result<(), PersistenceError> {
@@ -1068,11 +1015,7 @@ impl SqliteRepository {
     }
 
     pub fn load_excluded_applications(&self) -> Result<Vec<String>, PersistenceError> {
-        let connection = lock_unpoisoned(&self.connection);
-        setting(&connection, "excluded_applications")?
-            .map(|value| serde_json::from_str(&value).map_err(|_| PersistenceError::InvalidData))
-            .transpose()
-            .map(Option::unwrap_or_default)
+        load_excluded_applications_from_connection(&lock_unpoisoned(&self.connection))
     }
 
     pub fn save_excluded_applications(
@@ -1503,6 +1446,160 @@ fn validate_backup_file(path: &Path) -> Result<(), PersistenceError> {
         });
     }
     Ok(())
+}
+
+fn snapshot_backup_file(source: &Path, destination: &Path) -> Result<(), PersistenceError> {
+    if !source.is_file() {
+        return Err(PersistenceError::InvalidData);
+    }
+    let connection =
+        Connection::open_with_flags(source, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    connection.backup(rusqlite::MAIN_DB, destination, None)?;
+    validate_backup_file(destination)
+}
+
+fn validate_restore_connection(
+    connection: &Connection,
+    max_record_bytes: usize,
+) -> Result<(), PersistenceError> {
+    let integrity: String = connection.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
+    if integrity != "ok" || database_version_from_connection(connection)? != SCHEMA_VERSION {
+        return Err(PersistenceError::InvalidData);
+    }
+    let unsupported = connection
+        .query_row(
+            "SELECT kind FROM clipboard_representations
+             WHERE kind NOT IN ('unicode_text', 'rtf', 'html', 'png', 'dib_v5', 'file_list')
+             ORDER BY kind LIMIT 1",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    if let Some(kind) = unsupported {
+        return Err(PersistenceError::UnsupportedRepresentationKind(kind));
+    }
+    let mut ids = connection.prepare(
+        "SELECT id, typeof(note), length(CAST(note AS BLOB))
+         FROM clipboard_records ORDER BY captured_at DESC, id DESC",
+    )?;
+    let rows = ids.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Option<i64>>(2)?,
+        ))
+    })?;
+    for id in rows {
+        let (id, note_storage_type, note_length) = id?;
+        let note_bytes = note_metadata_bytes(&note_storage_type, note_length)
+            .ok_or(PersistenceError::InvalidData)?;
+        let representation_bytes = representation_metadata_bytes_for_id(connection, &id)?
+            .ok_or(PersistenceError::InvalidData)?;
+        let record_bytes = note_bytes
+            .checked_add(representation_bytes)
+            .ok_or(PersistenceError::InvalidData)?;
+        if record_bytes > max_record_bytes {
+            return Err(PersistenceError::InvalidData);
+        }
+    }
+    validate_restore_file_lists(connection)
+}
+
+fn load_settings_from_connection(
+    connection: &Connection,
+) -> Result<UserSettings, PersistenceError> {
+    let language = setting(connection, "language")?
+        .and_then(|value| parse_language(&value))
+        .unwrap_or_default();
+    let retention = setting(connection, "retention")?
+        .and_then(|value| parse_retention(&value))
+        .unwrap_or_default();
+    let storage_limit = setting(connection, "storage_limit")?
+        .and_then(|value| parse_storage_limit(&value))
+        .unwrap_or_default();
+    let evict_favorites_when_full = setting(connection, "evict_favorites_when_full")?
+        .and_then(|value| parse_bool(&value))
+        .unwrap_or(false);
+    let start_at_sign_in = setting(connection, "start_at_sign_in")?
+        .and_then(|value| parse_bool(&value))
+        .unwrap_or(false);
+    let start_minimized = setting(connection, "start_minimized")?
+        .and_then(|value| parse_bool(&value))
+        .unwrap_or(false);
+    let show_tray_icon = setting(connection, "show_tray_icon")?
+        .and_then(|value| parse_bool(&value))
+        .unwrap_or(true);
+    let accent_color = setting(connection, "accent_color")?
+        .and_then(|value| parse_accent_color(&value))
+        .unwrap_or_default();
+    let sound_enabled = setting(connection, "sound_enabled")?
+        .and_then(|value| parse_bool(&value))
+        .unwrap_or(true);
+    let capture_sound = setting(connection, "capture_sound")?
+        .and_then(|value| parse_capture_sound(&value))
+        .unwrap_or_default();
+    let quick_paste_enabled = setting(connection, "quick_paste_enabled")?
+        .and_then(|value| parse_bool(&value))
+        .unwrap_or(false);
+    let activation_shortcut = setting(connection, "activation_shortcut")?
+        .and_then(|value| serde_json::from_str(&value).ok())
+        .unwrap_or_default();
+    let group_shortcut_modifiers = setting(connection, "group_shortcut_modifiers")?
+        .and_then(|value| serde_json::from_str(&value).ok())
+        .unwrap_or(ShortcutModifiers::CTRL_ALT);
+    let quick_paste_modifiers = setting(connection, "quick_paste_modifiers")?
+        .and_then(|value| serde_json::from_str(&value).ok())
+        .or_else(|| {
+            setting(connection, "quick_paste_modifier")
+                .ok()
+                .flatten()
+                .and_then(|value| legacy_quick_paste_modifiers(&value))
+        })
+        .unwrap_or(ShortcutModifiers::CTRL_ALT);
+    Ok(UserSettings {
+        language,
+        retention,
+        storage_limit,
+        evict_favorites_when_full,
+        start_at_sign_in,
+        start_minimized,
+        show_tray_icon,
+        accent_color,
+        sound_enabled,
+        capture_sound,
+        activation_shortcut,
+        group_shortcut_modifiers,
+        quick_paste_enabled,
+        quick_paste_modifiers,
+    })
+}
+
+fn load_groups_from_connection(
+    connection: &Connection,
+) -> Result<Vec<(GroupId, String)>, PersistenceError> {
+    let mut statement = connection
+        .prepare("SELECT id, name FROM clipboard_groups ORDER BY position, name COLLATE NOCASE")?;
+    let rows = statement.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut groups = Vec::new();
+    for row in rows {
+        let (id, name) = row?;
+        groups.push((
+            GroupId::parse(&id).map_err(|_| PersistenceError::InvalidData)?,
+            name,
+        ));
+    }
+    Ok(groups)
+}
+
+fn load_excluded_applications_from_connection(
+    connection: &Connection,
+) -> Result<Vec<String>, PersistenceError> {
+    setting(connection, "excluded_applications")?
+        .map(|value| serde_json::from_str(&value).map_err(|_| PersistenceError::InvalidData))
+        .transpose()
+        .map(Option::unwrap_or_default)
 }
 
 trait MigrationFileOps {
@@ -2970,6 +3067,98 @@ mod tests {
         let after = record("after", Utc::now() + Duration::seconds(2));
         worker.save_record(&after).unwrap();
         assert_eq!(live.record_details(after.id).unwrap(), after);
+    }
+
+    #[test]
+    fn restore_rollback_failure_makes_the_worker_terminally_unavailable() {
+        let directory = tempdir().unwrap();
+        let live = SqliteRepository::open(directory.path().join("live.sqlite3")).unwrap();
+        let source_path = directory.path().join("source.clipbackup");
+        let source = SqliteRepository::open(source_path.clone()).unwrap();
+        source.save_record(&record("restored", Utc::now())).unwrap();
+        drop(source);
+        let available = Arc::new(AtomicBool::new(true));
+        let worker = PersistenceWorker::start(Arc::clone(&live), Arc::clone(&available)).unwrap();
+        live.fail_next_restore_snapshot();
+        live.fail_next_restore_rollback();
+
+        let error = worker
+            .restore(
+                source_path,
+                RestoreBudget {
+                    max_records: 500,
+                    max_total_bytes: 64 * 1024 * 1024,
+                    max_record_bytes: 16 * 1024 * 1024,
+                },
+            )
+            .unwrap_err();
+
+        assert!(matches!(error, PersistenceError::RestoreRollbackFailed));
+        assert!(!available.load(Ordering::Acquire));
+        assert!(matches!(
+            worker.save_record(&record("after", Utc::now())),
+            Err(PersistenceError::WorkerUnavailable)
+        ));
+    }
+
+    #[test]
+    fn restore_uses_the_source_snapshot_when_the_original_path_is_replaced() {
+        let directory = tempdir().unwrap();
+        let live = SqliteRepository::open(directory.path().join("live.sqlite3")).unwrap();
+        let source_path = directory.path().join("source.clipbackup");
+        let replacement_path = directory.path().join("replacement.clipbackup");
+        let source = SqliteRepository::open(source_path.clone()).unwrap();
+        let expected = record("snapshotted", Utc::now());
+        source.save_record(&expected).unwrap();
+        source
+            .save_settings(UserSettings {
+                language: Language::En,
+                ..UserSettings::default()
+            })
+            .unwrap();
+        drop(source);
+        let replacement = SqliteRepository::open(replacement_path.clone()).unwrap();
+        replacement
+            .save_record(&record("replacement", Utc::now() + Duration::seconds(1)))
+            .unwrap();
+        replacement
+            .save_settings(UserSettings {
+                language: Language::ZhCn,
+                ..UserSettings::default()
+            })
+            .unwrap();
+        drop(replacement);
+        let pause = Arc::new((Barrier::new(2), Barrier::new(2)));
+        live.pause_after_restore_source_snapshot(Arc::clone(&pause));
+        let restoring = {
+            let live = Arc::clone(&live);
+            let source_path = source_path.clone();
+            thread::spawn(move || {
+                live.restore_from(
+                    &source_path,
+                    RestoreBudget {
+                        max_records: 500,
+                        max_total_bytes: 64 * 1024 * 1024,
+                        max_record_bytes: 16 * 1024 * 1024,
+                    },
+                )
+            })
+        };
+        pause.0.wait();
+        fs::remove_file(&source_path).unwrap();
+        fs::rename(&replacement_path, &source_path).unwrap();
+        pause.1.wait();
+
+        let restored = restoring.join().unwrap().unwrap();
+        assert_eq!(restored.settings.language, Language::En);
+        assert_eq!(live.record_details(expected.id).unwrap(), expected);
+        assert!(
+            restored
+                .page
+                .records
+                .iter()
+                .any(|summary| summary.id == expected.id)
+        );
     }
 
     #[test]
