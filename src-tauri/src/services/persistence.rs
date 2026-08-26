@@ -721,7 +721,7 @@ impl SqliteRepository {
         source_repository.load_settings()?;
         source_repository.load_excluded_applications()?;
         source_repository.load_groups()?;
-        source_repository.validate_restore_representation_kinds(budget)?;
+        source_repository.validate_restore_representation_kinds(budget.max_record_bytes)?;
         source_repository.load_recent_bounded(budget)?;
         drop(source_repository);
 
@@ -769,7 +769,7 @@ impl SqliteRepository {
 
     fn validate_restore_representation_kinds(
         &self,
-        budget: RestoreBudget,
+        max_record_bytes: usize,
     ) -> Result<(), PersistenceError> {
         let connection = lock_unpoisoned(&self.connection);
         let unsupported = connection
@@ -795,8 +795,6 @@ impl SqliteRepository {
                 row.get::<_, Option<i64>>(2)?,
             ))
         })?;
-        let mut validated_records = 0_usize;
-        let mut validated_bytes = 0_usize;
         for id in rows {
             let (id, note_storage_type, note_length) = id?;
             let note_bytes = note_metadata_bytes(&note_storage_type, note_length)
@@ -806,17 +804,8 @@ impl SqliteRepository {
             let record_bytes = note_bytes
                 .checked_add(representation_bytes)
                 .ok_or(PersistenceError::InvalidData)?;
-            if record_bytes > budget.max_record_bytes {
+            if record_bytes > max_record_bytes {
                 return Err(PersistenceError::InvalidData);
-            }
-            if validated_records < budget.max_records {
-                validated_bytes = validated_bytes
-                    .checked_add(record_bytes)
-                    .ok_or(PersistenceError::InvalidData)?;
-                if validated_bytes > budget.max_total_bytes {
-                    return Err(PersistenceError::InvalidData);
-                }
-                validated_records = validated_records.saturating_add(1);
             }
         }
         validate_restore_file_lists(&connection)?;
@@ -2897,6 +2886,62 @@ mod tests {
         assert_eq!(restored.settings.retention, RetentionPeriod::Forever);
         assert_eq!(restored.settings.accent_color, AccentColor::Rose);
         assert_eq!(repository.load_recent(10).unwrap(), restored.records);
+    }
+
+    #[test]
+    fn restore_accepts_valid_history_larger_than_the_bounded_working_set() {
+        let directory = tempdir().unwrap();
+        let live_path = directory.path().join("live.sqlite3");
+        let backup_path = directory.path().join("large-history.clipbackup");
+        let repository = SqliteRepository::open(live_path).unwrap();
+        let source = SqliteRepository::open(backup_path.clone()).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 8, 26, 14, 0, 0).unwrap();
+        for index in 0..6 {
+            source
+                .save_record(&ClipboardRecord::from_capture(
+                    crate::domain::CapturedClipboard {
+                        content_identity: ContentIdentity::new(format!("large-backup-{index}")),
+                        captured_at: now + Duration::seconds(index),
+                        source: SourceIdentity::default(),
+                        representations: vec![ClipboardRepresentation::Png {
+                            bytes: vec![index as u8; 12 * 1024 * 1024],
+                        }],
+                    },
+                ))
+                .unwrap();
+        }
+        drop(source);
+
+        let budget = RestoreBudget {
+            max_records: 5,
+            max_total_bytes: 64 * 1024 * 1024,
+            max_record_bytes: 16 * 1024 * 1024,
+        };
+        let restored = repository.restore_from(&backup_path, budget).unwrap();
+
+        assert_eq!(
+            repository
+                .load_page(HistoryQuery::default())
+                .unwrap()
+                .records
+                .len(),
+            6
+        );
+        assert_eq!(restored.records.len(), 5);
+        assert_eq!(
+            restored.records[0].content_identity.as_str(),
+            "large-backup-5"
+        );
+        assert_eq!(
+            restored.records[4].content_identity.as_str(),
+            "large-backup-1"
+        );
+        assert!(
+            restored
+                .records
+                .iter()
+                .all(|record| record.content_identity.as_str() != "large-backup-0")
+        );
     }
 
     #[test]
