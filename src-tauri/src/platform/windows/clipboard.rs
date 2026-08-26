@@ -1560,6 +1560,13 @@ fn read_supported_representations()
         )?;
         Ok((sequence_number, representations))
     })();
+    finish_clipboard_read(operation, clipboard)
+}
+
+fn finish_clipboard_read<T, C: ClipboardCloser>(
+    operation: Result<T, ClipboardReadError>,
+    clipboard: ClipboardGuard<C>,
+) -> Result<T, ClipboardReadError> {
     combine_clipboard_operation_and_close(operation, clipboard.close())
         .map_err(ClipboardReadError::from_combined)
 }
@@ -1781,11 +1788,8 @@ trait ClipboardMemoryReader {
     fn size(&self, format: u32) -> Result<Option<usize>, ClipboardReadError>;
     fn lock(&self, format: u32) -> Result<Self::Locked, ClipboardReadError>;
     fn locked_size(&self, locked: &Self::Locked) -> Result<usize, ClipboardReadError>;
-    fn copy_and_unlock(
-        &self,
-        locked: Self::Locked,
-        size: usize,
-    ) -> Result<Vec<u8>, ClipboardReadError>;
+    fn copy(&self, locked: &Self::Locked, size: usize) -> Result<Vec<u8>, ClipboardReadError>;
+    fn unlock(&self, locked: &mut Self::Locked) -> Result<(), ClipboardReadError>;
 }
 
 trait ClipboardFileReader {
@@ -1818,14 +1822,12 @@ impl ClipboardMemoryReader for Win32ClipboardMemory {
         global_memory_size(locked.memory)
     }
 
-    fn copy_and_unlock(
-        &self,
-        mut lock: Self::Locked,
-        size: usize,
-    ) -> Result<Vec<u8>, ClipboardReadError> {
-        let bytes = unsafe { std::slice::from_raw_parts(lock.pointer.cast::<u8>(), size) }.to_vec();
-        lock.unlock()?;
-        Ok(bytes)
+    fn copy(&self, lock: &Self::Locked, size: usize) -> Result<Vec<u8>, ClipboardReadError> {
+        Ok(unsafe { std::slice::from_raw_parts(lock.pointer.cast::<u8>(), size) }.to_vec())
+    }
+
+    fn unlock(&self, lock: &mut Self::Locked) -> Result<(), ClipboardReadError> {
+        lock.unlock()
     }
 }
 
@@ -2115,15 +2117,15 @@ fn copy_unchanged(
     format: u32,
     expected_size: usize,
 ) -> Result<Option<Vec<u8>>, ClipboardReadError> {
-    let locked = reader.lock(format)?;
-    let actual_size = match reader.locked_size(&locked) {
-        Ok(size) => size,
-        Err(_) => return Ok(None),
+    let mut locked = reader.lock(format)?;
+    let result = match reader.locked_size(&locked) {
+        Ok(actual_size) if actual_size == expected_size => {
+            reader.copy(&locked, actual_size).map(Some)
+        }
+        Ok(_) | Err(_) => Ok(None),
     };
-    if actual_size != expected_size {
-        return Ok(None);
-    }
-    reader.copy_and_unlock(locked, actual_size).map(Some)
+    reader.unlock(&mut locked)?;
+    result
 }
 
 fn text_source_fits_budget(source_bytes: usize, budget: usize) -> bool {
@@ -3664,11 +3666,7 @@ mod tests {
                 })
         }
 
-        fn copy_and_unlock(
-            &self,
-            locked: Self::Locked,
-            size: usize,
-        ) -> Result<Vec<u8>, ClipboardReadError> {
+        fn copy(&self, locked: &Self::Locked, size: usize) -> Result<Vec<u8>, ClipboardReadError> {
             self.operations.borrow_mut().push(("copy", locked.format));
             if self.copy_errors.contains(&locked.format) {
                 return Err(ClipboardReadError::windows(
@@ -3676,16 +3674,21 @@ mod tests {
                     windows::core::Error::from_win32(),
                 ));
             }
+            self.copies.borrow_mut().push(locked.format);
+            let bytes = self.payloads.get(&locked.format).cloned().unwrap();
+            assert_eq!(bytes.len(), size);
+            Ok(bytes)
+        }
+
+        fn unlock(&self, locked: &mut Self::Locked) -> Result<(), ClipboardReadError> {
+            self.operations.borrow_mut().push(("unlock", locked.format));
             if self.unlock_errors.contains(&locked.format) {
                 return Err(ClipboardReadError::windows(
                     super::ClipboardReadOperation::GlobalUnlock,
                     windows::core::Error::from_win32(),
                 ));
             }
-            self.copies.borrow_mut().push(locked.format);
-            let bytes = self.payloads.get(&locked.format).cloned().unwrap();
-            assert_eq!(bytes.len(), size);
-            Ok(bytes)
+            Ok(())
         }
     }
 
@@ -4023,6 +4026,84 @@ mod tests {
                     )
                 )
         ));
+    }
+
+    #[derive(Clone, Copy)]
+    enum EarlyReadExit {
+        SizeError,
+        SizeMismatch,
+    }
+
+    struct CleanupTrackingReader {
+        exit: EarlyReadExit,
+        api: super::FakeableGlobalMemoryApi,
+    }
+
+    impl ClipboardMemoryReader for CleanupTrackingReader {
+        type Locked = super::GlobalMemoryLock<super::FakeableGlobalMemoryApi>;
+
+        fn size(&self, _format: u32) -> Result<Option<usize>, ClipboardReadError> {
+            Ok(Some(4))
+        }
+
+        fn lock(&self, _format: u32) -> Result<Self::Locked, ClipboardReadError> {
+            Ok(super::GlobalMemoryLock::new_for_test(
+                7,
+                std::ptr::dangling_mut::<std::ffi::c_void>(),
+                self.api.clone(),
+            ))
+        }
+
+        fn locked_size(&self, _locked: &Self::Locked) -> Result<usize, ClipboardReadError> {
+            match self.exit {
+                EarlyReadExit::SizeError => Err(ClipboardReadError::windows(
+                    super::ClipboardReadOperation::GlobalSize,
+                    windows::core::Error::from_win32(),
+                )),
+                EarlyReadExit::SizeMismatch => Ok(5),
+            }
+        }
+
+        fn copy(
+            &self,
+            _locked: &Self::Locked,
+            _size: usize,
+        ) -> Result<Vec<u8>, ClipboardReadError> {
+            panic!("early read exits must not copy clipboard data")
+        }
+
+        fn unlock(&self, locked: &mut Self::Locked) -> Result<(), ClipboardReadError> {
+            locked.unlock()
+        }
+    }
+
+    #[test]
+    fn early_read_exit_propagates_unlock_failure_retries_drop_and_aggregates_close() {
+        for exit in [EarlyReadExit::SizeError, EarlyReadExit::SizeMismatch] {
+            let api = super::FakeableGlobalMemoryApi::new([false, true]);
+            let reader = CleanupTrackingReader {
+                exit,
+                api: api.clone(),
+            };
+            let closer = super::FakeableClipboardCloser::new([false, true]);
+            let clipboard = super::ClipboardGuard::new_for_test(closer.clone());
+            let operation = super::copy_unchanged(&reader, 100, 4).map(|_| ());
+            let result = super::finish_clipboard_read(operation, clipboard);
+
+            assert!(matches!(
+                result,
+                Err(ClipboardReadError::OperationAndClose { operation, .. })
+                    if matches!(
+                        *operation,
+                        ClipboardReadError::Windows(
+                            super::ClipboardReadOperation::GlobalUnlock,
+                            _
+                        )
+                    )
+            ));
+            assert_eq!(api.operations(), ["unlock", "unlock"]);
+            assert_eq!(closer.calls(), 2);
+        }
     }
 
     #[test]
@@ -4493,18 +4574,32 @@ mod tests {
     fn capture_skips_format_when_size_changes_after_lock() {
         for locked_size in [Ok(3), Ok(5), Err(())] {
             let reader = FakeClipboardMemory {
-                payloads: HashMap::from([(100, vec![1; 4])]),
+                payloads: HashMap::from([
+                    (CF_UNICODETEXT_FORMAT, [b'o', 0, b'k', 0, 0, 0].to_vec()),
+                    (100, vec![1; 4]),
+                ]),
                 locked_sizes: HashMap::from([(100, locked_size)]),
                 ..Default::default()
             };
 
-            let captured = read_bounded_representations(&reader, 100, 101, 64).unwrap();
+            let captured = read_bounded_representations(&reader, 100, 101, 128).unwrap();
 
-            assert!(captured.is_empty());
-            assert!(reader.copies.borrow().is_empty());
+            assert!(matches!(
+                captured.as_slice(),
+                [ClipboardRepresentation::UnicodeText { text }] if text == "ok"
+            ));
+            assert_eq!(&*reader.copies.borrow(), &[CF_UNICODETEXT_FORMAT]);
             assert_eq!(
                 &*reader.operations.borrow(),
-                &[("lock", 100), ("locked_size", 100)]
+                &[
+                    ("lock", CF_UNICODETEXT_FORMAT),
+                    ("locked_size", CF_UNICODETEXT_FORMAT),
+                    ("copy", CF_UNICODETEXT_FORMAT),
+                    ("unlock", CF_UNICODETEXT_FORMAT),
+                    ("lock", 100),
+                    ("locked_size", 100),
+                    ("unlock", 100),
+                ]
             );
         }
     }
