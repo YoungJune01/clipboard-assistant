@@ -4,7 +4,8 @@ pub mod record;
 pub mod settings;
 
 pub use clipboard::{
-    CapturedClipboard, ClipboardRepresentation, ContentIdentity, ContentKind, SourceIdentity,
+    CapturedClipboard, ClipboardRepresentation, ClipboardRepresentationDetails,
+    ClipboardRepresentationKind, ContentIdentity, ContentKind, SourceIdentity,
 };
 pub use paste::{PasteFallbackReason, PasteOutcome, TargetToken};
 pub use record::{

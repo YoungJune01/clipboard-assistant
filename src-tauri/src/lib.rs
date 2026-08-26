@@ -957,7 +957,7 @@ mod runtime_tests {
 
         assert_eq!(settings.current().retention, RetentionPeriod::Forever);
         assert_eq!(
-            live.record_details(restored_record.id).unwrap(),
+            live.full_record(restored_record.id).unwrap(),
             restored_record
         );
         assert!(
@@ -1149,10 +1149,7 @@ mod runtime_tests {
         assert!(groups.list().is_empty());
         assert_eq!(active.current(), ActiveGroup::Ungrouped);
         assert!(live.load_groups().unwrap().is_empty());
-        assert_eq!(
-            live.record_details(restored_record.id).unwrap().group_id,
-            None
-        );
+        assert_eq!(live.full_record(restored_record.id).unwrap().group_id, None);
         assert_eq!(
             records
                 .list()
@@ -1254,10 +1251,7 @@ mod runtime_tests {
         updating.join().unwrap();
 
         assert!(!groups.contains_coordinated(stale_group));
-        assert_eq!(
-            live.record_details(restored_record.id).unwrap().group_id,
-            None
-        );
+        assert_eq!(live.full_record(restored_record.id).unwrap().group_id, None);
         assert_eq!(
             records
                 .list()

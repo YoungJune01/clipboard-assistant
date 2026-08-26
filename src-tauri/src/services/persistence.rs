@@ -34,11 +34,12 @@ use windows::{
 use std::{marker::PhantomData, rc::Rc};
 
 use crate::domain::{
-    AccentColor, CaptureSound, ClipboardRecord, ClipboardRepresentation, ContentIdentity,
-    ContentKind, GroupId, HistoryCursor, HistoryQuery, Language, RecordId, RecordNote,
-    RetentionPeriod, ShortcutModifiers, SourceIdentity, StorageLimit, UserSettings,
+    AccentColor, CaptureSound, ClipboardRecord, ClipboardRepresentation,
+    ClipboardRepresentationDetails, ClipboardRepresentationKind, ContentIdentity, ContentKind,
+    GroupId, HistoryCursor, HistoryQuery, Language, RecordId, RecordNote, RetentionPeriod,
+    ShortcutModifiers, SourceIdentity, StorageLimit, UserSettings,
 };
-use crate::services::session_records::REPRESENTATION_OVERHEAD_BYTES;
+use crate::services::session_records::{MAX_CAPTURE_RECORD_BYTES, REPRESENTATION_OVERHEAD_BYTES};
 
 const SCHEMA_VERSION: i64 = 4;
 const DATABASE_FILE: &str = "clipboard-history.sqlite3";
@@ -55,6 +56,7 @@ const BACKUP_WORKER_TIMEOUT: StdDuration = StdDuration::from_secs(120);
 const CONTROL_POLL_INTERVAL: StdDuration = StdDuration::from_millis(25);
 const MIGRATION_LOCK_TIMEOUT: StdDuration = StdDuration::from_secs(10);
 const MIGRATION_MUTEX_PREFIX: &str = "Local\\ClipboardAssistant.StorageMigration.";
+const MAX_DETAIL_TEXT_BYTES: usize = 256 * 1024;
 
 #[derive(Clone, Copy)]
 pub(crate) struct RestoreBudget {
@@ -108,6 +110,21 @@ pub struct HistoryRecordSummary {
 pub struct HistoryPage {
     pub records: Vec<HistoryRecordSummary>,
     pub next_cursor: Option<HistoryCursor>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PersistedRecordDetails {
+    pub id: RecordId,
+    pub content_identity: ContentIdentity,
+    pub captured_at: DateTime<Utc>,
+    pub source_application: Option<String>,
+    pub representations: Vec<ClipboardRepresentationDetails>,
+    pub note: Option<RecordNote>,
+    pub group_id: Option<GroupId>,
+    pub content_kind: ContentKind,
+    pub pinned: bool,
+    pub favorite: bool,
+    pub sensitive: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -209,7 +226,10 @@ pub trait RecordPersistence: Send + Sync {
     fn load_page(&self, _query: HistoryQuery) -> Result<HistoryPage, PersistenceError> {
         Err(PersistenceError::WorkerUnavailable)
     }
-    fn record_details(&self, _id: RecordId) -> Result<ClipboardRecord, PersistenceError> {
+    fn record_details(&self, _id: RecordId) -> Result<PersistedRecordDetails, PersistenceError> {
+        Err(PersistenceError::WorkerUnavailable)
+    }
+    fn full_record(&self, _id: RecordId) -> Result<ClipboardRecord, PersistenceError> {
         Err(PersistenceError::WorkerUnavailable)
     }
 }
@@ -497,7 +517,7 @@ impl RecordPersistence for PersistenceWorker {
             .load_page(query)
     }
 
-    fn record_details(&self, id: RecordId) -> Result<ClipboardRecord, PersistenceError> {
+    fn record_details(&self, id: RecordId) -> Result<PersistedRecordDetails, PersistenceError> {
         if !self.storage_available.load(Ordering::Acquire) {
             return Err(PersistenceError::WorkerUnavailable);
         }
@@ -505,6 +525,16 @@ impl RecordPersistence for PersistenceWorker {
             .as_ref()
             .ok_or(PersistenceError::WorkerUnavailable)?
             .record_details(id)
+    }
+
+    fn full_record(&self, id: RecordId) -> Result<ClipboardRecord, PersistenceError> {
+        if !self.storage_available.load(Ordering::Acquire) {
+            return Err(PersistenceError::WorkerUnavailable);
+        }
+        self.reader
+            .as_ref()
+            .ok_or(PersistenceError::WorkerUnavailable)?
+            .full_record(id)
     }
 }
 
@@ -1096,35 +1126,44 @@ impl SqliteRepository {
         load_page_from_connection(&connection, query)
     }
 
-    pub fn record_details(&self, id: RecordId) -> Result<ClipboardRecord, PersistenceError> {
+    pub fn full_record(&self, id: RecordId) -> Result<ClipboardRecord, PersistenceError> {
         let connection = lock_unpoisoned(&self.connection);
-        let row = connection
-            .query_row(
-                "SELECT id, content_identity, captured_at, source_application, source_path, \
-                        typeof(note), length(CAST(note AS BLOB)), group_id, pinned, favorite, sensitive \
-                 FROM clipboard_records WHERE id = ?1",
-                [id.as_uuid().to_string()],
-                |row| {
-                    Ok(DbRecord {
-                        id: row.get(0)?,
-                        content_identity: row.get(1)?,
-                        captured_at: row.get(2)?,
-                        source_application: row.get(3)?,
-                        source_path: row.get(4)?,
-                        note_storage_type: row.get(5)?,
-                        note_length: row.get(6)?,
-                        group_id: row.get(7)?,
-                        pinned: row.get(8)?,
-                        favorite: row.get(9)?,
-                        sensitive: row.get(10)?,
-                    })
-                },
-            )
-            .optional()?
-            .ok_or(PersistenceError::InvalidData)?;
+        let row = load_db_record(&connection, id)?;
+        validate_record_metadata(&connection, &row)?;
         let representations = load_representations(&connection, &row.id)?;
         let note = load_note(&connection, &row.id)?;
         row.into_record(representations, note)
+    }
+
+    pub fn record_details(&self, id: RecordId) -> Result<PersistedRecordDetails, PersistenceError> {
+        let connection = lock_unpoisoned(&self.connection);
+        let row = load_db_record(&connection, id)?;
+        validate_record_metadata(&connection, &row)?;
+        let representations = load_representation_details(&connection, &row.id)?;
+        let content_kind = content_kind_from_details(&representations);
+        let note = load_note(&connection, &row.id)?
+            .map(RecordNote::new)
+            .transpose()
+            .map_err(|_| PersistenceError::InvalidData)?;
+        Ok(PersistedRecordDetails {
+            id: RecordId::parse(&row.id).map_err(|_| PersistenceError::InvalidData)?,
+            content_identity: ContentIdentity::new(row.content_identity),
+            captured_at: DateTime::parse_from_rfc3339(&row.captured_at)
+                .map_err(|_| PersistenceError::InvalidData)?
+                .with_timezone(&Utc),
+            source_application: row.source_application,
+            representations,
+            note,
+            group_id: row
+                .group_id
+                .map(|value| GroupId::parse(&value))
+                .transpose()
+                .map_err(|_| PersistenceError::InvalidData)?,
+            content_kind,
+            pinned: row.pinned,
+            favorite: row.favorite,
+            sensitive: row.sensitive,
+        })
     }
 
     pub(crate) fn load_recent_bounded(
@@ -1366,8 +1405,12 @@ impl RecordPersistence for SqliteRepository {
         SqliteRepository::load_page(self, query)
     }
 
-    fn record_details(&self, id: RecordId) -> Result<ClipboardRecord, PersistenceError> {
+    fn record_details(&self, id: RecordId) -> Result<PersistedRecordDetails, PersistenceError> {
         SqliteRepository::record_details(self, id)
+    }
+
+    fn full_record(&self, id: RecordId) -> Result<ClipboardRecord, PersistenceError> {
+        SqliteRepository::full_record(self, id)
     }
 }
 
@@ -2477,6 +2520,50 @@ fn note_metadata_bytes(storage_type: &str, length: Option<i64>) -> Option<usize>
     }
 }
 
+fn load_db_record(connection: &Connection, id: RecordId) -> Result<DbRecord, PersistenceError> {
+    connection
+        .query_row(
+            "SELECT id, content_identity, captured_at, source_application, source_path, \
+                    typeof(note), length(CAST(note AS BLOB)), group_id, pinned, favorite, sensitive \
+             FROM clipboard_records WHERE id = ?1",
+            [id.as_uuid().to_string()],
+            |row| {
+                Ok(DbRecord {
+                    id: row.get(0)?,
+                    content_identity: row.get(1)?,
+                    captured_at: row.get(2)?,
+                    source_application: row.get(3)?,
+                    source_path: row.get(4)?,
+                    note_storage_type: row.get(5)?,
+                    note_length: row.get(6)?,
+                    group_id: row.get(7)?,
+                    pinned: row.get(8)?,
+                    favorite: row.get(9)?,
+                    sensitive: row.get(10)?,
+                })
+            },
+        )
+        .optional()?
+        .ok_or(PersistenceError::InvalidData)
+}
+
+fn validate_record_metadata(
+    connection: &Connection,
+    row: &DbRecord,
+) -> Result<(), PersistenceError> {
+    let note_bytes = note_metadata_bytes(&row.note_storage_type, row.note_length)
+        .ok_or(PersistenceError::InvalidData)?;
+    let representation_bytes = representation_metadata_bytes_for_id(connection, &row.id)?
+        .ok_or(PersistenceError::InvalidData)?;
+    let total = representation_bytes
+        .checked_add(note_bytes)
+        .ok_or(PersistenceError::InvalidData)?;
+    if total > MAX_CAPTURE_RECORD_BYTES {
+        return Err(PersistenceError::InvalidData);
+    }
+    Ok(())
+}
+
 fn representation_metadata_bytes_for_id(
     connection: &Connection,
     record_id: &str,
@@ -2590,6 +2677,117 @@ fn load_representations(
         return Err(PersistenceError::InvalidData);
     }
     Ok(representations)
+}
+
+fn load_representation_details(
+    connection: &Connection,
+    record_id: &str,
+) -> Result<Vec<ClipboardRepresentationDetails>, PersistenceError> {
+    let mut statement = connection.prepare(
+        "SELECT kind,
+                length(CASE WHEN text_value IS NOT NULL THEN CAST(text_value AS BLOB) ELSE blob_value END),
+                CASE WHEN kind = 'unicode_text' THEN substr(CAST(text_value AS BLOB), 1, ?2) ELSE NULL END,
+                CASE WHEN kind IN ('rtf', 'html') THEN substr(blob_value, 1, ?2) ELSE NULL END,
+                CASE WHEN kind = 'file_list' THEN text_value ELSE NULL END
+         FROM clipboard_representations
+         WHERE record_id = ?1 ORDER BY position",
+    )?;
+    let rows = statement.query_map(params![record_id, MAX_DETAIL_TEXT_BYTES as i64], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, Option<Vec<u8>>>(2)?,
+            row.get::<_, Option<Vec<u8>>>(3)?,
+            row.get::<_, Option<String>>(4)?,
+        ))
+    })?;
+    let mut details = Vec::new();
+    for row in rows {
+        let (kind, byte_length, unicode_text, rich_bytes, file_list) = row?;
+        let byte_length =
+            usize::try_from(byte_length).map_err(|_| PersistenceError::InvalidData)?;
+        if byte_length > MAX_CAPTURE_RECORD_BYTES {
+            return Err(PersistenceError::InvalidData);
+        }
+        let (kind, text, paths) = match kind.as_str() {
+            "unicode_text" => (
+                ClipboardRepresentationKind::UnicodeText,
+                Some(
+                    String::from_utf8_lossy(&unicode_text.ok_or(PersistenceError::InvalidData)?)
+                        .into_owned(),
+                ),
+                None,
+            ),
+            "rtf" => (
+                ClipboardRepresentationKind::Rtf,
+                Some(
+                    String::from_utf8_lossy(&rich_bytes.ok_or(PersistenceError::InvalidData)?)
+                        .into_owned(),
+                ),
+                None,
+            ),
+            "html" => (
+                ClipboardRepresentationKind::Html,
+                Some(
+                    String::from_utf8_lossy(&rich_bytes.ok_or(PersistenceError::InvalidData)?)
+                        .into_owned(),
+                ),
+                None,
+            ),
+            "png" => (ClipboardRepresentationKind::Png, None, None),
+            "dib_v5" => (ClipboardRepresentationKind::DibV5, None, None),
+            "file_list" => {
+                let paths: Vec<String> = serde_json::from_str(
+                    file_list.as_deref().ok_or(PersistenceError::InvalidData)?,
+                )
+                .map_err(|_| PersistenceError::InvalidData)?;
+                validate_file_list(&paths)?;
+                (ClipboardRepresentationKind::FileList, None, Some(paths))
+            }
+            _ => return Err(PersistenceError::InvalidData),
+        };
+        details.push(ClipboardRepresentationDetails {
+            kind,
+            byte_length,
+            text,
+            paths,
+            truncated: matches!(
+                kind,
+                ClipboardRepresentationKind::UnicodeText
+                    | ClipboardRepresentationKind::Rtf
+                    | ClipboardRepresentationKind::Html
+            ) && byte_length > MAX_DETAIL_TEXT_BYTES,
+        });
+    }
+    if details.is_empty() {
+        return Err(PersistenceError::InvalidData);
+    }
+    Ok(details)
+}
+
+fn content_kind_from_details(details: &[ClipboardRepresentationDetails]) -> ContentKind {
+    if details
+        .iter()
+        .any(|value| value.kind == ClipboardRepresentationKind::FileList)
+    {
+        ContentKind::Files
+    } else if details.iter().any(|value| {
+        matches!(
+            value.kind,
+            ClipboardRepresentationKind::Png | ClipboardRepresentationKind::DibV5
+        )
+    }) {
+        ContentKind::Image
+    } else if details.iter().any(|value| {
+        matches!(
+            value.kind,
+            ClipboardRepresentationKind::Rtf | ClipboardRepresentationKind::Html
+        )
+    }) {
+        ContentKind::RichText
+    } else {
+        ContentKind::Text
+    }
 }
 
 fn validate_file_list(paths: &[String]) -> Result<(), PersistenceError> {
@@ -3090,11 +3288,11 @@ mod tests {
         );
 
         assert!(available.load(Ordering::Acquire));
-        assert_eq!(live.record_details(old.id).unwrap(), old);
-        assert!(live.record_details(restored.id).is_err());
+        assert_eq!(live.full_record(old.id).unwrap(), old);
+        assert!(live.full_record(restored.id).is_err());
         let after = record("after", Utc::now() + Duration::seconds(2));
         worker.save_record(&after).unwrap();
-        assert_eq!(live.record_details(after.id).unwrap(), after);
+        assert_eq!(live.full_record(after.id).unwrap(), after);
     }
 
     #[test]
@@ -3134,7 +3332,7 @@ mod tests {
             Err(PersistenceError::WorkerUnavailable)
         ));
         assert!(matches!(
-            worker.record_details(existing.id),
+            worker.full_record(existing.id),
             Err(PersistenceError::WorkerUnavailable)
         ));
     }
@@ -3189,7 +3387,7 @@ mod tests {
 
         let restored = restoring.join().unwrap().unwrap();
         assert_eq!(restored.settings.language, Language::En);
-        assert_eq!(live.record_details(expected.id).unwrap(), expected);
+        assert_eq!(live.full_record(expected.id).unwrap(), expected);
         assert!(
             restored
                 .page
@@ -3559,7 +3757,7 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(repository.record_details(expected.id).unwrap(), expected);
+        assert_eq!(repository.full_record(expected.id).unwrap(), expected);
     }
 
     #[test]
@@ -3613,7 +3811,7 @@ mod tests {
         assert_eq!(page.records[0].content_kind, ContentKind::RichText);
         assert!(matches!(
             repository
-                .record_details(page.records[0].id)
+                .full_record(page.records[0].id)
                 .unwrap()
                 .representations[0],
             ClipboardRepresentation::Html { .. }
@@ -3650,7 +3848,7 @@ mod tests {
             .save_record(&expected)
             .unwrap();
         let reopened = SqliteRepository::open(path).unwrap();
-        assert_eq!(reopened.record_details(expected.id).unwrap(), expected);
+        assert_eq!(reopened.full_record(expected.id).unwrap(), expected);
     }
 
     #[test]
@@ -3847,7 +4045,7 @@ mod tests {
             4_096
         );
         assert!(page.records[0].has_image);
-        assert_eq!(repository.record_details(expected.id).unwrap(), expected);
+        assert_eq!(repository.full_record(expected.id).unwrap(), expected);
     }
 
     #[test]
@@ -4110,6 +4308,33 @@ mod tests {
             .unwrap();
 
         assert_eq!(restored, vec![small]);
+    }
+
+    #[test]
+    fn record_details_rejects_externally_oversized_blob_from_metadata() {
+        let directory = tempdir().unwrap();
+        let repository = SqliteRepository::open(directory.path().join("history.sqlite3")).unwrap();
+        let record = text_record("oversized-details", Utc::now(), "caption");
+        repository.save_record(&record).unwrap();
+        {
+            let connection = lock_unpoisoned(&repository.connection);
+            connection
+                .execute(
+                    "UPDATE clipboard_representations
+                     SET kind = 'png', text_value = NULL, blob_value = zeroblob(?1)
+                     WHERE record_id = ?2 AND position = 0",
+                    params![
+                        (crate::services::session_records::MAX_CAPTURE_RECORD_BYTES + 1) as i64,
+                        record.id.as_uuid().to_string()
+                    ],
+                )
+                .unwrap();
+        }
+
+        assert!(matches!(
+            repository.record_details(record.id),
+            Err(PersistenceError::InvalidData)
+        ));
     }
 
     #[test]

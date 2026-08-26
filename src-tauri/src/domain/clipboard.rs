@@ -59,6 +59,27 @@ pub enum ClipboardRepresentation {
     FileList { paths: Vec<String> },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClipboardRepresentationKind {
+    UnicodeText,
+    Rtf,
+    Html,
+    Png,
+    DibV5,
+    FileList,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClipboardRepresentationDetails {
+    pub kind: ClipboardRepresentationKind,
+    pub byte_length: usize,
+    pub text: Option<String>,
+    pub paths: Option<Vec<String>>,
+    pub truncated: bool,
+}
+
 impl fmt::Debug for ClipboardRepresentation {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
