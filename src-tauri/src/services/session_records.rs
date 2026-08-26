@@ -355,6 +355,7 @@ impl SessionRecordStore {
         } else {
             Some(RecordNote::new(value).map_err(SessionRecordError::InvalidNote)?)
         };
+        self.load_record_for_mutation(id)?;
         let mut state = lock_unpoisoned(&self.state);
         let index = state
             .records
@@ -427,6 +428,7 @@ impl SessionRecordStore {
         id: RecordId,
         group_id: Option<GroupId>,
     ) -> Result<SessionRecordView, SessionRecordError> {
+        self.load_record_for_mutation(id)?;
         let mut state = lock_unpoisoned(&self.state);
         let record = state
             .records
@@ -474,6 +476,7 @@ impl SessionRecordStore {
 
     pub fn delete(&self, id: RecordId) -> Result<ClipboardRecord, SessionRecordError> {
         self.require_durable_storage()?;
+        self.load_record_for_mutation(id)?;
         let mut state = lock_unpoisoned(&self.state);
         let index = state
             .records
@@ -493,6 +496,9 @@ impl SessionRecordStore {
             self.storage_available.store(false, Ordering::Release);
             return Err(SessionRecordError::PersistenceUnavailable);
         }
+        lock_unpoisoned(&self.state)
+            .page
+            .retain(|view| view.id != id);
         let removed = removed.as_ref().clone();
         *lock_unpoisoned(&self.last_deleted) = Some(removed.clone());
         Ok(removed)
@@ -593,6 +599,51 @@ impl SessionRecordStore {
             || !self.storage_available.load(Ordering::Acquire)
         {
             return Err(SessionRecordError::PersistenceUnavailable);
+        }
+        Ok(())
+    }
+
+    fn load_record_for_mutation(&self, id: RecordId) -> Result<(), SessionRecordError> {
+        if lock_unpoisoned(&self.state)
+            .records
+            .iter()
+            .any(|record| record.id == id)
+        {
+            return Ok(());
+        }
+        let record = match &self.persistence {
+            NotePersistence::Durable(persistence) => persistence
+                .record_details(id)
+                .map_err(|_| SessionRecordError::NotFound)?,
+            NotePersistence::NotConfigured | NotePersistence::SessionOnly => {
+                return Err(SessionRecordError::NotFound);
+            }
+        };
+        let bytes = checked_record_bytes(&record).ok_or(SessionRecordError::RecordTooLarge)?;
+        if bytes > self.limits.record_bytes {
+            return Err(SessionRecordError::RecordTooLarge);
+        }
+        let mut state = lock_unpoisoned(&self.state);
+        let position = state
+            .records
+            .iter()
+            .position(|existing| existing.captured_at < record.captured_at)
+            .unwrap_or(state.records.len());
+        state.total_bytes = state.total_bytes.saturating_add(bytes);
+        state.records.insert(position, Arc::new(record));
+        while state.records.len() > MAX_SESSION_RECORDS
+            || state.total_bytes > self.limits.total_bytes
+        {
+            let remove_index = state
+                .records
+                .iter()
+                .rposition(|record| record.id != id)
+                .ok_or(SessionRecordError::RecordTooLarge)?;
+            let removed = state
+                .records
+                .remove(remove_index)
+                .ok_or(SessionRecordError::RecordTooLarge)?;
+            state.total_bytes = state.total_bytes.saturating_sub(record_bytes(&removed));
         }
         Ok(())
     }
@@ -1100,6 +1151,50 @@ mod tests {
         assert!(store.record_details(binary.id).unwrap().representations.iter().any(
             |representation| matches!(representation, ClipboardRepresentation::Png { bytes } if bytes.len() == 128)
         ));
+    }
+
+    #[test]
+    fn paged_history_supports_note_group_and_delete_mutations_on_demand() {
+        let directory = tempdir().unwrap();
+        let repository = SqliteRepository::open(directory.path().join("history.sqlite3")).unwrap();
+        let note_record = ClipboardRecord::from_capture(capture("paged-note", "note"));
+        let group_record = ClipboardRecord::from_capture(capture("paged-group", "group"));
+        let delete_record = ClipboardRecord::from_capture(capture("paged-delete", "delete"));
+        for record in [&note_record, &group_record, &delete_record] {
+            repository.save_record(record).unwrap();
+        }
+        let page = repository.load_page(HistoryQuery::default()).unwrap();
+        let available = Arc::new(AtomicBool::new(true));
+        let store = SessionRecordStore::with_persistence_page(
+            page,
+            Arc::clone(&repository) as Arc<dyn RecordPersistence>,
+            available,
+        );
+        let group = GroupId::new();
+
+        assert_eq!(
+            store
+                .update_note(note_record.id, "loaded on demand".to_owned())
+                .unwrap()
+                .note
+                .as_ref()
+                .map(RecordNote::as_str),
+            Some("loaded on demand")
+        );
+        assert_eq!(
+            store
+                .update_group(group_record.id, Some(group))
+                .unwrap()
+                .group_id,
+            Some(group)
+        );
+        assert_eq!(
+            repository.record_details(group_record.id).unwrap().group_id,
+            Some(group)
+        );
+        assert_eq!(store.delete(delete_record.id).unwrap().id, delete_record.id);
+        assert!(store.list().iter().all(|view| view.id != delete_record.id));
+        assert!(repository.record_details(delete_record.id).is_err());
     }
 
     #[test]

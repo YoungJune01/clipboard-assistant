@@ -41,8 +41,6 @@ const SCHEMA_VERSION: i64 = 4;
 const DATABASE_FILE: &str = "clipboard-history.sqlite3";
 const MIGRATION_TEMP_SUFFIX: &str = ".migrate-v2";
 const MIGRATION_BACKUP_SUFFIX: &str = ".migrate-v1-backup";
-pub(crate) const DATABASE_MAX_RECORDS: usize = 10_000;
-pub(crate) const DATABASE_MAX_PAYLOAD_BYTES: usize = 1024 * 1024 * 1024;
 const DEFAULT_HISTORY_PAGE_LIMIT: usize = 50;
 const MAX_HISTORY_PAGE_LIMIT: usize = 100;
 const MAX_FILE_LIST_PATHS: usize = 4096;
@@ -80,8 +78,8 @@ struct DiskQuota {
 impl Default for DiskQuota {
     fn default() -> Self {
         Self {
-            max_records: DATABASE_MAX_RECORDS,
-            max_payload_bytes: DATABASE_MAX_PAYLOAD_BYTES,
+            max_records: usize::MAX,
+            max_payload_bytes: usize::MAX,
             incremental_vacuum_pages: DATABASE_INCREMENTAL_VACUUM_PAGES,
         }
     }
@@ -723,7 +721,7 @@ impl SqliteRepository {
         source_repository.load_settings()?;
         source_repository.load_excluded_applications()?;
         source_repository.load_groups()?;
-        source_repository.validate_restore_representation_kinds()?;
+        source_repository.validate_restore_representation_kinds(budget)?;
         source_repository.load_recent_bounded(budget)?;
         drop(source_repository);
 
@@ -769,7 +767,10 @@ impl SqliteRepository {
         })
     }
 
-    fn validate_restore_representation_kinds(&self) -> Result<(), PersistenceError> {
+    fn validate_restore_representation_kinds(
+        &self,
+        budget: RestoreBudget,
+    ) -> Result<(), PersistenceError> {
         let connection = lock_unpoisoned(&self.connection);
         let unsupported = connection
             .query_row(
@@ -783,16 +784,42 @@ impl SqliteRepository {
         if let Some(kind) = unsupported {
             return Err(PersistenceError::UnsupportedRepresentationKind(kind));
         }
-        let mut ids = connection.prepare("SELECT id FROM clipboard_records")?;
-        let rows = ids.query_map([], |row| row.get::<_, String>(0))?;
+        let mut ids = connection.prepare(
+            "SELECT id, typeof(note), length(CAST(note AS BLOB))
+             FROM clipboard_records ORDER BY captured_at DESC, id DESC",
+        )?;
+        let rows = ids.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+            ))
+        })?;
+        let mut validated_records = 0_usize;
+        let mut validated_bytes = 0_usize;
         for id in rows {
-            let id = id?;
-            if representation_metadata_bytes_for_id(&connection, &id)?.is_none()
-                || load_representations(&connection, &id).is_err()
-            {
+            let (id, note_storage_type, note_length) = id?;
+            let note_bytes = note_metadata_bytes(&note_storage_type, note_length)
+                .ok_or(PersistenceError::InvalidData)?;
+            let representation_bytes = representation_metadata_bytes_for_id(&connection, &id)?
+                .ok_or(PersistenceError::InvalidData)?;
+            let record_bytes = note_bytes
+                .checked_add(representation_bytes)
+                .ok_or(PersistenceError::InvalidData)?;
+            if record_bytes > budget.max_record_bytes {
                 return Err(PersistenceError::InvalidData);
             }
+            if validated_records < budget.max_records {
+                validated_bytes = validated_bytes
+                    .checked_add(record_bytes)
+                    .ok_or(PersistenceError::InvalidData)?;
+                if validated_bytes > budget.max_total_bytes {
+                    return Err(PersistenceError::InvalidData);
+                }
+                validated_records = validated_records.saturating_add(1);
+            }
         }
+        validate_restore_file_lists(&connection)?;
         Ok(())
     }
 
@@ -1078,7 +1105,6 @@ impl SqliteRepository {
         } else {
             query.limit.min(MAX_HISTORY_PAGE_LIMIT)
         };
-        let fetch_limit = requested.saturating_add(1);
         let connection = lock_unpoisoned(&self.connection);
         let mut sql = String::from(
             "SELECT r.id, r.captured_at, r.source_application, r.note, r.group_id, \
@@ -1111,10 +1137,7 @@ impl SqliteRepository {
         if query.favorites_only {
             sql.push_str(" AND r.favorite = 1");
         }
-        sql.push_str(" ORDER BY r.captured_at DESC, r.id DESC LIMIT ?");
-        values.push(Box::new(
-            i64::try_from(fetch_limit).map_err(|_| PersistenceError::InvalidData)?,
-        ));
+        sql.push_str(" ORDER BY r.captured_at DESC, r.id DESC");
         let params = values.iter().map(|value| value.as_ref());
         let mut statement = connection.prepare(&sql)?;
         let rows = statement.query_map(rusqlite::params_from_iter(params), |row| {
@@ -1134,7 +1157,9 @@ impl SqliteRepository {
         })?;
         let mut records = Vec::with_capacity(requested);
         for row in rows {
-            let row = row?;
+            let Ok(row) = row else {
+                continue;
+            };
             let Ok(summary) = row.into_summary() else {
                 continue;
             };
@@ -1802,20 +1827,21 @@ fn select_legacy_records(
         params![REPRESENTATION_OVERHEAD_BYTES as i64, cutoff],
         |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
     )?;
+    let (max_records, max_payload_bytes) = effective_quota_limits(connection, quota)?;
     let mut retained = Vec::new();
-    let mut retained_bytes = 0_usize;
+    let mut retained_bytes = 0_u64;
     for row in rows {
         let (id, payload_bytes) = row?;
-        let Ok(payload_bytes) = usize::try_from(payload_bytes) else {
+        let Ok(payload_bytes) = u64::try_from(payload_bytes) else {
             continue;
         };
-        if retained.len() >= quota.max_records {
+        if max_records.is_some_and(|limit| retained.len() >= limit) {
             break;
         }
         let Some(next_bytes) = retained_bytes.checked_add(payload_bytes) else {
             break;
         };
-        if next_bytes > quota.max_payload_bytes {
+        if max_payload_bytes.is_some_and(|limit| next_bytes > limit) {
             continue;
         }
         retained.push(id);
@@ -2165,12 +2191,7 @@ fn enforce_disk_quota(
     transaction: &Transaction<'_>,
     quota: DiskQuota,
 ) -> Result<usize, PersistenceError> {
-    let max_payload_bytes = setting(transaction, "storage_limit")?
-        .and_then(|value| parse_storage_limit(&value))
-        .unwrap_or_default()
-        .bytes()
-        .unwrap_or(u64::MAX)
-        .min(quota.max_payload_bytes as u64);
+    let (max_records, max_payload_bytes) = effective_quota_limits(transaction, quota)?;
     let evict_favorites = setting(transaction, "evict_favorites_when_full")?
         .and_then(|value| parse_bool(&value))
         .unwrap_or(false);
@@ -2223,7 +2244,9 @@ fn enforce_disk_quota(
         u64::try_from(total_bytes).map_err(|_| PersistenceError::InvalidData)?;
     let mut removed = 0_usize;
     for (id, payload_bytes, favorite) in records {
-        if retained_count <= quota.max_records && retained_bytes <= max_payload_bytes {
+        let within_count = max_records.is_none_or(|limit| retained_count <= limit);
+        let within_bytes = max_payload_bytes.is_none_or(|limit| retained_bytes <= limit);
+        if within_count && within_bytes {
             break;
         }
         if favorite && !evict_favorites {
@@ -2243,6 +2266,26 @@ fn enforce_disk_quota(
     Ok(removed)
 }
 
+fn effective_quota_limits(
+    connection: &Connection,
+    quota: DiskQuota,
+) -> Result<(Option<usize>, Option<u64>), PersistenceError> {
+    let settings_bytes = setting(connection, "storage_limit")?
+        .and_then(|value| parse_storage_limit(&value))
+        .unwrap_or_default()
+        .bytes();
+    let injected_bytes =
+        (quota.max_payload_bytes != usize::MAX).then_some(quota.max_payload_bytes as u64);
+    let max_payload_bytes = match (settings_bytes, injected_bytes) {
+        (Some(settings), Some(injected)) => Some(settings.min(injected)),
+        (Some(settings), None) => Some(settings),
+        (None, Some(injected)) => Some(injected),
+        (None, None) => None,
+    };
+    let max_records = (quota.max_records != usize::MAX).then_some(quota.max_records);
+    Ok((max_records, max_payload_bytes))
+}
+
 fn incremental_vacuum(connection: &Connection, quota: DiskQuota) -> Result<(), PersistenceError> {
     connection.execute_batch(&format!(
         "PRAGMA incremental_vacuum({});",
@@ -2255,13 +2298,9 @@ fn representation_metadata_bytes(
     connection: &Connection,
     record: &DbRecord,
 ) -> Result<Option<usize>, PersistenceError> {
-    let note_bytes = match (record.note_storage_type.as_str(), record.note_length) {
-        ("null", None) => 0,
-        ("text", Some(length)) => match usize::try_from(length) {
-            Ok(length) => length,
-            Err(_) => return Ok(None),
-        },
-        _ => return Ok(None),
+    let Some(note_bytes) = note_metadata_bytes(&record.note_storage_type, record.note_length)
+    else {
+        return Ok(None);
     };
     let Some(representation_bytes) = representation_metadata_bytes_for_id(connection, &record.id)?
     else {
@@ -2271,6 +2310,14 @@ fn representation_metadata_bytes(
         .checked_add(representation_bytes)
         .map(Some)
         .ok_or(PersistenceError::InvalidData)
+}
+
+fn note_metadata_bytes(storage_type: &str, length: Option<i64>) -> Option<usize> {
+    match (storage_type, length) {
+        ("null", None) => Some(0),
+        ("text", Some(length)) => usize::try_from(length).ok(),
+        _ => None,
+    }
 }
 
 fn representation_metadata_bytes_for_id(
@@ -2400,6 +2447,20 @@ fn validate_file_list(paths: &[String]) -> Result<(), PersistenceError> {
     });
     if total.is_none_or(|total| total > MAX_FILE_LIST_BYTES) {
         return Err(PersistenceError::InvalidData);
+    }
+    Ok(())
+}
+
+fn validate_restore_file_lists(connection: &Connection) -> Result<(), PersistenceError> {
+    let mut statement = connection.prepare(
+        "SELECT text_value FROM clipboard_representations
+         WHERE kind = 'file_list'",
+    )?;
+    let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+    for row in rows {
+        let paths: Vec<String> =
+            serde_json::from_str(&row?).map_err(|_| PersistenceError::InvalidData)?;
+        validate_file_list(&paths)?;
     }
     Ok(())
 }
@@ -3437,6 +3498,136 @@ mod tests {
         );
         assert!(page.records[0].has_image);
         assert_eq!(repository.record_details(expected.id).unwrap(), expected);
+    }
+
+    #[test]
+    fn production_quota_uses_storage_limit_without_legacy_byte_or_count_caps() {
+        let directory = tempdir().unwrap();
+        let repository = SqliteRepository::open(directory.path().join("history.sqlite3")).unwrap();
+        repository
+            .save_settings(UserSettings {
+                storage_limit: StorageLimit::FiveGb,
+                ..UserSettings::default()
+            })
+            .unwrap();
+        let connection = lock_unpoisoned(&repository.connection);
+
+        assert_eq!(
+            effective_quota_limits(&connection, repository.quota).unwrap(),
+            (None, Some(5 * 1024 * 1024 * 1024))
+        );
+        drop(connection);
+        repository
+            .save_settings(UserSettings {
+                storage_limit: StorageLimit::TenGb,
+                ..UserSettings::default()
+            })
+            .unwrap();
+        let connection = lock_unpoisoned(&repository.connection);
+        assert_eq!(
+            effective_quota_limits(&connection, repository.quota).unwrap(),
+            (None, Some(10 * 1024 * 1024 * 1024))
+        );
+        drop(connection);
+        repository
+            .save_settings(UserSettings {
+                storage_limit: StorageLimit::Unlimited,
+                ..UserSettings::default()
+            })
+            .unwrap();
+        let connection = lock_unpoisoned(&repository.connection);
+        assert_eq!(
+            effective_quota_limits(&connection, repository.quota).unwrap(),
+            (None, None)
+        );
+    }
+
+    #[test]
+    fn restore_rejects_oversized_metadata_before_reading_blob_payload() {
+        let directory = tempdir().unwrap();
+        let live_path = directory.path().join("live.sqlite3");
+        let source_path = directory.path().join("oversized.clipbackup");
+        let repository = SqliteRepository::open(live_path).unwrap();
+        let expected = text_record("live", Utc::now(), "keep");
+        repository.save_record(&expected).unwrap();
+        let source = SqliteRepository::open(source_path.clone()).unwrap();
+        let oversized = text_record("oversized", Utc::now(), "placeholder");
+        source.save_record(&oversized).unwrap();
+        lock_unpoisoned(&source.connection)
+            .execute(
+                "UPDATE clipboard_representations
+                 SET kind = 'png', text_value = NULL, blob_value = zeroblob(?1)
+                 WHERE record_id = ?2",
+                params![2 * 1024 * 1024, oversized.id.as_uuid().to_string()],
+            )
+            .unwrap();
+        drop(source);
+
+        assert!(matches!(
+            repository.restore_from(
+                &source_path,
+                RestoreBudget {
+                    max_records: 10,
+                    max_total_bytes: 1024 * 1024,
+                    max_record_bytes: 1024 * 1024,
+                },
+            ),
+            Err(PersistenceError::InvalidData)
+        ));
+        assert_eq!(repository.load_recent(10).unwrap(), vec![expected]);
+    }
+
+    #[test]
+    fn history_page_scans_past_malformed_summaries_for_valid_lookahead() {
+        let directory = tempdir().unwrap();
+        let repository = SqliteRepository::open(directory.path().join("history.sqlite3")).unwrap();
+        let base = Utc.with_ymd_and_hms(2026, 8, 26, 12, 0, 0).unwrap();
+        let oldest = text_record("oldest", base, "oldest");
+        let middle = text_record("middle", base + Duration::seconds(1), "middle");
+        let malformed = text_record("malformed", base + Duration::seconds(2), "bad");
+        let newest = text_record("newest", base + Duration::seconds(3), "newest");
+        for record in [&oldest, &middle, &malformed, &newest] {
+            repository.save_record(record).unwrap();
+        }
+        lock_unpoisoned(&repository.connection)
+            .execute(
+                "UPDATE clipboard_records SET content_kind = 'corrupt'
+                 WHERE id = ?1",
+                [malformed.id.as_uuid().to_string()],
+            )
+            .unwrap();
+
+        let first = repository
+            .load_page(HistoryQuery {
+                limit: 2,
+                ..HistoryQuery::default()
+            })
+            .unwrap();
+        let second = repository
+            .load_page(HistoryQuery {
+                cursor: first.next_cursor.clone(),
+                limit: 2,
+                ..HistoryQuery::default()
+            })
+            .unwrap();
+
+        assert_eq!(
+            first
+                .records
+                .iter()
+                .map(|record| record.id)
+                .collect::<Vec<_>>(),
+            vec![newest.id, middle.id]
+        );
+        assert!(first.next_cursor.is_some());
+        assert_eq!(
+            second
+                .records
+                .iter()
+                .map(|record| record.id)
+                .collect::<Vec<_>>(),
+            vec![oldest.id]
+        );
     }
 
     #[test]
