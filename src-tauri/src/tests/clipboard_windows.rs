@@ -11,7 +11,8 @@ use windows::{
         System::{
             DataExchange::{
                 CloseClipboard, EmptyClipboard, GetClipboardData, GetClipboardSequenceNumber,
-                OpenClipboard, SetClipboardData,
+                IsClipboardFormatAvailable, OpenClipboard, RegisterClipboardFormatW,
+                SetClipboardData,
             },
             Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock},
             Threading::{CreateMutexW, INFINITE, ReleaseMutex, WaitForSingleObject},
@@ -26,6 +27,7 @@ use crate::{
 };
 
 const CF_UNICODETEXT_FORMAT: u32 = 13;
+const CF_HDROP_FORMAT: u32 = 15;
 const LISTENER_OPERATION_TIMEOUT: Duration = Duration::from_secs(3);
 
 struct NamedClipboardLock(HANDLE);
@@ -107,6 +109,53 @@ fn listener_captures_text_suppresses_owned_sequence_and_resumes() {
     let resumed_sequence = write_clipboard_text(&resumed_text).expect("write resumed text");
     let resumed_event = receive_sequence(&receiver, resumed_sequence);
     assert_event_text(&resumed_event, &resumed_text);
+
+    shutdown_listener(listener);
+}
+
+#[test]
+#[ignore = "mutates the desktop clipboard; set CLIPBOARD_ASSISTANT_RUN_CLIPBOARD_TESTS=1 and run explicitly"]
+fn publisher_exposes_text_rtf_html_and_file_list_formats() {
+    assert_eq!(
+        std::env::var("CLIPBOARD_ASSISTANT_RUN_CLIPBOARD_TESTS").as_deref(),
+        Ok("1"),
+        "set CLIPBOARD_ASSISTANT_RUN_CLIPBOARD_TESTS=1 for destructive clipboard tests"
+    );
+    let _lock = NamedClipboardLock::acquire();
+    let _backup = ClipboardTextBackup::capture();
+    let (sender, _receiver) = mpsc::channel();
+    let listener = start_listener(sender);
+
+    listener
+        .publish(&[
+            ClipboardRepresentation::UnicodeText {
+                text: unique_text("formats"),
+            },
+            ClipboardRepresentation::Rtf {
+                bytes: br"{\rtf1 clipboard assistant}".to_vec(),
+            },
+            ClipboardRepresentation::Html {
+                bytes: b"Version:1.0\r\n<html>clipboard assistant</html>".to_vec(),
+            },
+            ClipboardRepresentation::FileList {
+                paths: vec![
+                    r"C:\clipboard-assistant-one.txt".to_owned(),
+                    r"C:\clipboard-assistant-two.txt".to_owned(),
+                ],
+            },
+        ])
+        .expect("publish all supported clipboard formats");
+
+    unsafe {
+        let rtf = RegisterClipboardFormatW(w!("Rich Text Format"));
+        let html = RegisterClipboardFormatW(w!("HTML Format"));
+        assert_ne!(rtf, 0);
+        assert_ne!(html, 0);
+        assert!(IsClipboardFormatAvailable(CF_UNICODETEXT_FORMAT).is_ok());
+        assert!(IsClipboardFormatAvailable(CF_HDROP_FORMAT).is_ok());
+        assert!(IsClipboardFormatAvailable(rtf).is_ok());
+        assert!(IsClipboardFormatAvailable(html).is_ok());
+    }
 
     shutdown_listener(listener);
 }
