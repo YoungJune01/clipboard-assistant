@@ -1695,24 +1695,29 @@ fn read_bounded_representations(
     let used = representation_bytes(&representations);
     let remaining = budget.saturating_sub(used);
 
-    let selected_image = [(png_format, png_size, true), (dib_format, dib_size, false)]
-        .into_iter()
-        .filter_map(|(format, size, png)| size.map(|size| (format, size, png)))
-        .filter(|(_, size, _)| {
-            *size <= MAX_IMAGE_PAYLOAD_BYTES
-                && size
-                    .checked_add(crate::services::session_records::REPRESENTATION_OVERHEAD_BYTES)
-                    .is_some_and(|bytes| bytes <= remaining)
-        })
-        .min_by_key(|(_, size, _)| *size);
-    if let Some((format, size, png)) = selected_image
-        && let Some(bytes) = copy_unchanged(reader, format, size)?
-    {
-        representations.push(if png {
-            ClipboardRepresentation::Png { bytes }
-        } else {
-            ClipboardRepresentation::DibV5 { bytes }
-        });
+    let mut image_candidates: Vec<_> =
+        [(png_format, png_size, true), (dib_format, dib_size, false)]
+            .into_iter()
+            .filter_map(|(format, size, png)| size.map(|size| (format, size, png)))
+            .filter(|(_, size, _)| {
+                *size <= MAX_IMAGE_PAYLOAD_BYTES
+                    && size
+                        .checked_add(
+                            crate::services::session_records::REPRESENTATION_OVERHEAD_BYTES,
+                        )
+                        .is_some_and(|bytes| bytes <= remaining)
+            })
+            .collect();
+    image_candidates.sort_unstable_by_key(|(_, size, _)| *size);
+    for (format, size, png) in image_candidates {
+        if let Some(bytes) = copy_format_unchanged(reader, format, size) {
+            representations.push(if png {
+                ClipboardRepresentation::Png { bytes }
+            } else {
+                ClipboardRepresentation::DibV5 { bytes }
+            });
+            break;
+        }
     }
     debug_assert!(representation_bytes(&representations) <= budget);
     Ok(representations)
@@ -1756,7 +1761,7 @@ fn read_bounded_representations_with_files(
     let _ = read_file_list(files, &mut representations, budget);
 
     let remaining = budget.saturating_sub(representation_bytes(&representations));
-    let selected_image = [(formats.png, true), (CF_DIBV5_FORMAT, false)]
+    let mut image_candidates: Vec<_> = [(formats.png, true), (CF_DIBV5_FORMAT, false)]
         .into_iter()
         .filter_map(|(format, png)| {
             probe_format_size(reader, format).map(|size| (format, size, png))
@@ -1764,15 +1769,17 @@ fn read_bounded_representations_with_files(
         .filter(|(_, size, _)| {
             *size <= MAX_IMAGE_PAYLOAD_BYTES && binary_source_fits_budget(*size, remaining)
         })
-        .min_by_key(|(_, size, _)| *size);
-    if let Some((format, size, png)) = selected_image
-        && let Some(bytes) = copy_format_unchanged(reader, format, size)
-    {
-        representations.push(if png {
-            ClipboardRepresentation::Png { bytes }
-        } else {
-            ClipboardRepresentation::DibV5 { bytes }
-        });
+        .collect();
+    image_candidates.sort_unstable_by_key(|(_, size, _)| *size);
+    for (format, size, png) in image_candidates {
+        if let Some(bytes) = copy_format_unchanged(reader, format, size) {
+            representations.push(if png {
+                ClipboardRepresentation::Png { bytes }
+            } else {
+                ClipboardRepresentation::DibV5 { bytes }
+            });
+            break;
+        }
     }
     debug_assert!(representation_bytes(&representations) <= budget);
     Ok(representations)
@@ -3618,6 +3625,51 @@ mod tests {
             captured.as_slice(),
             [ClipboardRepresentation::UnicodeText { text }] if text == "ok"
         ));
+    }
+
+    #[test]
+    fn failed_smaller_image_falls_back_to_larger_image_and_keeps_text() {
+        let formats = RegisteredFormats {
+            png: 100,
+            rtf: 101,
+            html: 102,
+        };
+        for reader in [
+            FakeClipboardMemory {
+                payloads: HashMap::from([
+                    (CF_UNICODETEXT_FORMAT, [b'o', 0, b'k', 0, 0, 0].to_vec()),
+                    (formats.png, vec![1; 4]),
+                    (super::CF_DIBV5_FORMAT, vec![2; 6]),
+                ]),
+                locked_sizes: HashMap::from([(formats.png, Ok(5))]),
+                ..Default::default()
+            },
+            FakeClipboardMemory {
+                payloads: HashMap::from([
+                    (CF_UNICODETEXT_FORMAT, [b'o', 0, b'k', 0, 0, 0].to_vec()),
+                    (formats.png, vec![1; 4]),
+                    (super::CF_DIBV5_FORMAT, vec![2; 6]),
+                ]),
+                copy_errors: vec![formats.png],
+                ..Default::default()
+            },
+        ] {
+            let captured = read_bounded_representations_with_files(
+                &reader,
+                &FakeClipboardFiles::default(),
+                formats,
+                1024,
+            )
+            .unwrap();
+
+            assert!(matches!(
+                captured.as_slice(),
+                [
+                    ClipboardRepresentation::UnicodeText { text },
+                    ClipboardRepresentation::DibV5 { bytes },
+                ] if text == "ok" && bytes == &[2; 6]
+            ));
+        }
     }
 
     #[derive(Clone, Default)]
