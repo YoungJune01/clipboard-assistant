@@ -39,12 +39,24 @@ impl fmt::Debug for SourceIdentity {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContentKind {
+    Text,
+    RichText,
+    Image,
+    Files,
+}
+
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ClipboardRepresentation {
     UnicodeText { text: String },
+    Rtf { bytes: Vec<u8> },
+    Html { bytes: Vec<u8> },
     Png { bytes: Vec<u8> },
     DibV5 { bytes: Vec<u8> },
+    FileList { paths: Vec<String> },
 }
 
 impl fmt::Debug for ClipboardRepresentation {
@@ -54,6 +66,14 @@ impl fmt::Debug for ClipboardRepresentation {
                 .debug_struct("UnicodeText")
                 .field("characters", &text.chars().count())
                 .finish(),
+            Self::Rtf { bytes } => formatter
+                .debug_struct("Rtf")
+                .field("bytes", &bytes.len())
+                .finish(),
+            Self::Html { bytes } => formatter
+                .debug_struct("Html")
+                .field("bytes", &bytes.len())
+                .finish(),
             Self::Png { bytes } => formatter
                 .debug_struct("Png")
                 .field("bytes", &bytes.len())
@@ -61,6 +81,11 @@ impl fmt::Debug for ClipboardRepresentation {
             Self::DibV5 { bytes } => formatter
                 .debug_struct("DibV5")
                 .field("bytes", &bytes.len())
+                .finish(),
+            Self::FileList { paths } => formatter
+                .debug_struct("FileList")
+                .field("paths", &paths.len())
+                .field("bytes", &self.checked_payload_bytes())
                 .finish(),
         }
     }
@@ -71,9 +96,52 @@ impl ClipboardRepresentation {
         matches!(
             (self, other),
             (Self::UnicodeText { .. }, Self::UnicodeText { .. })
+                | (Self::Rtf { .. }, Self::Rtf { .. })
+                | (Self::Html { .. }, Self::Html { .. })
                 | (Self::Png { .. }, Self::Png { .. })
                 | (Self::DibV5 { .. }, Self::DibV5 { .. })
+                | (Self::FileList { .. }, Self::FileList { .. })
         )
+    }
+
+    pub(crate) fn checked_payload_bytes(&self) -> Option<usize> {
+        match self {
+            Self::UnicodeText { text } => Some(text.len()),
+            Self::Rtf { bytes }
+            | Self::Html { bytes }
+            | Self::Png { bytes }
+            | Self::DibV5 { bytes } => Some(bytes.len()),
+            Self::FileList { paths } => paths
+                .iter()
+                .try_fold(0_usize, |total, path| total.checked_add(path.len())),
+        }
+    }
+}
+
+impl ContentKind {
+    pub fn classify(representations: &[ClipboardRepresentation]) -> Self {
+        if representations
+            .iter()
+            .any(|value| matches!(value, ClipboardRepresentation::FileList { .. }))
+        {
+            Self::Files
+        } else if representations.iter().any(|value| {
+            matches!(
+                value,
+                ClipboardRepresentation::Png { .. } | ClipboardRepresentation::DibV5 { .. }
+            )
+        }) {
+            Self::Image
+        } else if representations.iter().any(|value| {
+            matches!(
+                value,
+                ClipboardRepresentation::Rtf { .. } | ClipboardRepresentation::Html { .. }
+            )
+        }) {
+            Self::RichText
+        } else {
+            Self::Text
+        }
     }
 }
 
@@ -99,8 +167,94 @@ impl fmt::Debug for CapturedClipboard {
 
 #[cfg(test)]
 mod tests {
-    use super::{CapturedClipboard, ClipboardRepresentation, ContentIdentity, SourceIdentity};
+    use super::{
+        CapturedClipboard, ClipboardRepresentation, ContentIdentity, ContentKind, SourceIdentity,
+    };
     use chrono::{TimeZone, Utc};
+
+    #[test]
+    fn all_clipboard_representations_have_stable_tags() {
+        let values = [
+            ClipboardRepresentation::UnicodeText {
+                text: "plain".into(),
+            },
+            ClipboardRepresentation::Rtf {
+                bytes: br"{\rtf1 rich}".to_vec(),
+            },
+            ClipboardRepresentation::Html {
+                bytes: b"<b>html</b>".to_vec(),
+            },
+            ClipboardRepresentation::Png {
+                bytes: vec![1, 2, 3],
+            },
+            ClipboardRepresentation::DibV5 {
+                bytes: vec![4, 5, 6],
+            },
+            ClipboardRepresentation::FileList {
+                paths: vec![r"C:\Temp\one.txt".into()],
+            },
+        ];
+
+        let json = serde_json::to_string(&values).unwrap();
+
+        for tag in ["unicode_text", "rtf", "html", "png", "dib_v5", "file_list"] {
+            assert!(json.contains(tag));
+        }
+        assert_eq!(
+            serde_json::from_str::<Vec<ClipboardRepresentation>>(&json).unwrap(),
+            values
+        );
+    }
+
+    #[test]
+    fn content_classification_prefers_files_images_and_rich_text() {
+        assert_eq!(
+            ContentKind::classify(&[ClipboardRepresentation::UnicodeText { text: "x".into() }]),
+            ContentKind::Text
+        );
+        assert_eq!(
+            ContentKind::classify(&[ClipboardRepresentation::Html {
+                bytes: b"x".to_vec(),
+            }]),
+            ContentKind::RichText
+        );
+        assert_eq!(
+            ContentKind::classify(&[ClipboardRepresentation::Png { bytes: vec![1] }]),
+            ContentKind::Image
+        );
+        assert_eq!(
+            ContentKind::classify(&[ClipboardRepresentation::FileList {
+                paths: vec!["a".into()],
+            }]),
+            ContentKind::Files
+        );
+
+        let mixed = [
+            ClipboardRepresentation::UnicodeText { text: "x".into() },
+            ClipboardRepresentation::Html {
+                bytes: b"x".to_vec(),
+            },
+            ClipboardRepresentation::Png { bytes: vec![1] },
+            ClipboardRepresentation::FileList {
+                paths: vec!["a".into()],
+            },
+        ];
+        assert_eq!(ContentKind::classify(&mixed), ContentKind::Files);
+        assert_eq!(ContentKind::classify(&mixed[..3]), ContentKind::Image);
+        assert_eq!(ContentKind::classify(&mixed[..2]), ContentKind::RichText);
+    }
+
+    #[test]
+    fn file_list_payload_counts_utf8_path_bytes() {
+        let representation = ClipboardRepresentation::FileList {
+            paths: vec![r"C:\Temp\one.txt".into(), r"C:\临时\二.txt".into()],
+        };
+
+        assert_eq!(
+            representation.checked_payload_bytes(),
+            Some(r"C:\Temp\one.txt".len() + r"C:\临时\二.txt".len())
+        );
+    }
 
     #[test]
     fn clipboard_representation_uses_stable_snake_case_json_tags() {
@@ -155,11 +309,20 @@ mod tests {
             ClipboardRepresentation::UnicodeText {
                 text: SECRET_TEXT.to_owned(),
             },
+            ClipboardRepresentation::Rtf {
+                bytes: binary.clone(),
+            },
+            ClipboardRepresentation::Html {
+                bytes: binary.clone(),
+            },
             ClipboardRepresentation::Png {
                 bytes: binary.clone(),
             },
             ClipboardRepresentation::DibV5 {
                 bytes: binary.clone(),
+            },
+            ClipboardRepresentation::FileList {
+                paths: vec![r"C:\DEBUG_SECRET_FILE_PATH\secret.txt".to_owned()],
             },
         ];
 
@@ -167,10 +330,15 @@ mod tests {
 
         assert!(!representation_debug.contains(SECRET_TEXT));
         assert!(!representation_debug.contains("[222, 173, 190, 239]"));
+        assert!(!representation_debug.contains("DEBUG_SECRET_FILE_PATH"));
         assert!(representation_debug.contains("UnicodeText"));
         assert!(representation_debug.contains("characters: 19"));
+        assert!(representation_debug.contains("Rtf"));
+        assert!(representation_debug.contains("Html"));
         assert!(representation_debug.contains("Png"));
         assert!(representation_debug.contains("DibV5"));
+        assert!(representation_debug.contains("FileList"));
+        assert!(representation_debug.contains("paths: 1"));
         assert!(representation_debug.contains("bytes: 4"));
 
         let capture = CapturedClipboard {

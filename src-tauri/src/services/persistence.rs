@@ -1101,6 +1101,11 @@ fn write_record(
                 ClipboardRepresentation::DibV5 { bytes } => {
                     ("dib_v5", None, Some(bytes.as_slice()))
                 }
+                ClipboardRepresentation::Rtf { .. }
+                | ClipboardRepresentation::Html { .. }
+                | ClipboardRepresentation::FileList { .. } => {
+                    return Err(PersistenceError::InvalidData);
+                }
             };
         transaction.execute(
             "INSERT INTO clipboard_representations \

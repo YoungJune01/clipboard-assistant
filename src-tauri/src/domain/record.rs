@@ -4,7 +4,9 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Deserializer, Serialize};
 use uuid::Uuid;
 
-use super::{CapturedClipboard, ClipboardRepresentation, ContentIdentity, SourceIdentity};
+use super::{
+    CapturedClipboard, ClipboardRepresentation, ContentIdentity, ContentKind, SourceIdentity,
+};
 
 const MAX_NOTE_CHARACTERS: usize = 200;
 
@@ -198,6 +200,10 @@ impl ClipboardRecord {
 
         Ok(())
     }
+
+    pub fn content_kind(&self) -> ContentKind {
+        ContentKind::classify(&self.representations)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -224,7 +230,7 @@ impl Error for RefreshError {}
 mod tests {
     use super::{ClipboardRecord, GroupId, RecordNote, RecordNoteError, RefreshError};
     use crate::domain::{
-        CapturedClipboard, ClipboardRepresentation, ContentIdentity, SourceIdentity,
+        CapturedClipboard, ClipboardRepresentation, ContentIdentity, ContentKind, SourceIdentity,
     };
     use chrono::{TimeZone, Utc};
 
@@ -353,6 +359,29 @@ mod tests {
             record.representations[1],
             ClipboardRepresentation::Png { .. }
         ));
+    }
+
+    #[test]
+    fn record_reports_its_primary_content_kind() {
+        let mut record = ClipboardRecord::from_capture(captured("same", 3));
+        assert_eq!(record.content_kind(), ContentKind::Text);
+
+        record.representations.push(ClipboardRepresentation::Html {
+            bytes: b"<b>rich</b>".to_vec(),
+        });
+        assert_eq!(record.content_kind(), ContentKind::RichText);
+
+        record
+            .representations
+            .push(ClipboardRepresentation::Png { bytes: vec![1] });
+        assert_eq!(record.content_kind(), ContentKind::Image);
+
+        record
+            .representations
+            .push(ClipboardRepresentation::FileList {
+                paths: vec![r"C:\Temp\one.txt".into()],
+            });
+        assert_eq!(record.content_kind(), ContentKind::Files);
     }
 
     #[test]

@@ -259,7 +259,10 @@ impl SessionRecordStore {
             .find_map(|representation| match representation {
                 ClipboardRepresentation::Png { bytes } => png_preview(bytes),
                 ClipboardRepresentation::DibV5 { bytes } => dib_preview(bytes),
-                ClipboardRepresentation::UnicodeText { .. } => None,
+                ClipboardRepresentation::UnicodeText { .. }
+                | ClipboardRepresentation::Rtf { .. }
+                | ClipboardRepresentation::Html { .. }
+                | ClipboardRepresentation::FileList { .. } => None,
             })
             .ok_or(SessionRecordError::ImagePreviewUnavailable)
     }
@@ -528,7 +531,11 @@ impl SessionRecordView {
                 ClipboardRepresentation::UnicodeText { text } => {
                     Some(utf8_preview(text, preview_bytes))
                 }
-                ClipboardRepresentation::Png { .. } | ClipboardRepresentation::DibV5 { .. } => None,
+                ClipboardRepresentation::Rtf { .. }
+                | ClipboardRepresentation::Html { .. }
+                | ClipboardRepresentation::Png { .. }
+                | ClipboardRepresentation::DibV5 { .. }
+                | ClipboardRepresentation::FileList { .. } => None,
             });
         let has_image = record.representations.iter().any(|representation| {
             matches!(
@@ -554,11 +561,7 @@ pub(crate) fn checked_representation_bytes(
     representations
         .iter()
         .try_fold(0_usize, |total, representation| {
-            let payload = match representation {
-                ClipboardRepresentation::UnicodeText { text } => text.len(),
-                ClipboardRepresentation::Png { bytes }
-                | ClipboardRepresentation::DibV5 { bytes } => bytes.len(),
-            };
+            let payload = representation.checked_payload_bytes()?;
             total.checked_add(payload.checked_add(REPRESENTATION_OVERHEAD_BYTES)?)
         })
 }
@@ -584,7 +587,10 @@ fn retain_preferred_image(representations: &mut Vec<ClipboardRepresentation>) {
             ClipboardRepresentation::Png { bytes } | ClipboardRepresentation::DibV5 { bytes } => {
                 Some((index, bytes.len()))
             }
-            ClipboardRepresentation::UnicodeText { .. } => None,
+            ClipboardRepresentation::UnicodeText { .. }
+            | ClipboardRepresentation::Rtf { .. }
+            | ClipboardRepresentation::Html { .. }
+            | ClipboardRepresentation::FileList { .. } => None,
         })
         .min_by_key(|(_, bytes)| *bytes)
         .map(|(index, _)| index);

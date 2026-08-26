@@ -403,6 +403,11 @@ fn validate_representations(
             ClipboardRepresentation::Png { bytes } | ClipboardRepresentation::DibV5 { bytes } => {
                 (bytes.len(), MAX_IMAGE_PAYLOAD_BYTES)
             }
+            ClipboardRepresentation::Rtf { .. }
+            | ClipboardRepresentation::Html { .. }
+            | ClipboardRepresentation::FileList { .. } => {
+                return Err(ClipboardWriteError::UnsupportedRepresentation);
+            }
         };
         if size > limit {
             return Err(ClipboardWriteError::PayloadTooLarge);
@@ -467,6 +472,11 @@ fn write_representations(
                     (format, bytes.clone())
                 }
                 ClipboardRepresentation::DibV5 { bytes } => (CF_DIBV5_FORMAT, bytes.clone()),
+                ClipboardRepresentation::Rtf { .. }
+                | ClipboardRepresentation::Html { .. }
+                | ClipboardRepresentation::FileList { .. } => {
+                    return Err(ClipboardWriteError::UnsupportedRepresentation);
+                }
             };
             ownership.perform_owned_change(&mut owned_sequences, || {
                 publish_global_bytes(format, &bytes)
