@@ -13,9 +13,10 @@ use crate::domain::{
     CapturedClipboard, ClipboardRecord, ClipboardRepresentation, GroupId, RecordId, RecordNote,
     RecordNoteError,
 };
-use crate::services::persistence::RecordPersistence;
+use crate::services::persistence::{HistoryPage, HistoryRecordSummary, RecordPersistence};
 
 pub(crate) const MAX_SESSION_RECORDS: usize = 500;
+pub(crate) const STARTUP_HISTORY_RECORDS: usize = 100;
 pub(crate) const TOTAL_SESSION_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
 pub(crate) const INGESTION_QUEUE_BYTES: usize = 16 * 1024 * 1024;
 pub(crate) const INGESTION_QUEUE_EVENTS: usize = 64;
@@ -73,6 +74,7 @@ struct SessionRecordLimits {
 
 struct SessionRecordState {
     records: VecDeque<Arc<ClipboardRecord>>,
+    page: VecDeque<SessionRecordView>,
     total_bytes: usize,
 }
 
@@ -98,6 +100,7 @@ impl SessionRecordStore {
         Self {
             state: Mutex::new(SessionRecordState {
                 records: VecDeque::new(),
+                page: VecDeque::new(),
                 total_bytes: 0,
             }),
             last_deleted: Mutex::new(None),
@@ -115,6 +118,7 @@ impl SessionRecordStore {
         let store = Self {
             state: Mutex::new(SessionRecordState {
                 records: VecDeque::new(),
+                page: VecDeque::new(),
                 total_bytes: 0,
             }),
             last_deleted: Mutex::new(None),
@@ -127,6 +131,30 @@ impl SessionRecordStore {
             storage_available,
         };
         store.replace_loaded(records);
+        store
+    }
+
+    pub fn with_persistence_page(
+        page: HistoryPage,
+        persistence: Arc<dyn RecordPersistence>,
+        storage_available: Arc<AtomicBool>,
+    ) -> Self {
+        let store = Self {
+            state: Mutex::new(SessionRecordState {
+                records: VecDeque::new(),
+                page: VecDeque::new(),
+                total_bytes: 0,
+            }),
+            last_deleted: Mutex::new(None),
+            limits: SessionRecordLimits {
+                total_bytes: DEFAULT_STORE_BYTES,
+                record_bytes: DEFAULT_RECORD_BYTES,
+                preview_bytes: DEFAULT_PREVIEW_BYTES,
+            },
+            persistence: NotePersistence::Durable(persistence),
+            storage_available,
+        };
+        store.replace_page(page);
         store
     }
 
@@ -143,6 +171,7 @@ impl SessionRecordStore {
         let store = Self {
             state: Mutex::new(SessionRecordState {
                 records: VecDeque::new(),
+                page: VecDeque::new(),
                 total_bytes: 0,
             }),
             last_deleted: Mutex::new(None),
@@ -217,6 +246,13 @@ impl SessionRecordStore {
         let record = ClipboardRecord::from_capture(capture);
         state.total_bytes = state.total_bytes.saturating_add(capture_bytes);
         state.records.push_front(Arc::new(record));
+        if !state.page.is_empty()
+            && let Some(record) = state.records.front()
+        {
+            let view = SessionRecordView::from_record(record, self.limits.preview_bytes);
+            state.page.retain(|existing| existing.id != view.id);
+            state.page.push_front(view);
+        }
         evict_to_limits(&mut state, self.limits);
         let persisted = state.records.front().cloned();
         let status = CaptureStatus::Inserted {
@@ -230,11 +266,12 @@ impl SessionRecordStore {
     }
 
     pub fn list(&self) -> Vec<SessionRecordView> {
-        let records: Vec<_> = lock_unpoisoned(&self.state)
-            .records
-            .iter()
-            .cloned()
-            .collect();
+        let state = lock_unpoisoned(&self.state);
+        if !state.page.is_empty() {
+            return state.page.iter().cloned().collect();
+        }
+        let records: Vec<_> = state.records.iter().cloned().collect();
+        drop(state);
         records
             .iter()
             .map(|record| SessionRecordView::from_record(record, self.limits.preview_bytes))
@@ -242,12 +279,53 @@ impl SessionRecordStore {
     }
 
     pub fn representations(&self, id: RecordId) -> Option<Vec<ClipboardRepresentation>> {
+        self.record_details(id)
+            .ok()
+            .map(|record| record.representations)
+    }
+
+    pub fn record_details(&self, id: RecordId) -> Result<ClipboardRecord, SessionRecordError> {
         let record = lock_unpoisoned(&self.state)
             .records
             .iter()
             .find(|record| record.id == id)
             .cloned();
-        record.map(|record| record.representations.clone())
+        if let Some(record) = record {
+            return Ok(record.as_ref().clone());
+        }
+        match &self.persistence {
+            NotePersistence::Durable(persistence) => persistence
+                .record_details(id)
+                .map_err(|_| SessionRecordError::NotFound),
+            NotePersistence::NotConfigured | NotePersistence::SessionOnly => {
+                Err(SessionRecordError::NotFound)
+            }
+        }
+    }
+
+    pub fn replace_page(&self, page: HistoryPage) {
+        let mut state = lock_unpoisoned(&self.state);
+        state.page = page
+            .records
+            .into_iter()
+            .map(SessionRecordView::from_summary)
+            .take(MAX_SESSION_RECORDS)
+            .collect();
+    }
+
+    pub fn append_page(&self, page: HistoryPage) {
+        let mut state = lock_unpoisoned(&self.state);
+        for summary in page.records {
+            if state.page.len() >= MAX_SESSION_RECORDS {
+                break;
+            }
+            if state.page.iter().any(|existing| existing.id == summary.id) {
+                continue;
+            }
+            state
+                .page
+                .push_back(SessionRecordView::from_summary(summary));
+        }
     }
 
     pub fn image_preview(&self, id: RecordId) -> Result<ImagePreviewView, SessionRecordError> {
@@ -305,6 +383,10 @@ impl SessionRecordStore {
                 .ok_or(SessionRecordError::NotFound)?,
         );
         record.note = note;
+        let page_note = record.note.clone();
+        if let Some(view) = state.page.iter_mut().find(|view| view.id == id) {
+            view.note = page_note;
+        }
         state.total_bytes = updated_total_bytes;
         evict_to_limits(&mut state, self.limits);
         let view = state
@@ -353,6 +435,9 @@ impl SessionRecordStore {
             .ok_or(SessionRecordError::NotFound)?;
         Arc::make_mut(record).group_id = group_id;
         let updated = Arc::clone(record);
+        if let Some(view) = state.page.iter_mut().find(|view| view.id == id) {
+            view.group_id = group_id;
+        }
         let view = SessionRecordView::from_record(&updated, self.limits.preview_bytes);
         drop(state);
         match &self.persistence {
@@ -377,6 +462,11 @@ impl SessionRecordStore {
             if record.group_id == Some(group_id) {
                 Arc::make_mut(record).group_id = None;
                 changed += 1;
+            }
+        }
+        for view in &mut state.page {
+            if view.group_id == Some(group_id) {
+                view.group_id = None;
             }
         }
         changed
@@ -442,6 +532,7 @@ impl SessionRecordStore {
         let mut state = lock_unpoisoned(&self.state);
         let removed = state.records.len();
         state.records.clear();
+        state.page.clear();
         state.total_bytes = 0;
         *lock_unpoisoned(&self.last_deleted) = None;
         Ok(removed)
@@ -451,6 +542,7 @@ impl SessionRecordStore {
         let mut state = lock_unpoisoned(&self.state);
         let before = state.records.len();
         state.records.retain(|record| record.captured_at >= cutoff);
+        state.page.retain(|record| record.captured_at >= cutoff);
         state.total_bytes = state
             .records
             .iter()
@@ -466,6 +558,7 @@ impl SessionRecordStore {
     pub(crate) fn replace_all(&self, records: Vec<ClipboardRecord>) {
         let mut state = lock_unpoisoned(&self.state);
         state.records.clear();
+        state.page.clear();
         state.total_bytes = 0;
         *lock_unpoisoned(&self.last_deleted) = None;
         for mut record in records {
@@ -562,6 +655,18 @@ impl SessionRecordView {
             group_id: record.group_id,
         }
     }
+
+    fn from_summary(summary: HistoryRecordSummary) -> Self {
+        Self {
+            id: summary.id,
+            captured_at: summary.captured_at,
+            source_application: summary.source_application,
+            text: summary.text,
+            has_image: summary.has_image,
+            note: summary.note,
+            group_id: summary.group_id,
+        }
+    }
 }
 
 pub(crate) fn checked_representation_bytes(
@@ -620,6 +725,10 @@ fn evict_to_limits(state: &mut SessionRecordState, limits: SessionRecordLimits) 
             break;
         };
         state.total_bytes = state.total_bytes.saturating_sub(record_bytes(&removed));
+        state.page.retain(|view| view.id != removed.id);
+    }
+    while state.page.len() > MAX_SESSION_RECORDS {
+        state.page.pop_back();
     }
 }
 
@@ -827,6 +936,8 @@ mod tests {
     use super::*;
     use crate::domain::{ContentIdentity, SourceIdentity};
     use crate::services::persistence::{PersistenceError, RecordPersistence};
+    use crate::{domain::HistoryQuery, services::persistence::SqliteRepository};
+    use tempfile::tempdir;
 
     fn png_bytes(width: u32, height: u32) -> Vec<u8> {
         let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
@@ -948,6 +1059,47 @@ mod tests {
         ));
         let store = SessionRecordStore::with_loaded(vec![oversized]);
         assert!(store.list().is_empty());
+    }
+
+    #[test]
+    fn paged_working_set_deduplicates_and_loads_binary_details_on_demand() {
+        let directory = tempdir().unwrap();
+        let repository = SqliteRepository::open(directory.path().join("history.sqlite3")).unwrap();
+        let mut binary = ClipboardRecord::from_capture(capture("binary", "caption"));
+        binary.representations.push(ClipboardRepresentation::Png {
+            bytes: vec![9; 128],
+        });
+        repository.save_record(&binary).unwrap();
+        let text = ClipboardRecord::from_capture(capture("text", "plain"));
+        repository.save_record(&text).unwrap();
+        let page = repository
+            .load_page(HistoryQuery {
+                limit: 1,
+                ..HistoryQuery::default()
+            })
+            .unwrap();
+        let next = repository
+            .load_page(HistoryQuery {
+                cursor: page.next_cursor.clone(),
+                limit: 1,
+                ..HistoryQuery::default()
+            })
+            .unwrap();
+        let available = Arc::new(AtomicBool::new(true));
+        let store = SessionRecordStore::with_persistence_page(
+            page.clone(),
+            Arc::clone(&repository) as Arc<dyn RecordPersistence>,
+            available,
+        );
+
+        store.append_page(page);
+        store.append_page(next);
+
+        assert_eq!(store.list().len(), 2);
+        assert!(serde_json::to_string(&store.list()).unwrap().len() < 2048);
+        assert!(store.record_details(binary.id).unwrap().representations.iter().any(
+            |representation| matches!(representation, ClipboardRepresentation::Png { bytes } if bytes.len() == 128)
+        ));
     }
 
     #[test]

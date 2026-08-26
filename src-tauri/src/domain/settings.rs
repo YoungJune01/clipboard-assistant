@@ -21,6 +21,28 @@ pub enum RetentionPeriod {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum StorageLimit {
+    #[default]
+    OneGb,
+    FiveGb,
+    TenGb,
+    Unlimited,
+}
+
+impl StorageLimit {
+    pub const fn bytes(self) -> Option<u64> {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        match self {
+            Self::OneGb => Some(GIB),
+            Self::FiveGb => Some(5 * GIB),
+            Self::TenGb => Some(10 * GIB),
+            Self::Unlimited => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum AccentColor {
     #[default]
     Blue,
@@ -158,6 +180,10 @@ impl RetentionPeriod {
 pub struct UserSettings {
     pub language: Language,
     pub retention: RetentionPeriod,
+    #[serde(default)]
+    pub storage_limit: StorageLimit,
+    #[serde(default)]
+    pub evict_favorites_when_full: bool,
     pub start_at_sign_in: bool,
     pub start_minimized: bool,
     pub show_tray_icon: bool,
@@ -175,6 +201,8 @@ impl Default for UserSettings {
         Self {
             language: Language::default(),
             retention: RetentionPeriod::default(),
+            storage_limit: StorageLimit::default(),
+            evict_favorites_when_full: false,
             start_at_sign_in: false,
             start_minimized: false,
             show_tray_icon: true,
@@ -227,7 +255,7 @@ impl Default for PasteSettings {
 mod tests {
     use super::{
         AccentColor, AppSettings, CaptureSound, ClipboardSettings, Language, PasteSettings,
-        RetentionPeriod, Shortcut, ShortcutKey, ShortcutModifiers, UserSettings,
+        RetentionPeriod, Shortcut, ShortcutKey, ShortcutModifiers, StorageLimit, UserSettings,
     };
 
     #[test]
@@ -237,6 +265,8 @@ mod tests {
             UserSettings {
                 language: Language::ZhCn,
                 retention: RetentionPeriod::ThirtyDays,
+                storage_limit: StorageLimit::OneGb,
+                evict_favorites_when_full: false,
                 start_at_sign_in: false,
                 start_minimized: false,
                 show_tray_icon: true,
@@ -275,6 +305,29 @@ mod tests {
             serde_json::from_str::<AppSettings>(&json).unwrap(),
             settings
         );
+    }
+
+    #[test]
+    fn older_user_settings_json_defaults_storage_policy_fields() {
+        let json = r#"{
+            "language":"en",
+            "retention":"forever",
+            "start_at_sign_in":false,
+            "start_minimized":false,
+            "show_tray_icon":true,
+            "accent_color":"blue",
+            "sound_enabled":true,
+            "capture_sound":"default",
+            "activation_shortcut":{"modifiers":{"ctrl":true,"alt":false,"shift":true,"win":false},"key":"v"},
+            "group_shortcut_modifiers":{"ctrl":true,"alt":true,"shift":false,"win":false},
+            "quick_paste_enabled":false,
+            "quick_paste_modifiers":{"ctrl":true,"alt":true,"shift":false,"win":false}
+        }"#;
+
+        let settings: UserSettings = serde_json::from_str(json).unwrap();
+
+        assert_eq!(settings.storage_limit, StorageLimit::OneGb);
+        assert!(!settings.evict_favorites_when_full);
     }
 
     #[test]

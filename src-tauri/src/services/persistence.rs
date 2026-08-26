@@ -16,6 +16,7 @@ use std::{collections::HashSet, sync::Condvar, time::Instant};
 
 use chrono::{DateTime, Duration, Utc};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use serde::Serialize;
 
 #[cfg(windows)]
 use windows::{
@@ -30,18 +31,22 @@ use windows::{
 use std::{marker::PhantomData, rc::Rc};
 
 use crate::domain::{
-    AccentColor, CaptureSound, ClipboardRecord, ClipboardRepresentation, ContentIdentity, GroupId,
-    Language, RecordId, RecordNote, RetentionPeriod, ShortcutModifiers, SourceIdentity,
-    UserSettings,
+    AccentColor, CaptureSound, ClipboardRecord, ClipboardRepresentation, ContentIdentity,
+    ContentKind, GroupId, HistoryCursor, HistoryQuery, Language, RecordId, RecordNote,
+    RetentionPeriod, ShortcutModifiers, SourceIdentity, StorageLimit, UserSettings,
 };
 use crate::services::session_records::REPRESENTATION_OVERHEAD_BYTES;
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 const DATABASE_FILE: &str = "clipboard-history.sqlite3";
 const MIGRATION_TEMP_SUFFIX: &str = ".migrate-v2";
 const MIGRATION_BACKUP_SUFFIX: &str = ".migrate-v1-backup";
 pub(crate) const DATABASE_MAX_RECORDS: usize = 10_000;
-pub(crate) const DATABASE_MAX_PAYLOAD_BYTES: usize = 512 * 1024 * 1024;
+pub(crate) const DATABASE_MAX_PAYLOAD_BYTES: usize = 1024 * 1024 * 1024;
+const DEFAULT_HISTORY_PAGE_LIMIT: usize = 50;
+const MAX_HISTORY_PAGE_LIMIT: usize = 100;
+const MAX_FILE_LIST_PATHS: usize = 4096;
+const MAX_FILE_LIST_BYTES: usize = 16 * 1024 * 1024;
 const DATABASE_INCREMENTAL_VACUUM_PAGES: usize = 256;
 const WORK_QUEUE_CAPACITY: usize = 64;
 const WORKER_TIMEOUT: StdDuration = StdDuration::from_secs(2);
@@ -80,6 +85,28 @@ impl Default for DiskQuota {
             incremental_vacuum_pages: DATABASE_INCREMENTAL_VACUUM_PAGES,
         }
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryRecordSummary {
+    pub id: RecordId,
+    pub captured_at: DateTime<Utc>,
+    pub source_application: Option<String>,
+    pub text: Option<String>,
+    pub has_image: bool,
+    pub content_kind: ContentKind,
+    pub note: Option<RecordNote>,
+    pub group_id: Option<GroupId>,
+    pub pinned: bool,
+    pub favorite: bool,
+    pub sensitive: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HistoryPage {
+    pub records: Vec<HistoryRecordSummary>,
+    pub next_cursor: Option<HistoryCursor>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -162,6 +189,12 @@ pub trait RecordPersistence: Send + Sync {
     fn update_note(&self, id: RecordId, note: Option<&RecordNote>) -> Result<(), PersistenceError>;
     fn delete_record(&self, id: RecordId) -> Result<(), PersistenceError>;
     fn clear_records(&self) -> Result<(), PersistenceError>;
+    fn load_page(&self, _query: HistoryQuery) -> Result<HistoryPage, PersistenceError> {
+        Err(PersistenceError::WorkerUnavailable)
+    }
+    fn record_details(&self, _id: RecordId) -> Result<ClipboardRecord, PersistenceError> {
+        Err(PersistenceError::WorkerUnavailable)
+    }
 }
 
 enum PersistenceCommand {
@@ -205,6 +238,7 @@ pub struct PersistenceWorker {
     storage_available: Arc<AtomicBool>,
     accepted: AtomicUsize,
     response_timeout: StdDuration,
+    reader: Option<Arc<SqliteRepository>>,
 }
 
 trait PersistenceBackend: Send + Sync {
@@ -249,13 +283,28 @@ impl PersistenceWorker {
         repository: Arc<SqliteRepository>,
         storage_available: Arc<AtomicBool>,
     ) -> Result<Arc<Self>, PersistenceError> {
-        Self::start_backend(repository, storage_available, WORKER_TIMEOUT)
+        Self::start_backend_with_reader(
+            Arc::clone(&repository) as Arc<dyn PersistenceBackend>,
+            storage_available,
+            WORKER_TIMEOUT,
+            Some(repository),
+        )
     }
 
+    #[cfg(test)]
     fn start_backend(
         repository: Arc<dyn PersistenceBackend>,
         storage_available: Arc<AtomicBool>,
         response_timeout: StdDuration,
+    ) -> Result<Arc<Self>, PersistenceError> {
+        Self::start_backend_with_reader(repository, storage_available, response_timeout, None)
+    }
+
+    fn start_backend_with_reader(
+        repository: Arc<dyn PersistenceBackend>,
+        storage_available: Arc<AtomicBool>,
+        response_timeout: StdDuration,
+        reader: Option<Arc<SqliteRepository>>,
     ) -> Result<Arc<Self>, PersistenceError> {
         let (sender, receiver) = mpsc::sync_channel(WORK_QUEUE_CAPACITY);
         let (control, controls) = mpsc::channel();
@@ -273,6 +322,7 @@ impl PersistenceWorker {
             storage_available,
             accepted: AtomicUsize::new(0),
             response_timeout,
+            reader,
         }))
     }
 
@@ -409,6 +459,20 @@ impl RecordPersistence for PersistenceWorker {
 
     fn clear_records(&self) -> Result<(), PersistenceError> {
         self.request(PersistenceCommand::ClearRecords)
+    }
+
+    fn load_page(&self, query: HistoryQuery) -> Result<HistoryPage, PersistenceError> {
+        self.reader
+            .as_ref()
+            .ok_or(PersistenceError::WorkerUnavailable)?
+            .load_page(query)
+    }
+
+    fn record_details(&self, id: RecordId) -> Result<ClipboardRecord, PersistenceError> {
+        self.reader
+            .as_ref()
+            .ok_or(PersistenceError::WorkerUnavailable)?
+            .record_details(id)
     }
 }
 
@@ -710,7 +774,7 @@ impl SqliteRepository {
         let unsupported = connection
             .query_row(
                 "SELECT kind FROM clipboard_representations
-                 WHERE kind IN ('rtf', 'html', 'file_list')
+                 WHERE kind NOT IN ('unicode_text', 'rtf', 'html', 'png', 'dib_v5', 'file_list')
                  ORDER BY kind LIMIT 1",
                 [],
                 |row| row.get::<_, String>(0),
@@ -718,6 +782,16 @@ impl SqliteRepository {
             .optional()?;
         if let Some(kind) = unsupported {
             return Err(PersistenceError::UnsupportedRepresentationKind(kind));
+        }
+        let mut ids = connection.prepare("SELECT id FROM clipboard_records")?;
+        let rows = ids.query_map([], |row| row.get::<_, String>(0))?;
+        for id in rows {
+            let id = id?;
+            if representation_metadata_bytes_for_id(&connection, &id)?.is_none()
+                || load_representations(&connection, &id).is_err()
+            {
+                return Err(PersistenceError::InvalidData);
+            }
         }
         Ok(())
     }
@@ -730,6 +804,12 @@ impl SqliteRepository {
         let retention = setting(&connection, "retention")?
             .and_then(|value| parse_retention(&value))
             .unwrap_or_default();
+        let storage_limit = setting(&connection, "storage_limit")?
+            .and_then(|value| parse_storage_limit(&value))
+            .unwrap_or_default();
+        let evict_favorites_when_full = setting(&connection, "evict_favorites_when_full")?
+            .and_then(|value| parse_bool(&value))
+            .unwrap_or(false);
         let start_at_sign_in = setting(&connection, "start_at_sign_in")?
             .and_then(|value| parse_bool(&value))
             .unwrap_or(false);
@@ -769,6 +849,8 @@ impl SqliteRepository {
         Ok(UserSettings {
             language,
             retention,
+            storage_limit,
+            evict_favorites_when_full,
             start_at_sign_in,
             start_minimized,
             show_tray_icon,
@@ -866,6 +948,16 @@ impl SqliteRepository {
             &transaction,
             "retention",
             retention_value(settings.retention),
+        )?;
+        save_setting(
+            &transaction,
+            "storage_limit",
+            storage_limit_value(settings.storage_limit),
+        )?;
+        save_setting(
+            &transaction,
+            "evict_favorites_when_full",
+            bool_value(settings.evict_favorites_when_full),
         )?;
         save_setting(
             &transaction,
@@ -980,6 +1072,123 @@ impl SqliteRepository {
         })
     }
 
+    pub fn load_page(&self, query: HistoryQuery) -> Result<HistoryPage, PersistenceError> {
+        let requested = if query.limit == 0 {
+            DEFAULT_HISTORY_PAGE_LIMIT
+        } else {
+            query.limit.min(MAX_HISTORY_PAGE_LIMIT)
+        };
+        let fetch_limit = requested.saturating_add(1);
+        let connection = lock_unpoisoned(&self.connection);
+        let mut sql = String::from(
+            "SELECT r.id, r.captured_at, r.source_application, r.note, r.group_id, \
+                    r.pinned, r.favorite, r.sensitive, r.content_kind, \
+                    (SELECT substr(p.text_value, 1, 4096) FROM clipboard_representations p \
+                     WHERE p.record_id = r.id AND p.kind = 'unicode_text' \
+                     ORDER BY p.position LIMIT 1), \
+                    EXISTS(SELECT 1 FROM clipboard_representations p \
+                           WHERE p.record_id = r.id AND p.kind IN ('png', 'dib_v5')) \
+             FROM clipboard_records r WHERE 1 = 1",
+        );
+        let mut values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        if let Some(cursor) = query.cursor {
+            sql.push_str(" AND (r.captured_at < ? OR (r.captured_at = ? AND r.id < ?))");
+            values.push(Box::new(cursor.captured_at.to_rfc3339()));
+            values.push(Box::new(cursor.captured_at.to_rfc3339()));
+            values.push(Box::new(cursor.id.as_uuid().to_string()));
+        }
+        if let Some(kind) = query.content_kind {
+            sql.push_str(" AND r.content_kind = ?");
+            values.push(Box::new(content_kind_value(kind).to_owned()));
+        }
+        if let Some(group_id) = query.group_id {
+            sql.push_str(" AND r.group_id = ?");
+            values.push(Box::new(group_id.as_uuid().to_string()));
+        }
+        if query.ungrouped_only {
+            sql.push_str(" AND r.group_id IS NULL");
+        }
+        if query.favorites_only {
+            sql.push_str(" AND r.favorite = 1");
+        }
+        sql.push_str(" ORDER BY r.captured_at DESC, r.id DESC LIMIT ?");
+        values.push(Box::new(
+            i64::try_from(fetch_limit).map_err(|_| PersistenceError::InvalidData)?,
+        ));
+        let params = values.iter().map(|value| value.as_ref());
+        let mut statement = connection.prepare(&sql)?;
+        let rows = statement.query_map(rusqlite::params_from_iter(params), |row| {
+            Ok(DbSummary {
+                id: row.get(0)?,
+                captured_at: row.get(1)?,
+                source_application: row.get(2)?,
+                note: row.get(3)?,
+                group_id: row.get(4)?,
+                pinned: row.get(5)?,
+                favorite: row.get(6)?,
+                sensitive: row.get(7)?,
+                content_kind: row.get(8)?,
+                text: row.get(9)?,
+                has_image: row.get(10)?,
+            })
+        })?;
+        let mut records = Vec::with_capacity(requested);
+        for row in rows {
+            let row = row?;
+            let Ok(summary) = row.into_summary() else {
+                continue;
+            };
+            records.push(summary);
+            if records.len() > requested {
+                break;
+            }
+        }
+        let has_more = records.len() > requested;
+        records.truncate(requested);
+        let next_cursor = has_more.then(|| {
+            let last = records.last().expect("non-empty page with lookahead");
+            HistoryCursor {
+                captured_at: last.captured_at,
+                id: last.id,
+            }
+        });
+        Ok(HistoryPage {
+            records,
+            next_cursor,
+        })
+    }
+
+    pub fn record_details(&self, id: RecordId) -> Result<ClipboardRecord, PersistenceError> {
+        let connection = lock_unpoisoned(&self.connection);
+        let row = connection
+            .query_row(
+                "SELECT id, content_identity, captured_at, source_application, source_path, \
+                        typeof(note), length(CAST(note AS BLOB)), group_id, pinned, favorite, sensitive \
+                 FROM clipboard_records WHERE id = ?1",
+                [id.as_uuid().to_string()],
+                |row| {
+                    Ok(DbRecord {
+                        id: row.get(0)?,
+                        content_identity: row.get(1)?,
+                        captured_at: row.get(2)?,
+                        source_application: row.get(3)?,
+                        source_path: row.get(4)?,
+                        note_storage_type: row.get(5)?,
+                        note_length: row.get(6)?,
+                        group_id: row.get(7)?,
+                        pinned: row.get(8)?,
+                        favorite: row.get(9)?,
+                        sensitive: row.get(10)?,
+                    })
+                },
+            )
+            .optional()?
+            .ok_or(PersistenceError::InvalidData)?;
+        let representations = load_representations(&connection, &row.id)?;
+        let note = load_note(&connection, &row.id)?;
+        row.into_record(representations, note)
+    }
+
     pub(crate) fn load_recent_bounded(
         &self,
         budget: RestoreBudget,
@@ -1024,8 +1233,12 @@ impl SqliteRepository {
             if next_total > budget.max_total_bytes {
                 break;
             }
-            let representations = load_representations(&connection, &row.id)?;
-            let note = load_note(&connection, &row.id)?;
+            let Ok(representations) = load_representations(&connection, &row.id) else {
+                continue;
+            };
+            let Ok(note) = load_note(&connection, &row.id) else {
+                continue;
+            };
             let Ok(record) = row.into_record(representations, note) else {
                 continue;
             };
@@ -1088,8 +1301,8 @@ fn write_record(
     transaction.execute(
         "INSERT INTO clipboard_records (
                 id, content_identity, captured_at, source_application, source_path, note,
-                group_id, pinned, favorite, sensitive
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                group_id, pinned, favorite, sensitive, content_kind
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
              ON CONFLICT(id) DO UPDATE SET
                 content_identity = excluded.content_identity,
                 captured_at = excluded.captured_at,
@@ -1099,7 +1312,8 @@ fn write_record(
                 group_id = excluded.group_id,
                 pinned = excluded.pinned,
                 favorite = excluded.favorite,
-                sensitive = excluded.sensitive",
+                sensitive = excluded.sensitive,
+                content_kind = excluded.content_kind",
         params![
             record.id.as_uuid().to_string(),
             record.content_identity.as_str(),
@@ -1111,6 +1325,7 @@ fn write_record(
             record.pinned,
             record.favorite,
             record.sensitive,
+            content_kind_value(record.content_kind()),
         ],
     )?;
     transaction.execute(
@@ -1118,6 +1333,7 @@ fn write_record(
         [record.id.as_uuid().to_string()],
     )?;
     for (position, representation) in record.representations.iter().enumerate() {
+        let file_list_json;
         let (kind, text_value, blob_value): (&str, Option<&str>, Option<&[u8]>) =
             match representation {
                 ClipboardRepresentation::UnicodeText { text } => {
@@ -1127,10 +1343,13 @@ fn write_record(
                 ClipboardRepresentation::DibV5 { bytes } => {
                     ("dib_v5", None, Some(bytes.as_slice()))
                 }
-                ClipboardRepresentation::Rtf { .. }
-                | ClipboardRepresentation::Html { .. }
-                | ClipboardRepresentation::FileList { .. } => {
-                    return Err(PersistenceError::InvalidData);
+                ClipboardRepresentation::Rtf { bytes } => ("rtf", None, Some(bytes.as_slice())),
+                ClipboardRepresentation::Html { bytes } => ("html", None, Some(bytes.as_slice())),
+                ClipboardRepresentation::FileList { paths } => {
+                    validate_file_list(paths)?;
+                    file_list_json =
+                        serde_json::to_string(paths).map_err(|_| PersistenceError::InvalidData)?;
+                    ("file_list", Some(file_list_json.as_str()), None)
                 }
             };
         transaction.execute(
@@ -1199,6 +1418,14 @@ impl RecordPersistence for SqliteRepository {
         connection.execute("DELETE FROM clipboard_records", [])?;
         incremental_vacuum(&connection, self.quota)?;
         Ok(())
+    }
+
+    fn load_page(&self, query: HistoryQuery) -> Result<HistoryPage, PersistenceError> {
+        SqliteRepository::load_page(self, query)
+    }
+
+    fn record_details(&self, id: RecordId) -> Result<ClipboardRecord, PersistenceError> {
+        SqliteRepository::record_details(self, id)
     }
 }
 
@@ -1635,8 +1862,22 @@ fn build_migrated_database(
             }
         }
         transaction.execute_batch(
-            "INSERT INTO migrated.clipboard_records
-             SELECT r.* FROM main.clipboard_records r
+            "INSERT INTO migrated.clipboard_records (
+                id, content_identity, captured_at, source_application, source_path, note,
+                group_id, pinned, favorite, sensitive, content_kind
+             )
+             SELECT r.id, r.content_identity, r.captured_at, r.source_application, r.source_path,
+                    r.note, r.group_id, r.pinned, r.favorite, r.sensitive,
+                    CASE
+                      WHEN EXISTS (SELECT 1 FROM main.clipboard_representations p
+                                   WHERE p.record_id = r.id AND p.kind = 'file_list') THEN 'files'
+                      WHEN EXISTS (SELECT 1 FROM main.clipboard_representations p
+                                   WHERE p.record_id = r.id AND p.kind IN ('png', 'dib_v5')) THEN 'image'
+                      WHEN EXISTS (SELECT 1 FROM main.clipboard_representations p
+                                   WHERE p.record_id = r.id AND p.kind IN ('rtf', 'html')) THEN 'rich_text'
+                      ELSE 'text'
+                    END
+             FROM main.clipboard_records r
              JOIN retained_migration_ids keep ON keep.id = r.id;
              INSERT INTO migrated.clipboard_representations
              SELECT p.* FROM main.clipboard_representations p
@@ -1792,6 +2033,40 @@ fn migrate(connection: &mut Connection) -> Result<(), PersistenceError> {
              COMMIT;",
         )?;
     }
+    let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version == 3 {
+        connection.execute_batch(
+            "BEGIN IMMEDIATE;
+             ALTER TABLE clipboard_records
+                ADD COLUMN content_kind TEXT NOT NULL DEFAULT 'text';
+             UPDATE clipboard_records
+             SET content_kind = CASE
+                WHEN EXISTS (
+                    SELECT 1 FROM clipboard_representations p
+                    WHERE p.record_id = clipboard_records.id AND p.kind = 'file_list'
+                ) THEN 'files'
+                WHEN EXISTS (
+                    SELECT 1 FROM clipboard_representations p
+                    WHERE p.record_id = clipboard_records.id AND p.kind IN ('png', 'dib_v5')
+                ) THEN 'image'
+                WHEN EXISTS (
+                    SELECT 1 FROM clipboard_representations p
+                    WHERE p.record_id = clipboard_records.id AND p.kind IN ('rtf', 'html')
+                ) THEN 'rich_text'
+                ELSE 'text'
+             END;
+             CREATE INDEX clipboard_records_content_kind_page
+                ON clipboard_records(content_kind, captured_at DESC, id DESC);
+             CREATE INDEX clipboard_records_group_page
+                ON clipboard_records(group_id, captured_at DESC, id DESC);
+             CREATE INDEX clipboard_records_favorite_page
+                ON clipboard_records(favorite, captured_at DESC, id DESC);
+             CREATE INDEX clipboard_records_pinned_page
+                ON clipboard_records(pinned, captured_at DESC, id DESC);
+             PRAGMA user_version = 4;
+             COMMIT;",
+        )?;
+    }
     Ok(())
 }
 
@@ -1810,9 +2085,18 @@ fn create_schema(connection: &mut Connection) -> Result<(), PersistenceError> {
                 pinned INTEGER NOT NULL DEFAULT 0,
                 favorite INTEGER NOT NULL DEFAULT 0,
                 sensitive INTEGER NOT NULL DEFAULT 0
+                ,content_kind TEXT NOT NULL DEFAULT 'text'
          );
          CREATE INDEX clipboard_records_captured_at
                 ON clipboard_records(captured_at DESC);
+         CREATE INDEX clipboard_records_content_kind_page
+                ON clipboard_records(content_kind, captured_at DESC, id DESC);
+         CREATE INDEX clipboard_records_group_page
+                ON clipboard_records(group_id, captured_at DESC, id DESC);
+         CREATE INDEX clipboard_records_favorite_page
+                ON clipboard_records(favorite, captured_at DESC, id DESC);
+         CREATE INDEX clipboard_records_pinned_page
+                ON clipboard_records(pinned, captured_at DESC, id DESC);
          CREATE TABLE clipboard_representations (
                 record_id TEXT NOT NULL REFERENCES clipboard_records(id) ON DELETE CASCADE,
                 position INTEGER NOT NULL,
@@ -1830,7 +2114,7 @@ fn create_schema(connection: &mut Connection) -> Result<(), PersistenceError> {
                 name TEXT NOT NULL,
                 position INTEGER NOT NULL
          );
-         PRAGMA user_version = 3;
+         PRAGMA user_version = 4;
          COMMIT;",
     )?;
     Ok(())
@@ -1881,46 +2165,80 @@ fn enforce_disk_quota(
     transaction: &Transaction<'_>,
     quota: DiskQuota,
 ) -> Result<usize, PersistenceError> {
+    let max_payload_bytes = setting(transaction, "storage_limit")?
+        .and_then(|value| parse_storage_limit(&value))
+        .unwrap_or_default()
+        .bytes()
+        .unwrap_or(u64::MAX)
+        .min(quota.max_payload_bytes as u64);
+    let evict_favorites = setting(transaction, "evict_favorites_when_full")?
+        .and_then(|value| parse_bool(&value))
+        .unwrap_or(false);
     let mut records = Vec::new();
     let mut statement = transaction.prepare(
         "SELECT r.id,
                 COALESCE(length(CAST(r.note AS BLOB)), 0) + COALESCE(SUM(
                     COALESCE(length(CAST(p.text_value AS BLOB)), 0) +
                     COALESCE(length(p.blob_value), 0) + ?1
-                ), 0) AS payload_bytes
+                ), 0) AS payload_bytes,
+                r.favorite
          FROM clipboard_records r
          LEFT JOIN clipboard_representations p ON p.record_id = r.id
+         WHERE r.pinned = 0
          GROUP BY r.id
-         ORDER BY r.captured_at DESC, r.id DESC",
+         ORDER BY r.favorite ASC, r.captured_at ASC, r.id ASC",
     )?;
     let rows = statement.query_map([REPRESENTATION_OVERHEAD_BYTES as i64], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, bool>(2)?,
+        ))
     })?;
     for row in rows {
         records.push(row?);
     }
     drop(statement);
 
-    let mut retained_count = 0_usize;
-    let mut retained_bytes = 0_usize;
+    let total_count: i64 =
+        transaction.query_row("SELECT COUNT(*) FROM clipboard_records", [], |row| {
+            row.get(0)
+        })?;
+    let total_bytes: i64 = transaction.query_row(
+        "SELECT COALESCE(SUM(payload_bytes), 0) FROM (
+             SELECT COALESCE(length(CAST(r.note AS BLOB)), 0) + COALESCE(SUM(
+                 COALESCE(length(CAST(p.text_value AS BLOB)), 0) +
+                 COALESCE(length(p.blob_value), 0) + ?1
+             ), 0) AS payload_bytes
+             FROM clipboard_records r
+             LEFT JOIN clipboard_representations p ON p.record_id = r.id
+             GROUP BY r.id
+         )",
+        [REPRESENTATION_OVERHEAD_BYTES as i64],
+        |row| row.get(0),
+    )?;
+    let mut retained_count =
+        usize::try_from(total_count).map_err(|_| PersistenceError::InvalidData)?;
+    let mut retained_bytes =
+        u64::try_from(total_bytes).map_err(|_| PersistenceError::InvalidData)?;
     let mut removed = 0_usize;
-    for (id, payload_bytes) in records {
-        let Ok(payload_bytes) = usize::try_from(payload_bytes) else {
+    for (id, payload_bytes, favorite) in records {
+        if retained_count <= quota.max_records && retained_bytes <= max_payload_bytes {
+            break;
+        }
+        if favorite && !evict_favorites {
+            continue;
+        }
+        let Ok(payload_bytes) = u64::try_from(payload_bytes) else {
             transaction.execute("DELETE FROM clipboard_records WHERE id = ?1", [id])?;
             removed = removed.saturating_add(1);
+            retained_count = retained_count.saturating_sub(1);
             continue;
         };
-        let fits_count = retained_count < quota.max_records;
-        let fits_bytes = retained_bytes
-            .checked_add(payload_bytes)
-            .is_some_and(|bytes| bytes <= quota.max_payload_bytes);
-        if fits_count && fits_bytes {
-            retained_count = retained_count.saturating_add(1);
-            retained_bytes = retained_bytes.saturating_add(payload_bytes);
-        } else {
-            transaction.execute("DELETE FROM clipboard_records WHERE id = ?1", [id])?;
-            removed = removed.saturating_add(1);
-        }
+        transaction.execute("DELETE FROM clipboard_records WHERE id = ?1", [id])?;
+        retained_count = retained_count.saturating_sub(1);
+        retained_bytes = retained_bytes.saturating_sub(payload_bytes);
+        removed = removed.saturating_add(1);
     }
     Ok(removed)
 }
@@ -1945,13 +2263,27 @@ fn representation_metadata_bytes(
         },
         _ => return Ok(None),
     };
+    let Some(representation_bytes) = representation_metadata_bytes_for_id(connection, &record.id)?
+    else {
+        return Ok(None);
+    };
+    note_bytes
+        .checked_add(representation_bytes)
+        .map(Some)
+        .ok_or(PersistenceError::InvalidData)
+}
+
+fn representation_metadata_bytes_for_id(
+    connection: &Connection,
+    record_id: &str,
+) -> Result<Option<usize>, PersistenceError> {
     let mut statement = connection.prepare(
         "SELECT kind, typeof(text_value), length(CAST(text_value AS BLOB)),
                 typeof(blob_value), length(blob_value)
          FROM clipboard_representations
          WHERE record_id = ?1 ORDER BY position",
     )?;
-    let rows = statement.query_map([record.id.as_str()], |row| {
+    let rows = statement.query_map([record_id], |row| {
         Ok(RepresentationMetadata {
             kind: row.get(0)?,
             text_storage_type: row.get(1)?,
@@ -1960,7 +2292,7 @@ fn representation_metadata_bytes(
             blob_length: row.get(4)?,
         })
     })?;
-    let mut total = note_bytes;
+    let mut total = 0_usize;
     let mut count = 0_usize;
     for row in rows {
         let metadata = row?;
@@ -1970,10 +2302,15 @@ fn representation_metadata_bytes(
             {
                 metadata.text_length
             }
-            "png" | "dib_v5"
+            "rtf" | "html" | "png" | "dib_v5"
                 if metadata.text_storage_type == "null" && metadata.blob_storage_type == "blob" =>
             {
                 metadata.blob_length
+            }
+            "file_list"
+                if metadata.text_storage_type == "text" && metadata.blob_storage_type == "null" =>
+            {
+                metadata.text_length
             }
             _ => return Ok(None),
         };
@@ -2029,6 +2366,19 @@ fn load_representations(
             "dib_v5" => ClipboardRepresentation::DibV5 {
                 bytes: blob.ok_or(PersistenceError::InvalidData)?,
             },
+            "rtf" => ClipboardRepresentation::Rtf {
+                bytes: blob.ok_or(PersistenceError::InvalidData)?,
+            },
+            "html" => ClipboardRepresentation::Html {
+                bytes: blob.ok_or(PersistenceError::InvalidData)?,
+            },
+            "file_list" => {
+                let paths: Vec<String> =
+                    serde_json::from_str(text.as_deref().ok_or(PersistenceError::InvalidData)?)
+                        .map_err(|_| PersistenceError::InvalidData)?;
+                validate_file_list(&paths)?;
+                ClipboardRepresentation::FileList { paths }
+            }
             _ => return Err(PersistenceError::InvalidData),
         });
     }
@@ -2036,6 +2386,22 @@ fn load_representations(
         return Err(PersistenceError::InvalidData);
     }
     Ok(representations)
+}
+
+fn validate_file_list(paths: &[String]) -> Result<(), PersistenceError> {
+    if paths.is_empty() || paths.len() > MAX_FILE_LIST_PATHS {
+        return Err(PersistenceError::InvalidData);
+    }
+    let total = paths.iter().try_fold(0_usize, |total, path| {
+        if path.is_empty() || path.contains('\0') {
+            return None;
+        }
+        total.checked_add(path.len())
+    });
+    if total.is_none_or(|total| total > MAX_FILE_LIST_BYTES) {
+        return Err(PersistenceError::InvalidData);
+    }
+    Ok(())
 }
 
 struct DbRecord {
@@ -2050,6 +2416,49 @@ struct DbRecord {
     pinned: bool,
     favorite: bool,
     sensitive: bool,
+}
+
+struct DbSummary {
+    id: String,
+    captured_at: String,
+    source_application: Option<String>,
+    note: Option<String>,
+    group_id: Option<String>,
+    pinned: bool,
+    favorite: bool,
+    sensitive: bool,
+    content_kind: String,
+    text: Option<String>,
+    has_image: bool,
+}
+
+impl DbSummary {
+    fn into_summary(self) -> Result<HistoryRecordSummary, PersistenceError> {
+        Ok(HistoryRecordSummary {
+            id: RecordId::parse(&self.id).map_err(|_| PersistenceError::InvalidData)?,
+            captured_at: DateTime::parse_from_rfc3339(&self.captured_at)
+                .map_err(|_| PersistenceError::InvalidData)?
+                .with_timezone(&Utc),
+            source_application: self.source_application,
+            text: self.text,
+            has_image: self.has_image,
+            content_kind: parse_content_kind(&self.content_kind)
+                .ok_or(PersistenceError::InvalidData)?,
+            note: self
+                .note
+                .map(RecordNote::new)
+                .transpose()
+                .map_err(|_| PersistenceError::InvalidData)?,
+            group_id: self
+                .group_id
+                .map(|value| GroupId::parse(&value))
+                .transpose()
+                .map_err(|_| PersistenceError::InvalidData)?,
+            pinned: self.pinned,
+            favorite: self.favorite,
+            sensitive: self.sensitive,
+        })
+    }
 }
 
 impl DbRecord {
@@ -2165,6 +2574,44 @@ fn parse_retention(value: &str) -> Option<RetentionPeriod> {
     }
 }
 
+fn storage_limit_value(limit: StorageLimit) -> &'static str {
+    match limit {
+        StorageLimit::OneGb => "one_gb",
+        StorageLimit::FiveGb => "five_gb",
+        StorageLimit::TenGb => "ten_gb",
+        StorageLimit::Unlimited => "unlimited",
+    }
+}
+
+fn parse_storage_limit(value: &str) -> Option<StorageLimit> {
+    match value {
+        "one_gb" => Some(StorageLimit::OneGb),
+        "five_gb" => Some(StorageLimit::FiveGb),
+        "ten_gb" => Some(StorageLimit::TenGb),
+        "unlimited" => Some(StorageLimit::Unlimited),
+        _ => None,
+    }
+}
+
+fn content_kind_value(kind: ContentKind) -> &'static str {
+    match kind {
+        ContentKind::Text => "text",
+        ContentKind::RichText => "rich_text",
+        ContentKind::Image => "image",
+        ContentKind::Files => "files",
+    }
+}
+
+fn parse_content_kind(value: &str) -> Option<ContentKind> {
+    match value {
+        "text" => Some(ContentKind::Text),
+        "rich_text" => Some(ContentKind::RichText),
+        "image" => Some(ContentKind::Image),
+        "files" => Some(ContentKind::Files),
+        _ => None,
+    }
+}
+
 fn bool_value(value: bool) -> &'static str {
     if value { "true" } else { "false" }
 }
@@ -2191,6 +2638,7 @@ mod tests {
     #[cfg(windows)]
     use static_assertions::assert_not_impl_any;
     use std::{
+        collections::HashSet,
         io,
         sync::{Barrier, atomic::AtomicUsize},
     };
@@ -2429,51 +2877,46 @@ mod tests {
         repository.save_record(&expected_record).unwrap();
         repository.save_settings(expected_settings).unwrap();
 
-        for kind in ["rtf", "html", "file_list"] {
-            let source_path = directory
-                .path()
-                .join(format!("unsupported-{kind}.clipbackup"));
-            let source = SqliteRepository::open(source_path.clone()).unwrap();
-            let source_record = text_record("source", Utc::now(), "replace me");
-            source.save_record(&source_record).unwrap();
-            lock_unpoisoned(&source.connection)
-                .execute(
-                    "UPDATE clipboard_representations
-                     SET kind = ?1, text_value = NULL, blob_value = ?2
-                     WHERE record_id = ?3",
-                    params![
-                        kind,
-                        b"UNSUPPORTED_SECRET_PAYLOAD",
-                        source_record.id.as_uuid().to_string()
-                    ],
-                )
-                .unwrap();
-            drop(source);
+        let kind = "future_format";
+        let source_path = directory
+            .path()
+            .join(format!("unsupported-{kind}.clipbackup"));
+        let source = SqliteRepository::open(source_path.clone()).unwrap();
+        let source_record = text_record("source", Utc::now(), "replace me");
+        source.save_record(&source_record).unwrap();
+        lock_unpoisoned(&source.connection)
+            .execute(
+                "UPDATE clipboard_representations
+                 SET kind = ?1, text_value = NULL, blob_value = ?2
+                 WHERE record_id = ?3",
+                params![
+                    kind,
+                    b"UNSUPPORTED_SECRET_PAYLOAD",
+                    source_record.id.as_uuid().to_string()
+                ],
+            )
+            .unwrap();
+        drop(source);
 
-            let error = repository
-                .restore_from(
-                    &source_path,
-                    RestoreBudget {
-                        max_records: 500,
-                        max_total_bytes: crate::services::session_records::DEFAULT_STORE_BYTES,
-                        max_record_bytes:
-                            crate::services::session_records::MAX_CAPTURE_RECORD_BYTES,
-                    },
-                )
-                .unwrap_err();
+        let error = repository
+            .restore_from(
+                &source_path,
+                RestoreBudget {
+                    max_records: 500,
+                    max_total_bytes: crate::services::session_records::DEFAULT_STORE_BYTES,
+                    max_record_bytes: crate::services::session_records::MAX_CAPTURE_RECORD_BYTES,
+                },
+            )
+            .unwrap_err();
 
-            assert!(matches!(
-                &error,
-                PersistenceError::UnsupportedRepresentationKind(error_kind)
-                    if error_kind == kind
-            ));
-            assert!(!error.to_string().contains("UNSUPPORTED_SECRET_PAYLOAD"));
-            assert_eq!(
-                repository.load_recent(10).unwrap(),
-                vec![expected_record.clone()]
-            );
-            assert_eq!(repository.load_settings().unwrap(), expected_settings);
-        }
+        assert!(matches!(
+            &error,
+            PersistenceError::UnsupportedRepresentationKind(error_kind)
+                if error_kind == kind
+        ));
+        assert!(!error.to_string().contains("UNSUPPORTED_SECRET_PAYLOAD"));
+        assert_eq!(repository.load_recent(10).unwrap(), vec![expected_record]);
+        assert_eq!(repository.load_settings().unwrap(), expected_settings);
     }
 
     #[test]
@@ -2661,6 +3104,396 @@ mod tests {
 
         let repository = SqliteRepository::open(path).unwrap();
         assert_eq!(repository.load_recent(500).unwrap(), vec![expected]);
+    }
+
+    #[test]
+    fn backup_and_restore_preserve_all_six_representation_formats() {
+        let directory = tempdir().unwrap();
+        let live_path = directory.path().join("live.sqlite3");
+        let backup_path = directory.path().join("all-formats.clipbackup");
+        let repository = SqliteRepository::open(live_path).unwrap();
+        let mut expected = text_record("all-formats-backup", Utc::now(), "plain");
+        expected.representations = vec![
+            ClipboardRepresentation::UnicodeText {
+                text: "plain".into(),
+            },
+            ClipboardRepresentation::Rtf {
+                bytes: br"{\rtf1 rich}".to_vec(),
+            },
+            ClipboardRepresentation::Html {
+                bytes: b"<b>html</b>".to_vec(),
+            },
+            ClipboardRepresentation::Png {
+                bytes: vec![1, 2, 3],
+            },
+            ClipboardRepresentation::DibV5 {
+                bytes: vec![4, 5, 6],
+            },
+            ClipboardRepresentation::FileList {
+                paths: vec![r"C:\Temp\one.txt".into(), r"D:\two.bin".into()],
+            },
+        ];
+        repository.save_record(&expected).unwrap();
+        repository.backup_to(&backup_path).unwrap();
+        RecordPersistence::clear_records(repository.as_ref()).unwrap();
+
+        let restored = repository
+            .restore_from(
+                &backup_path,
+                RestoreBudget {
+                    max_records: 500,
+                    max_total_bytes: crate::services::session_records::DEFAULT_STORE_BYTES,
+                    max_record_bytes: crate::services::session_records::MAX_CAPTURE_RECORD_BYTES,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(restored.records, vec![expected]);
+    }
+
+    #[test]
+    fn schema_three_migrates_to_four_and_backfills_content_kind_without_losing_records() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("history.sqlite3");
+        {
+            let connection = Connection::open(&path).unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TABLE clipboard_records (
+                    id TEXT PRIMARY KEY NOT NULL, content_identity TEXT NOT NULL,
+                    captured_at TEXT NOT NULL, source_application TEXT, source_path TEXT,
+                    note TEXT, group_id TEXT, pinned INTEGER NOT NULL DEFAULT 0,
+                    favorite INTEGER NOT NULL DEFAULT 0, sensitive INTEGER NOT NULL DEFAULT 0
+                 );
+                 CREATE TABLE clipboard_representations (
+                    record_id TEXT NOT NULL REFERENCES clipboard_records(id) ON DELETE CASCADE,
+                    position INTEGER NOT NULL, kind TEXT NOT NULL, text_value TEXT,
+                    blob_value BLOB, PRIMARY KEY(record_id, position)
+                 );
+                 CREATE TABLE app_settings (key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL);
+                 CREATE TABLE clipboard_groups (
+                    id TEXT PRIMARY KEY NOT NULL, name TEXT NOT NULL, position INTEGER NOT NULL
+                 );
+                 PRAGMA user_version = 3;",
+                )
+                .unwrap();
+            let id = RecordId::new().as_uuid().to_string();
+            connection
+                .execute(
+                    "INSERT INTO clipboard_records
+                 (id, content_identity, captured_at, pinned, favorite, sensitive)
+                 VALUES (?1, 'legacy', ?2, 0, 0, 0)",
+                    params![id, Utc::now().to_rfc3339()],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO clipboard_representations
+                 (record_id, position, kind, blob_value) VALUES (?1, 0, 'html', ?2)",
+                    params![id, b"<b>legacy</b>"],
+                )
+                .unwrap();
+        }
+
+        let repository = SqliteRepository::open(path).unwrap();
+        assert_eq!(repository.schema_version().unwrap(), 4);
+        let page = repository.load_page(HistoryQuery::default()).unwrap();
+        assert_eq!(page.records.len(), 1);
+        assert_eq!(page.records[0].content_kind, ContentKind::RichText);
+        assert!(matches!(
+            repository
+                .record_details(page.records[0].id)
+                .unwrap()
+                .representations[0],
+            ClipboardRepresentation::Html { .. }
+        ));
+    }
+
+    #[test]
+    fn all_six_representations_round_trip_in_order_after_reopen() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("history.sqlite3");
+        let mut expected = text_record("all-formats", Utc::now(), "plain");
+        expected.representations = vec![
+            ClipboardRepresentation::UnicodeText {
+                text: "plain".into(),
+            },
+            ClipboardRepresentation::Rtf {
+                bytes: br"{\rtf1 rich}".to_vec(),
+            },
+            ClipboardRepresentation::Html {
+                bytes: b"<b>html</b>".to_vec(),
+            },
+            ClipboardRepresentation::Png {
+                bytes: vec![1, 2, 3],
+            },
+            ClipboardRepresentation::DibV5 {
+                bytes: vec![4, 5, 6],
+            },
+            ClipboardRepresentation::FileList {
+                paths: vec![r"C:\Temp\one.txt".into(), r"D:\two.bin".into()],
+            },
+        ];
+        SqliteRepository::open(path.clone())
+            .unwrap()
+            .save_record(&expected)
+            .unwrap();
+        let reopened = SqliteRepository::open(path).unwrap();
+        assert_eq!(reopened.record_details(expected.id).unwrap(), expected);
+    }
+
+    #[test]
+    fn malformed_file_list_is_skipped_by_bounded_restore_without_panicking() {
+        let directory = tempdir().unwrap();
+        let repository = SqliteRepository::open(directory.path().join("history.sqlite3")).unwrap();
+        let valid = text_record("valid", Utc::now() - Duration::seconds(1), "ok");
+        repository.save_record(&valid).unwrap();
+        let malformed = text_record("malformed", Utc::now(), "bad");
+        repository.save_record(&malformed).unwrap();
+        lock_unpoisoned(&repository.connection)
+            .execute(
+                "UPDATE clipboard_representations
+             SET kind = 'file_list', text_value = '[\"bad\\u0000path\"]', blob_value = NULL
+             WHERE record_id = ?1",
+                [malformed.id.as_uuid().to_string()],
+            )
+            .unwrap();
+
+        assert_eq!(repository.load_recent(10).unwrap(), vec![valid]);
+    }
+
+    #[test]
+    fn keyset_paging_is_stable_across_new_inserts_and_caps_limits() {
+        let directory = tempdir().unwrap();
+        let repository = SqliteRepository::open(directory.path().join("history.sqlite3")).unwrap();
+        let base = Utc.with_ymd_and_hms(2026, 8, 26, 12, 0, 0).unwrap();
+        for index in 0..40 {
+            repository
+                .save_record(&text_record(
+                    &format!("record-{index}"),
+                    base + Duration::seconds(index),
+                    "x",
+                ))
+                .unwrap();
+        }
+        let first = repository
+            .load_page(HistoryQuery {
+                limit: 20,
+                ..HistoryQuery::default()
+            })
+            .unwrap();
+        repository
+            .save_record(&text_record("inserted", base + Duration::seconds(100), "x"))
+            .unwrap();
+        let second = repository
+            .load_page(HistoryQuery {
+                cursor: first.next_cursor.clone(),
+                limit: 20,
+                ..HistoryQuery::default()
+            })
+            .unwrap();
+        let ids = first
+            .records
+            .iter()
+            .chain(&second.records)
+            .map(|record| record.id)
+            .collect::<HashSet<_>>();
+        assert_eq!(first.records.len(), 20);
+        assert_eq!(second.records.len(), 20);
+        assert_eq!(ids.len(), 40);
+        assert_eq!(
+            repository
+                .load_page(HistoryQuery::default())
+                .unwrap()
+                .records
+                .len(),
+            41
+        );
+        assert_eq!(
+            repository
+                .load_page(HistoryQuery {
+                    limit: usize::MAX,
+                    ..HistoryQuery::default()
+                })
+                .unwrap()
+                .records
+                .len(),
+            41
+        );
+    }
+
+    #[test]
+    fn keyset_paging_breaks_equal_timestamps_by_id() {
+        let directory = tempdir().unwrap();
+        let repository = SqliteRepository::open(directory.path().join("history.sqlite3")).unwrap();
+        let captured_at = Utc.with_ymd_and_hms(2026, 8, 26, 12, 0, 0).unwrap();
+        let records = (0..3)
+            .map(|index| text_record(&format!("tie-{index}"), captured_at, "x"))
+            .collect::<Vec<_>>();
+        for record in &records {
+            repository.save_record(record).unwrap();
+        }
+        let mut expected_ids = records.iter().map(|record| record.id).collect::<Vec<_>>();
+        expected_ids.sort_by_key(|id| std::cmp::Reverse(id.as_uuid().to_string()));
+
+        let first = repository
+            .load_page(HistoryQuery {
+                limit: 1,
+                ..HistoryQuery::default()
+            })
+            .unwrap();
+        let second = repository
+            .load_page(HistoryQuery {
+                cursor: first.next_cursor.clone(),
+                limit: 2,
+                ..HistoryQuery::default()
+            })
+            .unwrap();
+        let actual_ids = first
+            .records
+            .iter()
+            .chain(&second.records)
+            .map(|record| record.id)
+            .collect::<Vec<_>>();
+
+        assert_eq!(actual_ids, expected_ids);
+    }
+
+    #[test]
+    fn history_page_filters_by_kind_group_ungrouped_and_favorite() {
+        let directory = tempdir().unwrap();
+        let repository = SqliteRepository::open(directory.path().join("history.sqlite3")).unwrap();
+        let group = GroupId::new();
+        repository.save_group(group, "Filtered").unwrap();
+        let now = Utc::now();
+        let plain = text_record("plain", now, "plain");
+        let mut rich = text_record("rich", now + Duration::seconds(1), "fallback");
+        rich.representations.push(ClipboardRepresentation::Html {
+            bytes: b"<b>rich</b>".to_vec(),
+        });
+        rich.group_id = Some(group);
+        rich.favorite = true;
+        let mut image = text_record("image", now + Duration::seconds(2), "fallback");
+        image.representations.push(ClipboardRepresentation::Png {
+            bytes: vec![1, 2, 3],
+        });
+        for record in [&plain, &rich, &image] {
+            repository.save_record(record).unwrap();
+        }
+
+        let rich_page = repository
+            .load_page(HistoryQuery {
+                content_kind: Some(ContentKind::RichText),
+                ..HistoryQuery::default()
+            })
+            .unwrap();
+        let grouped_page = repository
+            .load_page(HistoryQuery {
+                group_id: Some(group),
+                ..HistoryQuery::default()
+            })
+            .unwrap();
+        let ungrouped_page = repository
+            .load_page(HistoryQuery {
+                ungrouped_only: true,
+                ..HistoryQuery::default()
+            })
+            .unwrap();
+        let favorite_page = repository
+            .load_page(HistoryQuery {
+                favorites_only: true,
+                ..HistoryQuery::default()
+            })
+            .unwrap();
+
+        assert_eq!(rich_page.records.len(), 1);
+        assert_eq!(rich_page.records[0].id, rich.id);
+        assert_eq!(grouped_page.records[0].id, rich.id);
+        assert_eq!(ungrouped_page.records.len(), 2);
+        assert!(
+            ungrouped_page
+                .records
+                .iter()
+                .all(|record| record.id != rich.id)
+        );
+        assert_eq!(favorite_page.records[0].id, rich.id);
+    }
+
+    #[test]
+    fn history_summary_bounds_text_without_loading_binary_payloads() {
+        let directory = tempdir().unwrap();
+        let repository = SqliteRepository::open(directory.path().join("history.sqlite3")).unwrap();
+        let mut expected = text_record("large-summary", Utc::now(), &"x".repeat(8_192));
+        expected.representations.push(ClipboardRepresentation::Png {
+            bytes: vec![7; 1024 * 1024],
+        });
+        repository.save_record(&expected).unwrap();
+
+        let page = repository.load_page(HistoryQuery::default()).unwrap();
+
+        assert_eq!(
+            page.records[0].text.as_deref().unwrap().chars().count(),
+            4_096
+        );
+        assert!(page.records[0].has_image);
+        assert_eq!(repository.record_details(expected.id).unwrap(), expected);
+    }
+
+    #[test]
+    fn quota_never_evicts_pinned_and_requires_opt_in_for_favorites() {
+        let directory = tempdir().unwrap();
+        let quota = DiskQuota {
+            max_records: 3,
+            max_payload_bytes: 1024,
+            incremental_vacuum_pages: 1,
+        };
+        let repository =
+            SqliteRepository::open_with_quota(directory.path().join("history.sqlite3"), quota)
+                .unwrap();
+        let now = Utc::now();
+        let mut pinned = text_record("pinned", now, "x");
+        pinned.pinned = true;
+        let mut favorite = text_record("favorite", now + Duration::seconds(1), "x");
+        favorite.favorite = true;
+        repository
+            .save_record(&text_record("ordinary", now - Duration::seconds(1), "x"))
+            .unwrap();
+        repository.save_record(&pinned).unwrap();
+        repository.save_record(&favorite).unwrap();
+        {
+            let mut connection = lock_unpoisoned(&repository.connection);
+            let transaction = connection.transaction().unwrap();
+            write_record(
+                &transaction,
+                &text_record("newest", now + Duration::seconds(2), "x"),
+            )
+            .unwrap();
+            let strict = DiskQuota {
+                max_records: 2,
+                ..quota
+            };
+            enforce_disk_quota(&transaction, strict).unwrap();
+            transaction.commit().unwrap();
+        }
+        let records = repository.load_recent(10).unwrap();
+        assert!(records.iter().any(|record| record.id == pinned.id));
+        assert!(records.iter().any(|record| record.id == favorite.id));
+
+        repository
+            .save_settings(UserSettings {
+                evict_favorites_when_full: true,
+                retention: RetentionPeriod::Forever,
+                ..UserSettings::default()
+            })
+            .unwrap();
+        repository.prune(RetentionPeriod::Forever, now).unwrap();
+        assert!(
+            repository
+                .load_recent(10)
+                .unwrap()
+                .iter()
+                .any(|record| record.id == pinned.id)
+        );
     }
 
     #[test]
@@ -3328,6 +4161,8 @@ mod tests {
                 .save_settings(UserSettings {
                     language: Language::En,
                     retention: RetentionPeriod::Forever,
+                    storage_limit: StorageLimit::FiveGb,
+                    evict_favorites_when_full: true,
                     start_at_sign_in: true,
                     start_minimized: true,
                     show_tray_icon: true,
@@ -3363,6 +4198,8 @@ mod tests {
             UserSettings {
                 language: Language::En,
                 retention: RetentionPeriod::Forever,
+                storage_limit: StorageLimit::FiveGb,
+                evict_favorites_when_full: true,
                 start_at_sign_in: true,
                 start_minimized: true,
                 show_tray_icon: true,

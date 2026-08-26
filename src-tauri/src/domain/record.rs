@@ -58,6 +58,22 @@ impl Default for GroupId {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryCursor {
+    pub captured_at: DateTime<Utc>,
+    pub id: RecordId,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct HistoryQuery {
+    pub cursor: Option<HistoryCursor>,
+    pub limit: usize,
+    pub content_kind: Option<ContentKind>,
+    pub group_id: Option<GroupId>,
+    pub ungrouped_only: bool,
+    pub favorites_only: bool,
+}
+
 #[derive(Clone, PartialEq, Eq, Serialize)]
 #[serde(transparent)]
 pub struct RecordNote(String);

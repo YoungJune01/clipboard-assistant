@@ -1744,17 +1744,24 @@ pub fn run() {
                         .prune(settings.retention, chrono::Utc::now())
                         .ok()?;
                     let records = repository
-                        .load_recent_bounded(RestoreBudget {
-                            max_records: services::session_records::MAX_SESSION_RECORDS,
-                            max_total_bytes: services::session_records::DEFAULT_STORE_BYTES,
-                            max_record_bytes: services::session_records::MAX_CAPTURE_RECORD_BYTES,
+                        .load_page(crate::domain::HistoryQuery {
+                            limit: services::session_records::STARTUP_HISTORY_RECORDS,
+                            ..crate::domain::HistoryQuery::default()
                         })
                         .ok()?;
                     let exclusions = repository.load_excluded_applications().ok()?;
                     Some((repository, settings, exclusions, records))
                 })
                 .map_or(
-                    (None, UserSettings::default(), Vec::new(), Vec::new()),
+                    (
+                        None,
+                        UserSettings::default(),
+                        Vec::new(),
+                        services::persistence::HistoryPage {
+                            records: Vec::new(),
+                            next_cursor: None,
+                        },
+                    ),
                     |(repository, settings, exclusions, records)| {
                         storage_available.store(true, Ordering::Release);
                         (Some(repository), settings, exclusions, records)
@@ -1778,13 +1785,13 @@ pub fn run() {
                 storage_available.store(false, Ordering::Release);
             }
             let session_records = match &persistence {
-                Some(persistence) => Arc::new(SessionRecordStore::with_persistence(
+                Some(persistence) => Arc::new(SessionRecordStore::with_persistence_page(
                     loaded_records,
                     Arc::clone(persistence) as Arc<dyn services::persistence::RecordPersistence>,
                     Arc::clone(&storage_available),
                 )),
                 None => Arc::new(SessionRecordStore::with_session_only(
-                    loaded_records,
+                    Vec::new(),
                     Arc::clone(&storage_available),
                 )),
             };
