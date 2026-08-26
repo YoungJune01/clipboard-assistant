@@ -1382,7 +1382,9 @@ fn restore_backup(
         effective.quick_paste_modifiers = previous.quick_paste_modifiers;
     }
 
-    records.replace_all(restored.records);
+    records
+        .reload_first_page()
+        .map_err(|error| error.to_string())?;
     groups.replace_all(restored.groups);
     active.set(ActiveGroup::All);
     let startup_updated = std::env::current_exe()

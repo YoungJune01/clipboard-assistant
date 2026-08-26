@@ -65,14 +65,13 @@ pub(crate) struct RestoredData {
     pub(crate) settings: UserSettings,
     pub(crate) excluded_applications: Vec<String>,
     pub(crate) groups: Vec<(GroupId, String)>,
-    pub(crate) records: Vec<ClipboardRecord>,
 }
 
 #[derive(Clone, Copy)]
-struct DiskQuota {
-    max_records: usize,
-    max_payload_bytes: usize,
-    incremental_vacuum_pages: usize,
+pub(crate) struct DiskQuota {
+    pub(crate) max_records: usize,
+    pub(crate) max_payload_bytes: usize,
+    pub(crate) incremental_vacuum_pages: usize,
 }
 
 impl Default for DiskQuota {
@@ -186,7 +185,7 @@ pub trait RecordPersistence: Send + Sync {
     fn save_record(&self, record: &ClipboardRecord) -> Result<(), PersistenceError>;
     fn update_note(&self, id: RecordId, note: Option<&RecordNote>) -> Result<(), PersistenceError>;
     fn delete_record(&self, id: RecordId) -> Result<(), PersistenceError>;
-    fn clear_records(&self) -> Result<(), PersistenceError>;
+    fn clear_records(&self) -> Result<usize, PersistenceError>;
     fn load_page(&self, _query: HistoryQuery) -> Result<HistoryPage, PersistenceError> {
         Err(PersistenceError::WorkerUnavailable)
     }
@@ -206,7 +205,7 @@ enum PersistenceCommand {
         mpsc::SyncSender<Result<(), PersistenceError>>,
     ),
     DeleteRecord(RecordId, mpsc::SyncSender<Result<(), PersistenceError>>),
-    ClearRecords(mpsc::SyncSender<Result<(), PersistenceError>>),
+    ClearRecords(mpsc::SyncSender<Result<usize, PersistenceError>>),
     SaveSettings(UserSettings, mpsc::SyncSender<Result<(), PersistenceError>>),
     SaveExcludedApplications(Vec<String>, mpsc::SyncSender<Result<(), PersistenceError>>),
     Prune(
@@ -244,7 +243,7 @@ trait PersistenceBackend: Send + Sync {
     fn persist_note(&self, id: RecordId, note: Option<&RecordNote>)
     -> Result<(), PersistenceError>;
     fn delete_record(&self, id: RecordId) -> Result<(), PersistenceError>;
-    fn clear_records(&self) -> Result<(), PersistenceError>;
+    fn clear_records(&self) -> Result<usize, PersistenceError>;
     fn persist_settings(&self, settings: UserSettings) -> Result<(), PersistenceError>;
     fn persist_excluded_applications(
         &self,
@@ -455,8 +454,13 @@ impl RecordPersistence for PersistenceWorker {
         self.request(|reply| PersistenceCommand::DeleteRecord(id, reply))
     }
 
-    fn clear_records(&self) -> Result<(), PersistenceError> {
-        self.request(PersistenceCommand::ClearRecords)
+    fn clear_records(&self) -> Result<usize, PersistenceError> {
+        let (reply, response) = mpsc::sync_channel(1);
+        self.enqueue(PersistenceCommand::ClearRecords(reply))?;
+        let result = response
+            .recv_timeout(self.response_timeout)
+            .map_err(|_| self.degrade())?;
+        result.map_err(|error| self.degrade_with(error))
     }
 
     fn load_page(&self, query: HistoryQuery) -> Result<HistoryPage, PersistenceError> {
@@ -600,9 +604,11 @@ fn reply_unavailable(command: PersistenceCommand) {
         PersistenceCommand::SaveRecord(_, reply)
         | PersistenceCommand::UpdateNote(_, _, reply)
         | PersistenceCommand::DeleteRecord(_, reply)
-        | PersistenceCommand::ClearRecords(reply)
         | PersistenceCommand::SaveSettings(_, reply)
         | PersistenceCommand::SaveExcludedApplications(_, reply) => {
+            let _ = reply.send(Err(PersistenceError::WorkerUnavailable));
+        }
+        PersistenceCommand::ClearRecords(reply) => {
             let _ = reply.send(Err(PersistenceError::WorkerUnavailable));
         }
         PersistenceCommand::Prune(_, _, reply) => {
@@ -634,7 +640,10 @@ impl SqliteRepository {
         Self::open_with_quota(path, DiskQuota::default())
     }
 
-    fn open_with_quota(path: PathBuf, quota: DiskQuota) -> Result<Arc<Self>, PersistenceError> {
+    pub(crate) fn open_with_quota(
+        path: PathBuf,
+        quota: DiskQuota,
+    ) -> Result<Arc<Self>, PersistenceError> {
         Self::open_with_quota_and_file_ops(path, quota, &StdMigrationFileOps)
     }
 
@@ -707,7 +716,7 @@ impl SqliteRepository {
         result
     }
 
-    fn restore_from(
+    pub(crate) fn restore_from(
         &self,
         source: &Path,
         budget: RestoreBudget,
@@ -763,7 +772,6 @@ impl SqliteRepository {
             settings: self.load_settings()?,
             excluded_applications: self.load_excluded_applications()?,
             groups: self.load_groups()?,
-            records: self.load_recent_bounded(budget)?,
         })
     }
 
@@ -1424,14 +1432,14 @@ impl RecordPersistence for SqliteRepository {
         Ok(())
     }
 
-    fn clear_records(&self) -> Result<(), PersistenceError> {
+    fn clear_records(&self) -> Result<usize, PersistenceError> {
         let _migration_guard = self
             .migration_locks
             .acquire(&self.path, MIGRATION_LOCK_TIMEOUT)?;
         let connection = lock_unpoisoned(&self.connection);
-        connection.execute("DELETE FROM clipboard_records", [])?;
+        let removed = connection.execute("DELETE FROM clipboard_records", [])?;
         incremental_vacuum(&connection, self.quota)?;
-        Ok(())
+        Ok(removed)
     }
 
     fn load_page(&self, query: HistoryQuery) -> Result<HistoryPage, PersistenceError> {
@@ -1460,7 +1468,7 @@ impl PersistenceBackend for SqliteRepository {
         RecordPersistence::delete_record(self, id)
     }
 
-    fn clear_records(&self) -> Result<(), PersistenceError> {
+    fn clear_records(&self) -> Result<usize, PersistenceError> {
         RecordPersistence::clear_records(self)
     }
 
@@ -2738,8 +2746,8 @@ mod tests {
             Ok(())
         }
 
-        fn clear_records(&self) -> Result<(), PersistenceError> {
-            Ok(())
+        fn clear_records(&self) -> Result<usize, PersistenceError> {
+            Ok(0)
         }
 
         fn persist_settings(&self, _settings: UserSettings) -> Result<(), PersistenceError> {
@@ -2774,7 +2782,6 @@ mod tests {
                 settings: UserSettings::default(),
                 excluded_applications: Vec::new(),
                 groups: Vec::new(),
-                records: Vec::new(),
             })
         }
     }
@@ -2865,7 +2872,10 @@ mod tests {
             .unwrap();
 
         repository.backup_to(&backup_path).unwrap();
-        RecordPersistence::clear_records(repository.as_ref()).unwrap();
+        assert_eq!(
+            RecordPersistence::clear_records(repository.as_ref()).unwrap(),
+            1
+        );
         repository.delete_group(group).unwrap();
         repository.save_settings(UserSettings::default()).unwrap();
 
@@ -2880,12 +2890,11 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(restored.records, vec![expected]);
         assert_eq!(restored.groups, vec![(group, "Accounts".to_owned())]);
         assert_eq!(restored.settings.language, Language::En);
         assert_eq!(restored.settings.retention, RetentionPeriod::Forever);
         assert_eq!(restored.settings.accent_color, AccentColor::Rose);
-        assert_eq!(repository.load_recent(10).unwrap(), restored.records);
+        assert_eq!(repository.load_recent(10).unwrap(), vec![expected]);
     }
 
     #[test]
@@ -2917,7 +2926,7 @@ mod tests {
             max_total_bytes: 64 * 1024 * 1024,
             max_record_bytes: 16 * 1024 * 1024,
         };
-        let restored = repository.restore_from(&backup_path, budget).unwrap();
+        repository.restore_from(&backup_path, budget).unwrap();
 
         assert_eq!(
             repository
@@ -2927,18 +2936,12 @@ mod tests {
                 .len(),
             6
         );
-        assert_eq!(restored.records.len(), 5);
-        assert_eq!(
-            restored.records[0].content_identity.as_str(),
-            "large-backup-5"
-        );
-        assert_eq!(
-            restored.records[4].content_identity.as_str(),
-            "large-backup-1"
-        );
+        let working_set = repository.load_recent_bounded(budget).unwrap();
+        assert_eq!(working_set.len(), 5);
+        assert_eq!(working_set[0].content_identity.as_str(), "large-backup-5");
+        assert_eq!(working_set[4].content_identity.as_str(), "large-backup-1");
         assert!(
-            restored
-                .records
+            working_set
                 .iter()
                 .all(|record| record.content_identity.as_str() != "large-backup-0")
         );
@@ -3243,7 +3246,7 @@ mod tests {
         repository.backup_to(&backup_path).unwrap();
         RecordPersistence::clear_records(repository.as_ref()).unwrap();
 
-        let restored = repository
+        repository
             .restore_from(
                 &backup_path,
                 RestoreBudget {
@@ -3254,7 +3257,7 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(restored.records, vec![expected]);
+        assert_eq!(repository.record_details(expected.id).unwrap(), expected);
     }
 
     #[test]

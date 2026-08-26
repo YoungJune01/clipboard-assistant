@@ -76,6 +76,7 @@ struct SessionRecordState {
     records: VecDeque<Arc<ClipboardRecord>>,
     page: VecDeque<SessionRecordView>,
     total_bytes: usize,
+    paged: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -102,6 +103,7 @@ impl SessionRecordStore {
                 records: VecDeque::new(),
                 page: VecDeque::new(),
                 total_bytes: 0,
+                paged: false,
             }),
             last_deleted: Mutex::new(None),
             limits,
@@ -120,6 +122,7 @@ impl SessionRecordStore {
                 records: VecDeque::new(),
                 page: VecDeque::new(),
                 total_bytes: 0,
+                paged: false,
             }),
             last_deleted: Mutex::new(None),
             limits: SessionRecordLimits {
@@ -144,6 +147,7 @@ impl SessionRecordStore {
                 records: VecDeque::new(),
                 page: VecDeque::new(),
                 total_bytes: 0,
+                paged: true,
             }),
             last_deleted: Mutex::new(None),
             limits: SessionRecordLimits {
@@ -173,6 +177,7 @@ impl SessionRecordStore {
                 records: VecDeque::new(),
                 page: VecDeque::new(),
                 total_bytes: 0,
+                paged: false,
             }),
             last_deleted: Mutex::new(None),
             limits: SessionRecordLimits {
@@ -206,12 +211,14 @@ impl SessionRecordStore {
 
     pub(crate) fn capture_one(&self, mut capture: CapturedClipboard) -> CaptureStatus {
         retain_preferred_image(&mut capture.representations);
+        let content_identity = capture.content_identity.clone();
         let Some(capture_bytes) = checked_representation_bytes(&capture.representations) else {
             return CaptureStatus::RejectedTooLarge;
         };
         if capture_bytes > self.limits.record_bytes {
             return CaptureStatus::RejectedTooLarge;
         }
+        self.load_page_front_for_capture();
         let mut state = lock_unpoisoned(&self.state);
         if let Some(current) = state.records.front()
             && current.content_identity == capture.content_identity
@@ -231,8 +238,13 @@ impl SessionRecordStore {
                 .saturating_sub(previous_bytes)
                 .saturating_add(refreshed_bytes);
             state.records[0] = Arc::new(refreshed);
+            sort_records(&mut state.records);
             evict_to_limits(&mut state, self.limits);
-            let persisted = state.records.front().cloned();
+            let persisted = state
+                .records
+                .iter()
+                .find(|record| record.content_identity == content_identity)
+                .cloned();
             let status = CaptureStatus::Refreshed {
                 previous: previous_bytes,
                 bytes: refreshed_bytes,
@@ -246,7 +258,7 @@ impl SessionRecordStore {
         let record = ClipboardRecord::from_capture(capture);
         state.total_bytes = state.total_bytes.saturating_add(capture_bytes);
         state.records.push_front(Arc::new(record));
-        if !state.page.is_empty()
+        if state.paged
             && let Some(record) = state.records.front()
         {
             let view = SessionRecordView::from_record(record, self.limits.preview_bytes);
@@ -305,6 +317,7 @@ impl SessionRecordStore {
 
     pub fn replace_page(&self, page: HistoryPage) {
         let mut state = lock_unpoisoned(&self.state);
+        state.paged = true;
         state.page = page
             .records
             .into_iter()
@@ -315,6 +328,7 @@ impl SessionRecordStore {
 
     pub fn append_page(&self, page: HistoryPage) {
         let mut state = lock_unpoisoned(&self.state);
+        state.paged = true;
         for summary in page.records {
             if state.page.len() >= MAX_SESSION_RECORDS {
                 break;
@@ -418,6 +432,7 @@ impl SessionRecordStore {
                     self.storage_available.store(false, Ordering::Release);
                     return Err(SessionRecordError::PersistenceUnavailable);
                 }
+                self.refresh_first_page()?;
             }
         }
         Ok(view)
@@ -452,6 +467,7 @@ impl SessionRecordStore {
                     self.storage_available.store(false, Ordering::Release);
                     return Err(SessionRecordError::PersistenceUnavailable);
                 }
+                self.refresh_first_page()?;
             }
         }
         Ok(view)
@@ -499,6 +515,7 @@ impl SessionRecordStore {
         lock_unpoisoned(&self.state)
             .page
             .retain(|view| view.id != id);
+        self.refresh_first_page()?;
         let removed = removed.as_ref().clone();
         *lock_unpoisoned(&self.last_deleted) = Some(removed.clone());
         Ok(removed)
@@ -524,19 +541,22 @@ impl SessionRecordStore {
             return Err(SessionRecordError::PersistenceUnavailable);
         }
         self.restore_in_memory(record);
+        self.refresh_first_page()?;
         Ok(view)
     }
 
     pub fn clear(&self) -> Result<usize, SessionRecordError> {
         self.require_durable_storage()?;
-        if let NotePersistence::Durable(persistence) = &self.persistence
-            && persistence.clear_records().is_err()
-        {
-            self.storage_available.store(false, Ordering::Release);
-            return Err(SessionRecordError::PersistenceUnavailable);
-        }
+        let removed = match &self.persistence {
+            NotePersistence::Durable(persistence) => persistence.clear_records().map_err(|_| {
+                self.storage_available.store(false, Ordering::Release);
+                SessionRecordError::PersistenceUnavailable
+            })?,
+            NotePersistence::NotConfigured | NotePersistence::SessionOnly => {
+                return Err(SessionRecordError::PersistenceUnavailable);
+            }
+        };
         let mut state = lock_unpoisoned(&self.state);
-        let removed = state.records.len();
         state.records.clear();
         state.page.clear();
         state.total_bytes = 0;
@@ -566,6 +586,7 @@ impl SessionRecordStore {
         state.records.clear();
         state.page.clear();
         state.total_bytes = 0;
+        state.paged = false;
         *lock_unpoisoned(&self.last_deleted) = None;
         for mut record in records {
             retain_preferred_image(&mut record.representations);
@@ -585,12 +606,82 @@ impl SessionRecordStore {
         self.replace_all(records);
     }
 
+    pub(crate) fn reload_first_page(&self) -> Result<(), SessionRecordError> {
+        let page = self.load_first_page()?;
+        let mut state = lock_unpoisoned(&self.state);
+        state.records.clear();
+        state.total_bytes = 0;
+        state.paged = true;
+        state.page = page
+            .records
+            .into_iter()
+            .map(SessionRecordView::from_summary)
+            .collect();
+        *lock_unpoisoned(&self.last_deleted) = None;
+        Ok(())
+    }
+
     fn persist_record(&self, record: &ClipboardRecord) {
         if let NotePersistence::Durable(persistence) = &self.persistence
             && self.storage_available.load(Ordering::Acquire)
-            && persistence.save_record(record).is_err()
+            && (persistence.save_record(record).is_err() || self.refresh_first_page().is_err())
         {
             self.storage_available.store(false, Ordering::Release);
+        }
+    }
+
+    fn refresh_first_page(&self) -> Result<(), SessionRecordError> {
+        if !lock_unpoisoned(&self.state).paged {
+            return Ok(());
+        }
+        let page = self.load_first_page()?;
+        let page_ids: Vec<_> = page.records.iter().map(|summary| summary.id).collect();
+        let mut state = lock_unpoisoned(&self.state);
+        state.page = page
+            .records
+            .into_iter()
+            .map(SessionRecordView::from_summary)
+            .collect();
+        state.records.retain(|record| page_ids.contains(&record.id));
+        state.total_bytes = state
+            .records
+            .iter()
+            .map(|record| record_bytes(record))
+            .sum();
+        Ok(())
+    }
+
+    fn load_first_page(&self) -> Result<HistoryPage, SessionRecordError> {
+        match &self.persistence {
+            NotePersistence::Durable(persistence) => persistence
+                .load_page(crate::domain::HistoryQuery {
+                    limit: STARTUP_HISTORY_RECORDS,
+                    ..crate::domain::HistoryQuery::default()
+                })
+                .map_err(|_| {
+                    self.storage_available.store(false, Ordering::Release);
+                    SessionRecordError::PersistenceUnavailable
+                }),
+            NotePersistence::NotConfigured | NotePersistence::SessionOnly => {
+                Err(SessionRecordError::PersistenceUnavailable)
+            }
+        }
+    }
+
+    fn load_page_front_for_capture(&self) {
+        let id = {
+            let state = lock_unpoisoned(&self.state);
+            if !state.paged {
+                return;
+            }
+            state
+                .page
+                .front()
+                .filter(|view| !state.records.iter().any(|record| record.id == view.id))
+                .map(|view| view.id)
+        };
+        if let Some(id) = id {
+            let _ = self.load_record_for_mutation(id);
         }
     }
 
@@ -627,7 +718,14 @@ impl SessionRecordStore {
         let position = state
             .records
             .iter()
-            .position(|existing| existing.captured_at < record.captured_at)
+            .position(|existing| {
+                record_order(
+                    record.captured_at,
+                    record.id,
+                    existing.captured_at,
+                    existing.id,
+                )
+            })
             .unwrap_or(state.records.len());
         state.total_bytes = state.total_bytes.saturating_add(bytes);
         state.records.insert(position, Arc::new(record));
@@ -661,10 +759,29 @@ impl SessionRecordStore {
         let position = state
             .records
             .iter()
-            .position(|existing| existing.captured_at < record.captured_at)
+            .position(|existing| {
+                record_order(
+                    record.captured_at,
+                    record.id,
+                    existing.captured_at,
+                    existing.id,
+                )
+            })
             .unwrap_or(state.records.len());
         state.total_bytes = state.total_bytes.saturating_add(bytes);
+        let view = SessionRecordView::from_record(&record, self.limits.preview_bytes);
         state.records.insert(position, Arc::new(record));
+        if state.paged {
+            state.page.retain(|existing| existing.id != view.id);
+            let page_position = state
+                .page
+                .iter()
+                .position(|existing| {
+                    record_order(view.captured_at, view.id, existing.captured_at, existing.id)
+                })
+                .unwrap_or(state.page.len());
+            state.page.insert(page_position, view);
+        }
         evict_to_limits(&mut state, self.limits);
     }
 
@@ -768,6 +885,24 @@ fn retain_preferred_image(representations: &mut Vec<ClipboardRepresentation>) {
         original_index += 1;
         keep
     });
+}
+
+fn sort_records(records: &mut VecDeque<Arc<ClipboardRecord>>) {
+    records.make_contiguous().sort_by(|left, right| {
+        right
+            .captured_at
+            .cmp(&left.captured_at)
+            .then_with(|| right.id.as_uuid().cmp(left.id.as_uuid()))
+    });
+}
+
+fn record_order(
+    left_at: chrono::DateTime<chrono::Utc>,
+    left_id: RecordId,
+    right_at: chrono::DateTime<chrono::Utc>,
+    right_id: RecordId,
+) -> bool {
+    left_at > right_at || (left_at == right_at && left_id.as_uuid() > right_id.as_uuid())
 }
 
 fn evict_to_limits(state: &mut SessionRecordState, limits: SessionRecordLimits) {
@@ -981,7 +1116,7 @@ fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 #[cfg(test)]
 mod tests {
-    use chrono::Utc;
+    use chrono::{Duration, TimeZone, Utc};
     use std::sync::atomic::AtomicBool;
 
     use super::*;
@@ -1020,7 +1155,7 @@ mod tests {
             Err(PersistenceError::WorkerUnavailable)
         }
 
-        fn clear_records(&self) -> Result<(), PersistenceError> {
+        fn clear_records(&self) -> Result<usize, PersistenceError> {
             Err(PersistenceError::WorkerUnavailable)
         }
     }
@@ -1195,6 +1330,203 @@ mod tests {
         assert_eq!(store.delete(delete_record.id).unwrap().id, delete_record.id);
         assert!(store.list().iter().all(|view| view.id != delete_record.id));
         assert!(repository.record_details(delete_record.id).is_err());
+    }
+
+    #[test]
+    fn paged_capture_refreshes_the_existing_front_record_and_reorders_the_summary() {
+        let directory = tempdir().unwrap();
+        let repository = SqliteRepository::open(directory.path().join("history.sqlite3")).unwrap();
+        let base = Utc.with_ymd_and_hms(2026, 8, 26, 10, 0, 0).unwrap();
+        let front = ClipboardRecord::from_capture(capture_at("same", "original", base));
+        let other = ClipboardRecord::from_capture(capture_at(
+            "other",
+            "other",
+            base - Duration::seconds(1),
+        ));
+        repository.save_record(&other).unwrap();
+        repository.save_record(&front).unwrap();
+        let store = SessionRecordStore::with_persistence_page(
+            repository.load_page(HistoryQuery::default()).unwrap(),
+            Arc::clone(&repository) as Arc<dyn RecordPersistence>,
+            Arc::new(AtomicBool::new(true)),
+        );
+        let refreshed_at = base + Duration::seconds(5);
+
+        assert!(matches!(
+            store.capture_one(capture_at("same", "updated", refreshed_at)),
+            CaptureStatus::Refreshed { .. }
+        ));
+
+        let listed = store.list();
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].id, front.id);
+        assert_eq!(listed[0].captured_at, refreshed_at);
+        assert_eq!(
+            repository
+                .load_page(HistoryQuery::default())
+                .unwrap()
+                .records
+                .len(),
+            2
+        );
+        assert_eq!(
+            repository.record_details(front.id).unwrap().captured_at,
+            refreshed_at
+        );
+    }
+
+    #[test]
+    fn paged_delete_undo_restores_payload_and_summary_in_stable_order() {
+        let directory = tempdir().unwrap();
+        let repository = SqliteRepository::open(directory.path().join("history.sqlite3")).unwrap();
+        let base = Utc.with_ymd_and_hms(2026, 8, 26, 11, 0, 0).unwrap();
+        let older = ClipboardRecord::from_capture(capture_at("older", "older", base));
+        let deleted = ClipboardRecord::from_capture(capture_at(
+            "deleted",
+            "deleted",
+            base + Duration::seconds(1),
+        ));
+        let newer = ClipboardRecord::from_capture(capture_at(
+            "newer",
+            "newer",
+            base + Duration::seconds(2),
+        ));
+        for record in [&older, &deleted, &newer] {
+            repository.save_record(record).unwrap();
+        }
+        let store = SessionRecordStore::with_persistence_page(
+            repository.load_page(HistoryQuery::default()).unwrap(),
+            Arc::clone(&repository) as Arc<dyn RecordPersistence>,
+            Arc::new(AtomicBool::new(true)),
+        );
+
+        store.delete(deleted.id).unwrap();
+        store.restore_last_deleted(deleted.id).unwrap();
+
+        assert_eq!(
+            store.list().iter().map(|view| view.id).collect::<Vec<_>>(),
+            vec![newer.id, deleted.id, older.id]
+        );
+        assert_eq!(store.record_details(deleted.id).unwrap(), deleted);
+    }
+
+    #[test]
+    fn paged_capture_drops_summaries_evicted_by_disk_quota() {
+        let directory = tempdir().unwrap();
+        let quota = crate::services::persistence::DiskQuota {
+            max_records: 2,
+            max_payload_bytes: usize::MAX,
+            incremental_vacuum_pages: 1,
+        };
+        let repository =
+            SqliteRepository::open_with_quota(directory.path().join("history.sqlite3"), quota)
+                .unwrap();
+        let base = Utc.with_ymd_and_hms(2026, 8, 26, 12, 0, 0).unwrap();
+        let oldest = ClipboardRecord::from_capture(capture_at("oldest", "oldest", base));
+        let middle = ClipboardRecord::from_capture(capture_at(
+            "middle",
+            "middle",
+            base + Duration::seconds(1),
+        ));
+        repository.save_record(&oldest).unwrap();
+        repository.save_record(&middle).unwrap();
+        let store = SessionRecordStore::with_persistence_page(
+            repository.load_page(HistoryQuery::default()).unwrap(),
+            Arc::clone(&repository) as Arc<dyn RecordPersistence>,
+            Arc::new(AtomicBool::new(true)),
+        );
+
+        assert!(store.capture(capture_at("newest", "newest", base + Duration::seconds(2),)));
+
+        let listed = store.list();
+        assert_eq!(listed.len(), 2);
+        assert!(listed.iter().all(|view| view.id != oldest.id));
+        assert!(repository.record_details(oldest.id).is_err());
+    }
+
+    #[test]
+    fn reloading_after_large_restore_keeps_history_paged() {
+        let directory = tempdir().unwrap();
+        let live = SqliteRepository::open(directory.path().join("live.sqlite3")).unwrap();
+        let source_path = directory.path().join("large.clipbackup");
+        let source = SqliteRepository::open(source_path.clone()).unwrap();
+        let base = Utc.with_ymd_and_hms(2026, 8, 26, 13, 0, 0).unwrap();
+        for index in 0..520 {
+            source
+                .save_record(&ClipboardRecord::from_capture(capture_at(
+                    &format!("restored-{index}"),
+                    "x",
+                    base + Duration::seconds(index),
+                )))
+                .unwrap();
+        }
+        drop(source);
+        let store = SessionRecordStore::with_persistence_page(
+            HistoryPage {
+                records: Vec::new(),
+                next_cursor: None,
+            },
+            Arc::clone(&live) as Arc<dyn RecordPersistence>,
+            Arc::new(AtomicBool::new(true)),
+        );
+        live.restore_from(
+            &source_path,
+            crate::services::persistence::RestoreBudget {
+                max_records: MAX_SESSION_RECORDS,
+                max_total_bytes: DEFAULT_STORE_BYTES,
+                max_record_bytes: MAX_CAPTURE_RECORD_BYTES,
+            },
+        )
+        .unwrap();
+
+        store.reload_first_page().unwrap();
+        let first = live
+            .load_page(HistoryQuery {
+                limit: STARTUP_HISTORY_RECORDS,
+                ..HistoryQuery::default()
+            })
+            .unwrap();
+        let next = live
+            .load_page(HistoryQuery {
+                cursor: first.next_cursor.clone(),
+                limit: STARTUP_HISTORY_RECORDS,
+                ..HistoryQuery::default()
+            })
+            .unwrap();
+        store.append_page(next);
+
+        assert_eq!(store.list().len(), 200);
+        assert_eq!(store.list()[0].text.as_deref(), Some("x"));
+        assert_eq!(live.load_recent(600).unwrap().len(), 520);
+    }
+
+    #[test]
+    fn paged_clear_returns_the_database_delete_count() {
+        let directory = tempdir().unwrap();
+        let repository = SqliteRepository::open(directory.path().join("history.sqlite3")).unwrap();
+        for index in 0..3 {
+            repository
+                .save_record(&ClipboardRecord::from_capture(capture(
+                    &format!("clear-{index}"),
+                    "x",
+                )))
+                .unwrap();
+        }
+        let store = SessionRecordStore::with_persistence_page(
+            repository.load_page(HistoryQuery::default()).unwrap(),
+            Arc::clone(&repository) as Arc<dyn RecordPersistence>,
+            Arc::new(AtomicBool::new(true)),
+        );
+
+        assert_eq!(store.clear().unwrap(), 3);
+        assert!(store.list().is_empty());
+        assert!(
+            repository
+                .load_page(HistoryQuery::default())
+                .unwrap()
+                .records
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1536,9 +1868,17 @@ mod tests {
     }
 
     fn capture(identity: &str, text: &str) -> CapturedClipboard {
+        capture_at(identity, text, Utc::now())
+    }
+
+    fn capture_at(
+        identity: &str,
+        text: &str,
+        captured_at: chrono::DateTime<Utc>,
+    ) -> CapturedClipboard {
         CapturedClipboard {
             content_identity: ContentIdentity::new(identity),
-            captured_at: Utc::now(),
+            captured_at,
             source: SourceIdentity::default(),
             representations: vec![ClipboardRepresentation::UnicodeText {
                 text: text.to_owned(),
