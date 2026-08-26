@@ -1503,14 +1503,13 @@ fn update_record_note(
     record_id: domain::RecordId,
     note: String,
     records: tauri::State<'_, Arc<SessionRecordStore>>,
-    settings: tauri::State<'_, Arc<ApplicationSettings>>,
     app: tauri::AppHandle,
 ) -> Result<SessionRecordView, String> {
-    let result = SessionRecordCommands::new(records.inner())
+    let updated = SessionRecordCommands::new(records.inner())
         .update_note(record_id, note)
-        .map_err(|error| error.to_string());
-    let _ = app.emit("settings-changed", settings.view());
-    result
+        .map_err(|error| error.to_string())?;
+    let _ = app.emit("clipboard-records-changed", ());
+    Ok(updated)
 }
 
 #[cfg(windows)]
@@ -1685,9 +1684,9 @@ fn update_record_group(
     records: tauri::State<'_, Arc<SessionRecordStore>>,
     app: tauri::AppHandle,
 ) -> Result<SessionRecordView, String> {
-    let result = update_record_group_state(record_id, group_id, groups.inner(), records.inner());
+    let updated = update_record_group_state(record_id, group_id, groups.inner(), records.inner())?;
     let _ = app.emit("clipboard-records-changed", ());
-    result
+    Ok(updated)
 }
 
 #[cfg(windows)]

@@ -75,6 +75,7 @@ pub enum ClipboardRepresentationKind {
 pub struct ClipboardRepresentationDetails {
     pub kind: ClipboardRepresentationKind,
     pub byte_length: usize,
+    pub item_count: Option<usize>,
     pub text: Option<String>,
     pub paths: Option<Vec<String>>,
     pub truncated: bool,

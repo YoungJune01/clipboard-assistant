@@ -66,6 +66,7 @@ pub struct RecordDetailsView {
     pub captured_at: chrono::DateTime<chrono::Utc>,
     pub source_application: Option<String>,
     pub text: Option<String>,
+    pub text_truncated: bool,
     pub representations: Vec<ClipboardRepresentationDetails>,
     pub note: Option<RecordNote>,
     pub group_id: Option<GroupId>,
@@ -697,72 +698,54 @@ impl SessionRecordStore {
             Some(RecordNote::new(value).map_err(SessionRecordError::InvalidNote)?)
         };
         let _serial = self.mutation_coordinator.lock();
-        self.load_record_for_mutation(id)?;
-        let mut state = lock_unpoisoned(&self.state);
-        let index = state
-            .records
-            .iter()
-            .position(|record| record.id == id)
-            .ok_or(SessionRecordError::NotFound)?;
-        let previous_bytes = checked_record_bytes(&state.records[index])
-            .ok_or(SessionRecordError::RecordTooLarge)?;
-        let updated_bytes = checked_representation_bytes(&state.records[index].representations)
-            .and_then(|bytes| {
-                bytes.checked_add(note.as_ref().map_or(0, |note| note.as_str().len()))
-            })
-            .ok_or(SessionRecordError::RecordTooLarge)?;
-        if updated_bytes > self.limits.record_bytes {
-            return Err(SessionRecordError::RecordTooLarge);
-        }
-        let updated_total_bytes = state
-            .total_bytes
-            .checked_sub(previous_bytes)
-            .and_then(|bytes| bytes.checked_add(updated_bytes))
-            .ok_or(SessionRecordError::RecordTooLarge)?;
-        let record = Arc::make_mut(
-            state
-                .records
-                .get_mut(index)
-                .ok_or(SessionRecordError::NotFound)?,
-        );
-        record.note = note;
-        let page_note = record.note.clone();
-        if let Some(view) = state.page.iter_mut().find(|view| view.id == id) {
-            view.note = page_note;
-        }
-        state.total_bytes = updated_total_bytes;
-        evict_to_limits(&mut state, self.limits);
-        let view = state
-            .records
-            .iter()
-            .find(|record| record.id == id)
-            .map(|record| SessionRecordView::from_record(record, self.limits.preview_bytes))
-            .ok_or(SessionRecordError::NotFound)?;
-        let persisted_note = state
-            .records
-            .iter()
-            .find(|record| record.id == id)
-            .and_then(|record| record.note.clone());
-        drop(state);
         match &self.persistence {
-            NotePersistence::NotConfigured => {}
             NotePersistence::SessionOnly => {
                 return Err(SessionRecordError::PersistenceUnavailable);
             }
+            NotePersistence::NotConfigured | NotePersistence::Durable(_) => {}
+        }
+        self.load_record_for_mutation(id)?;
+        let mut updated = {
+            let state = lock_unpoisoned(&self.state);
+            let current = state
+                .records
+                .iter()
+                .find(|record| record.id == id)
+                .ok_or(SessionRecordError::NotFound)?;
+            let previous_bytes =
+                checked_record_bytes(current).ok_or(SessionRecordError::RecordTooLarge)?;
+            let updated_bytes = checked_representation_bytes(&current.representations)
+                .and_then(|bytes| {
+                    bytes.checked_add(note.as_ref().map_or(0, |note| note.as_str().len()))
+                })
+                .ok_or(SessionRecordError::RecordTooLarge)?;
+            state
+                .total_bytes
+                .checked_sub(previous_bytes)
+                .and_then(|bytes| bytes.checked_add(updated_bytes))
+                .ok_or(SessionRecordError::RecordTooLarge)?;
+            current.as_ref().clone()
+        };
+        updated.note = note;
+        self.validate_record_budget(&updated)?;
+        match &self.persistence {
+            NotePersistence::NotConfigured => {}
+            NotePersistence::SessionOnly => unreachable!(),
             NotePersistence::Durable(persistence) => {
                 if !self.storage_available.load(Ordering::Acquire) {
                     return Err(SessionRecordError::PersistenceUnavailable);
                 }
-                if persistence
-                    .update_note(id, persisted_note.as_ref())
-                    .is_err()
-                {
+                if persistence.update_note(id, updated.note.as_ref()).is_err() {
                     self.storage_available.store(false, Ordering::Release);
                     return Err(SessionRecordError::PersistenceUnavailable);
                 }
-                self.refresh_loaded_window()?;
             }
         }
+        self.cache_updated_record(updated.clone());
+        if matches!(self.persistence, NotePersistence::Durable(_)) {
+            self.refresh_after_committed_mutation();
+        }
+        let view = SessionRecordView::from_record(&updated, self.limits.preview_bytes);
         Ok(view)
     }
 
@@ -780,23 +763,26 @@ impl SessionRecordStore {
         id: RecordId,
         group_id: Option<GroupId>,
     ) -> Result<SessionRecordView, SessionRecordError> {
-        self.load_record_for_mutation(id)?;
-        let mut state = lock_unpoisoned(&self.state);
-        let record = state
-            .records
-            .iter_mut()
-            .find(|record| record.id == id)
-            .ok_or(SessionRecordError::NotFound)?;
-        Arc::make_mut(record).group_id = group_id;
-        let updated = Arc::clone(record);
-        if let Some(view) = state.page.iter_mut().find(|view| view.id == id) {
-            view.group_id = group_id;
+        match &self.persistence {
+            NotePersistence::SessionOnly => {
+                return Err(SessionRecordError::PersistenceUnavailable);
+            }
+            NotePersistence::NotConfigured | NotePersistence::Durable(_) => {}
         }
-        let view = SessionRecordView::from_record(&updated, self.limits.preview_bytes);
-        drop(state);
+        self.load_record_for_mutation(id)?;
+        let mut updated = {
+            let state = lock_unpoisoned(&self.state);
+            state
+                .records
+                .iter()
+                .find(|record| record.id == id)
+                .map(|record| record.as_ref().clone())
+                .ok_or(SessionRecordError::NotFound)?
+        };
+        updated.group_id = group_id;
         match &self.persistence {
             NotePersistence::NotConfigured => {}
-            NotePersistence::SessionOnly => return Err(SessionRecordError::PersistenceUnavailable),
+            NotePersistence::SessionOnly => unreachable!(),
             NotePersistence::Durable(persistence) => {
                 if !self.storage_available.load(Ordering::Acquire)
                     || persistence.save_record(&updated).is_err()
@@ -804,9 +790,13 @@ impl SessionRecordStore {
                     self.storage_available.store(false, Ordering::Release);
                     return Err(SessionRecordError::PersistenceUnavailable);
                 }
-                self.refresh_loaded_window()?;
             }
         }
+        self.cache_updated_record(updated.clone());
+        if matches!(self.persistence, NotePersistence::Durable(_)) {
+            self.refresh_after_committed_mutation();
+        }
+        let view = SessionRecordView::from_record(&updated, self.limits.preview_bytes);
         Ok(view)
     }
 
@@ -836,31 +826,31 @@ impl SessionRecordStore {
         let _serial = self.mutation_coordinator.lock();
         self.require_durable_storage()?;
         self.load_record_for_mutation(id)?;
-        let mut state = lock_unpoisoned(&self.state);
-        let index = state
-            .records
-            .iter()
-            .position(|record| record.id == id)
-            .ok_or(SessionRecordError::NotFound)?;
-        let removed = state
-            .records
-            .remove(index)
-            .ok_or(SessionRecordError::NotFound)?;
-        state.total_bytes = state.total_bytes.saturating_sub(record_bytes(&removed));
-        drop(state);
+        let removed = {
+            let state = lock_unpoisoned(&self.state);
+            state
+                .records
+                .iter()
+                .find(|record| record.id == id)
+                .map(|record| record.as_ref().clone())
+                .ok_or(SessionRecordError::NotFound)?
+        };
         if let NotePersistence::Durable(persistence) = &self.persistence
             && persistence.delete_record(id).is_err()
         {
-            self.restore_in_memory(removed.as_ref().clone());
             self.storage_available.store(false, Ordering::Release);
             return Err(SessionRecordError::PersistenceUnavailable);
         }
-        lock_unpoisoned(&self.state)
-            .page
-            .retain(|view| view.id != id);
-        self.refresh_loaded_window()?;
-        let removed = removed.as_ref().clone();
+        {
+            let mut state = lock_unpoisoned(&self.state);
+            if let Some(index) = state.records.iter().position(|record| record.id == id) {
+                let cached = state.records.remove(index).expect("record index exists");
+                state.total_bytes = state.total_bytes.saturating_sub(record_bytes(&cached));
+            }
+            state.page.retain(|view| view.id != id);
+        }
         *lock_unpoisoned(&self.last_deleted) = Some(removed.clone());
+        self.refresh_after_committed_mutation();
         Ok(removed)
     }
 
@@ -870,22 +860,26 @@ impl SessionRecordStore {
     ) -> Result<SessionRecordView, SessionRecordError> {
         let _serial = self.mutation_coordinator.lock();
         self.require_durable_storage()?;
-        let mut deleted = lock_unpoisoned(&self.last_deleted);
-        if deleted.as_ref().is_none_or(|record| record.id != id) {
-            return Err(SessionRecordError::NotFound);
-        }
-        let record = deleted.take().ok_or(SessionRecordError::NotFound)?;
-        drop(deleted);
+        let record = lock_unpoisoned(&self.last_deleted)
+            .as_ref()
+            .filter(|record| record.id == id)
+            .cloned()
+            .ok_or(SessionRecordError::NotFound)?;
         let view = SessionRecordView::from_record(&record, self.limits.preview_bytes);
         if let NotePersistence::Durable(persistence) = &self.persistence
             && persistence.save_record(&record).is_err()
         {
-            *lock_unpoisoned(&self.last_deleted) = Some(record);
             self.storage_available.store(false, Ordering::Release);
             return Err(SessionRecordError::PersistenceUnavailable);
         }
+        {
+            let mut deleted = lock_unpoisoned(&self.last_deleted);
+            if deleted.as_ref().is_some_and(|deleted| deleted.id == id) {
+                deleted.take();
+            }
+        }
         self.restore_in_memory(record);
-        self.refresh_loaded_window()?;
+        self.refresh_after_committed_mutation();
         Ok(view)
     }
 
@@ -1275,28 +1269,20 @@ impl SessionRecordView {
 impl RecordDetailsView {
     fn from_record(record: ClipboardRecord) -> Self {
         let content_kind = record.content_kind();
-        let text = record
+        let representations: Vec<_> = record
             .representations
             .iter()
-            .find_map(|representation| match representation {
-                ClipboardRepresentation::UnicodeText { text } => Some(text.clone()),
-                ClipboardRepresentation::Rtf { .. }
-                | ClipboardRepresentation::Html { .. }
-                | ClipboardRepresentation::Png { .. }
-                | ClipboardRepresentation::DibV5 { .. }
-                | ClipboardRepresentation::FileList { .. } => None,
-            });
+            .map(representation_details_from_memory)
+            .collect();
+        let (text, text_truncated) = projected_unicode_text(&representations);
         Self {
             id: record.id,
             content_identity: record.content_identity,
             captured_at: record.captured_at,
             source_application: record.source.application_name,
             text,
-            representations: record
-                .representations
-                .iter()
-                .map(representation_details_from_memory)
-                .collect(),
+            text_truncated,
+            representations,
             note: record.note,
             group_id: record.group_id,
             content_kind,
@@ -1307,17 +1293,14 @@ impl RecordDetailsView {
     }
 
     fn from_persisted(record: PersistedRecordDetails) -> Self {
-        let text = record.representations.iter().find_map(|representation| {
-            (representation.kind == ClipboardRepresentationKind::UnicodeText)
-                .then(|| representation.text.clone())
-                .flatten()
-        });
+        let (text, text_truncated) = projected_unicode_text(&record.representations);
         Self {
             id: record.id,
             content_identity: record.content_identity,
             captured_at: record.captured_at,
             source_application: record.source_application,
             text,
+            text_truncated,
             representations: record.representations,
             note: record.note,
             group_id: record.group_id,
@@ -1329,48 +1312,94 @@ impl RecordDetailsView {
     }
 }
 
-const MAX_DETAIL_TEXT_BYTES: usize = 256 * 1024;
+pub(crate) const MAX_DETAIL_TEXT_BYTES: usize = 256 * 1024;
+pub(crate) const MAX_DETAIL_FILE_LIST_PATHS: usize = 256;
+pub(crate) const MAX_DETAIL_FILE_LIST_BYTES: usize = 256 * 1024;
+
+fn projected_unicode_text(
+    representations: &[ClipboardRepresentationDetails],
+) -> (Option<String>, bool) {
+    representations
+        .iter()
+        .find(|representation| representation.kind == ClipboardRepresentationKind::UnicodeText)
+        .map(|representation| (representation.text.clone(), representation.truncated))
+        .unwrap_or((None, false))
+}
 
 fn representation_details_from_memory(
     representation: &ClipboardRepresentation,
 ) -> ClipboardRepresentationDetails {
     let byte_length = representation.checked_payload_bytes().unwrap_or(usize::MAX);
-    let (kind, text, paths) = match representation {
+    let (kind, text, paths, item_count, truncated) = match representation {
         ClipboardRepresentation::UnicodeText { text } => (
             ClipboardRepresentationKind::UnicodeText,
             Some(truncate_utf8(text, MAX_DETAIL_TEXT_BYTES)),
             None,
+            None,
+            byte_length > MAX_DETAIL_TEXT_BYTES,
         ),
         ClipboardRepresentation::Rtf { bytes } => (
             ClipboardRepresentationKind::Rtf,
             Some(String::from_utf8_lossy(&bytes[..bytes.len().min(MAX_DETAIL_TEXT_BYTES)]).into()),
             None,
+            None,
+            byte_length > MAX_DETAIL_TEXT_BYTES,
         ),
         ClipboardRepresentation::Html { bytes } => (
             ClipboardRepresentationKind::Html,
             Some(String::from_utf8_lossy(&bytes[..bytes.len().min(MAX_DETAIL_TEXT_BYTES)]).into()),
             None,
-        ),
-        ClipboardRepresentation::Png { .. } => (ClipboardRepresentationKind::Png, None, None),
-        ClipboardRepresentation::DibV5 { .. } => (ClipboardRepresentationKind::DibV5, None, None),
-        ClipboardRepresentation::FileList { paths } => (
-            ClipboardRepresentationKind::FileList,
             None,
-            Some(paths.clone()),
+            byte_length > MAX_DETAIL_TEXT_BYTES,
         ),
+        ClipboardRepresentation::Png { .. } => {
+            (ClipboardRepresentationKind::Png, None, None, None, false)
+        }
+        ClipboardRepresentation::DibV5 { .. } => {
+            (ClipboardRepresentationKind::DibV5, None, None, None, false)
+        }
+        ClipboardRepresentation::FileList { paths } => {
+            let projected = project_file_list(paths);
+            (
+                ClipboardRepresentationKind::FileList,
+                None,
+                Some(projected.0),
+                Some(paths.len()),
+                projected.1,
+            )
+        }
     };
     ClipboardRepresentationDetails {
         kind,
         byte_length,
+        item_count,
         text,
         paths,
-        truncated: matches!(
-            kind,
-            ClipboardRepresentationKind::UnicodeText
-                | ClipboardRepresentationKind::Rtf
-                | ClipboardRepresentationKind::Html
-        ) && byte_length > MAX_DETAIL_TEXT_BYTES,
+        truncated,
     }
+}
+
+fn project_file_list(paths: &[String]) -> (Vec<String>, bool) {
+    let mut projected = Vec::new();
+    let mut bytes = 0;
+    for path in paths.iter().take(MAX_DETAIL_FILE_LIST_PATHS) {
+        let remaining = MAX_DETAIL_FILE_LIST_BYTES.saturating_sub(bytes);
+        if remaining == 0 {
+            break;
+        }
+        let value = truncate_utf8(path, remaining);
+        bytes += value.len();
+        projected.push(value);
+        if path.len() > remaining {
+            break;
+        }
+    }
+    let truncated = projected.len() < paths.len()
+        || projected
+            .iter()
+            .zip(paths)
+            .any(|(projected, original)| projected.len() < original.len());
+    (projected, truncated)
 }
 
 fn truncate_utf8(value: &str, max_bytes: usize) -> String {
@@ -1732,12 +1761,20 @@ mod tests {
     struct FailingRefreshPersistence {
         repository: Arc<SqliteRepository>,
         fail_next_page: AtomicBool,
+        fail_next_save: AtomicBool,
+        fail_next_note: AtomicBool,
+        fail_next_delete: AtomicBool,
         saves: AtomicUsize,
+        notes: AtomicUsize,
+        deletes: AtomicUsize,
     }
 
     impl RecordPersistence for FailingRefreshPersistence {
         fn save_record(&self, record: &ClipboardRecord) -> Result<(), PersistenceError> {
             self.saves.fetch_add(1, Ordering::AcqRel);
+            if self.fail_next_save.swap(false, Ordering::AcqRel) {
+                return Err(PersistenceError::WorkerUnavailable);
+            }
             self.repository.save_record(record)
         }
 
@@ -1746,10 +1783,18 @@ mod tests {
             id: RecordId,
             note: Option<&RecordNote>,
         ) -> Result<(), PersistenceError> {
+            self.notes.fetch_add(1, Ordering::AcqRel);
+            if self.fail_next_note.swap(false, Ordering::AcqRel) {
+                return Err(PersistenceError::WorkerUnavailable);
+            }
             self.repository.update_note(id, note)
         }
 
         fn delete_record(&self, id: RecordId) -> Result<(), PersistenceError> {
+            self.deletes.fetch_add(1, Ordering::AcqRel);
+            if self.fail_next_delete.swap(false, Ordering::AcqRel) {
+                return Err(PersistenceError::WorkerUnavailable);
+            }
             self.repository.delete_record(id)
         }
 
@@ -1771,6 +1816,21 @@ mod tests {
         fn full_record(&self, id: RecordId) -> Result<ClipboardRecord, PersistenceError> {
             self.repository.full_record(id)
         }
+    }
+
+    fn failing_refresh_persistence(
+        repository: Arc<SqliteRepository>,
+    ) -> Arc<FailingRefreshPersistence> {
+        Arc::new(FailingRefreshPersistence {
+            repository,
+            fail_next_page: AtomicBool::new(false),
+            fail_next_save: AtomicBool::new(false),
+            fail_next_note: AtomicBool::new(false),
+            fail_next_delete: AtomicBool::new(false),
+            saves: AtomicUsize::new(0),
+            notes: AtomicUsize::new(0),
+            deletes: AtomicUsize::new(0),
+        })
     }
 
     impl RecordPersistence for BlockingPagePersistence {
@@ -1873,7 +1933,7 @@ mod tests {
     }
 
     #[test]
-    fn persistence_failure_keeps_capture_and_note_available_in_memory() {
+    fn persistence_failure_does_not_publish_note_in_memory() {
         let available = Arc::new(AtomicBool::new(true));
         let store = SessionRecordStore::with_persistence(
             Vec::new(),
@@ -1891,15 +1951,12 @@ mod tests {
             store.update_note(id, "local draft".to_owned()),
             Err(SessionRecordError::PersistenceUnavailable)
         ));
-        assert_eq!(
-            store.list()[0].note.as_ref().map(RecordNote::as_str),
-            Some("local draft")
-        );
+        assert_eq!(store.list()[0].note, None);
         assert!(!available.load(Ordering::Acquire));
     }
 
     #[test]
-    fn session_only_note_edit_keeps_the_draft_but_reports_it_is_not_durable() {
+    fn session_only_note_edit_does_not_publish_an_undurable_draft() {
         let available = Arc::new(AtomicBool::new(false));
         let record = ClipboardRecord::from_capture(capture("one", "session text"));
         let id = record.id;
@@ -1909,10 +1966,7 @@ mod tests {
             store.update_note(id, "retry later".to_owned()),
             Err(SessionRecordError::PersistenceUnavailable)
         ));
-        assert_eq!(
-            store.list()[0].note.as_ref().map(RecordNote::as_str),
-            Some("retry later")
-        );
+        assert_eq!(store.list()[0].note, None);
     }
 
     #[test]
@@ -2067,11 +2121,8 @@ mod tests {
     fn durable_create_succeeds_when_post_commit_page_refresh_fails() {
         let directory = tempdir().unwrap();
         let repository = SqliteRepository::open(directory.path().join("history.sqlite3")).unwrap();
-        let persistence = Arc::new(FailingRefreshPersistence {
-            repository: Arc::clone(&repository),
-            fail_next_page: AtomicBool::new(true),
-            saves: AtomicUsize::new(0),
-        });
+        let persistence = failing_refresh_persistence(Arc::clone(&repository));
+        persistence.fail_next_page.store(true, Ordering::Release);
         let store = SessionRecordStore::with_persistence_page(
             repository.load_page(HistoryQuery::default()).unwrap(),
             Arc::clone(&persistence) as Arc<dyn RecordPersistence>,
@@ -2106,11 +2157,7 @@ mod tests {
         let repository = SqliteRepository::open(directory.path().join("history.sqlite3")).unwrap();
         let record = ClipboardRecord::from_capture(capture("refresh-failure-update", "before"));
         repository.save_record(&record).unwrap();
-        let persistence = Arc::new(FailingRefreshPersistence {
-            repository: Arc::clone(&repository),
-            fail_next_page: AtomicBool::new(false),
-            saves: AtomicUsize::new(0),
-        });
+        let persistence = failing_refresh_persistence(Arc::clone(&repository));
         let store = SessionRecordStore::with_persistence_page(
             repository.load_page(HistoryQuery::default()).unwrap(),
             Arc::clone(&persistence) as Arc<dyn RecordPersistence>,
@@ -2143,6 +2190,184 @@ mod tests {
             store.history_page(HistoryQuery::default()).unwrap().items[0].id,
             record.id
         );
+    }
+
+    #[test]
+    fn note_and_group_persistence_failures_do_not_publish_cache_changes() {
+        let directory = tempdir().unwrap();
+        let repository = SqliteRepository::open(directory.path().join("history.sqlite3")).unwrap();
+        let record = ClipboardRecord::from_capture(capture("durable-fields", "value"));
+        repository.save_record(&record).unwrap();
+        let persistence = failing_refresh_persistence(Arc::clone(&repository));
+        let store = SessionRecordStore::with_persistence_page(
+            repository.load_page(HistoryQuery::default()).unwrap(),
+            Arc::clone(&persistence) as Arc<dyn RecordPersistence>,
+            Arc::new(AtomicBool::new(true)),
+        );
+
+        persistence.fail_next_note.store(true, Ordering::Release);
+        assert!(matches!(
+            store.update_note(record.id, "not durable".to_owned()),
+            Err(SessionRecordError::PersistenceUnavailable)
+        ));
+        assert_eq!(store.list()[0].note, None);
+        assert_eq!(repository.full_record(record.id).unwrap().note, None);
+
+        store.storage_available.store(true, Ordering::Release);
+        let group = GroupId::new();
+        persistence.fail_next_save.store(true, Ordering::Release);
+        assert!(matches!(
+            store.update_group(record.id, Some(group)),
+            Err(SessionRecordError::PersistenceUnavailable)
+        ));
+        assert_eq!(store.list()[0].group_id, None);
+        assert_eq!(repository.full_record(record.id).unwrap().group_id, None);
+    }
+
+    #[test]
+    fn note_and_group_commits_succeed_when_post_commit_refresh_fails() {
+        let directory = tempdir().unwrap();
+        let repository = SqliteRepository::open(directory.path().join("history.sqlite3")).unwrap();
+        let record = ClipboardRecord::from_capture(capture("refresh-fields", "value"));
+        repository.save_record(&record).unwrap();
+        let persistence = failing_refresh_persistence(Arc::clone(&repository));
+        let store = SessionRecordStore::with_persistence_page(
+            repository.load_page(HistoryQuery::default()).unwrap(),
+            Arc::clone(&persistence) as Arc<dyn RecordPersistence>,
+            Arc::new(AtomicBool::new(true)),
+        );
+
+        persistence.fail_next_page.store(true, Ordering::Release);
+        assert_eq!(
+            store
+                .update_note(record.id, "durable note".to_owned())
+                .unwrap()
+                .note
+                .as_ref()
+                .map(RecordNote::as_str),
+            Some("durable note")
+        );
+        assert!(store.list().is_empty());
+        assert_eq!(
+            repository
+                .full_record(record.id)
+                .unwrap()
+                .note
+                .as_ref()
+                .map(RecordNote::as_str),
+            Some("durable note")
+        );
+
+        store.refresh_loaded_window().unwrap();
+        let group = GroupId::new();
+        persistence.fail_next_page.store(true, Ordering::Release);
+        assert_eq!(
+            store.update_group(record.id, Some(group)).unwrap().group_id,
+            Some(group)
+        );
+        assert!(store.list().is_empty());
+        assert_eq!(
+            repository.full_record(record.id).unwrap().group_id,
+            Some(group)
+        );
+        store.refresh_loaded_window().unwrap();
+        assert_eq!(store.list()[0].group_id, Some(group));
+    }
+
+    #[test]
+    fn delete_persistence_failure_keeps_record_and_existing_undo_slot() {
+        let directory = tempdir().unwrap();
+        let repository = SqliteRepository::open(directory.path().join("history.sqlite3")).unwrap();
+        let previous = ClipboardRecord::from_capture(capture("previous-delete", "previous"));
+        let record = ClipboardRecord::from_capture(capture("failed-delete", "value"));
+        repository.save_record(&record).unwrap();
+        let persistence = failing_refresh_persistence(Arc::clone(&repository));
+        let store = SessionRecordStore::with_persistence_page(
+            repository.load_page(HistoryQuery::default()).unwrap(),
+            Arc::clone(&persistence) as Arc<dyn RecordPersistence>,
+            Arc::new(AtomicBool::new(true)),
+        );
+        *lock_unpoisoned(&store.last_deleted) = Some(previous.clone());
+
+        persistence.fail_next_delete.store(true, Ordering::Release);
+        assert!(matches!(
+            store.delete(record.id),
+            Err(SessionRecordError::PersistenceUnavailable)
+        ));
+
+        assert_eq!(store.list()[0].id, record.id);
+        assert_eq!(repository.full_record(record.id).unwrap(), record);
+        assert_eq!(*lock_unpoisoned(&store.last_deleted), Some(previous));
+    }
+
+    #[test]
+    fn delete_commit_succeeds_when_refresh_fails_and_preserves_undo() {
+        let directory = tempdir().unwrap();
+        let repository = SqliteRepository::open(directory.path().join("history.sqlite3")).unwrap();
+        let record = ClipboardRecord::from_capture(capture("refresh-delete", "value"));
+        repository.save_record(&record).unwrap();
+        let persistence = failing_refresh_persistence(Arc::clone(&repository));
+        let store = SessionRecordStore::with_persistence_page(
+            repository.load_page(HistoryQuery::default()).unwrap(),
+            Arc::clone(&persistence) as Arc<dyn RecordPersistence>,
+            Arc::new(AtomicBool::new(true)),
+        );
+
+        persistence.fail_next_page.store(true, Ordering::Release);
+        assert_eq!(store.delete(record.id).unwrap(), record);
+        assert!(store.list().is_empty());
+        assert!(repository.full_record(record.id).is_err());
+        assert_eq!(*lock_unpoisoned(&store.last_deleted), Some(record.clone()));
+
+        assert_eq!(store.restore_last_deleted(record.id).unwrap().id, record.id);
+        assert_eq!(repository.full_record(record.id).unwrap(), record);
+    }
+
+    #[test]
+    fn undo_persistence_failure_keeps_record_deleted_and_slot_available() {
+        let directory = tempdir().unwrap();
+        let repository = SqliteRepository::open(directory.path().join("history.sqlite3")).unwrap();
+        let record = ClipboardRecord::from_capture(capture("failed-undo", "value"));
+        repository.save_record(&record).unwrap();
+        let persistence = failing_refresh_persistence(Arc::clone(&repository));
+        let store = SessionRecordStore::with_persistence_page(
+            repository.load_page(HistoryQuery::default()).unwrap(),
+            Arc::clone(&persistence) as Arc<dyn RecordPersistence>,
+            Arc::new(AtomicBool::new(true)),
+        );
+        store.delete(record.id).unwrap();
+
+        persistence.fail_next_save.store(true, Ordering::Release);
+        assert!(matches!(
+            store.restore_last_deleted(record.id),
+            Err(SessionRecordError::PersistenceUnavailable)
+        ));
+        assert!(repository.full_record(record.id).is_err());
+        assert_eq!(*lock_unpoisoned(&store.last_deleted), Some(record));
+    }
+
+    #[test]
+    fn undo_commit_succeeds_when_refresh_fails_and_consumes_slot() {
+        let directory = tempdir().unwrap();
+        let repository = SqliteRepository::open(directory.path().join("history.sqlite3")).unwrap();
+        let record = ClipboardRecord::from_capture(capture("refresh-undo", "value"));
+        repository.save_record(&record).unwrap();
+        let persistence = failing_refresh_persistence(Arc::clone(&repository));
+        let store = SessionRecordStore::with_persistence_page(
+            repository.load_page(HistoryQuery::default()).unwrap(),
+            Arc::clone(&persistence) as Arc<dyn RecordPersistence>,
+            Arc::new(AtomicBool::new(true)),
+        );
+        store.delete(record.id).unwrap();
+
+        persistence.fail_next_page.store(true, Ordering::Release);
+        assert_eq!(store.restore_last_deleted(record.id).unwrap().id, record.id);
+        assert!(store.list().is_empty());
+        assert_eq!(repository.full_record(record.id).unwrap(), record);
+        assert_eq!(*lock_unpoisoned(&store.last_deleted), None);
+
+        store.refresh_loaded_window().unwrap();
+        assert_eq!(store.list()[0].id, record.id);
     }
 
     #[test]
@@ -2264,6 +2489,87 @@ mod tests {
         assert!(!json.contains("231,231,231"));
         assert!(json.contains("\"kind\":\"png\""));
         assert!(json.contains("\"byteLength\":"));
+    }
+
+    #[test]
+    fn near_limit_text_details_bound_top_level_and_representation_json() {
+        let directory = tempdir().unwrap();
+        let repository = SqliteRepository::open(directory.path().join("history.sqlite3")).unwrap();
+        let text = "界".repeat((MAX_CAPTURE_RECORD_BYTES - 1024) / 3);
+        let record = ClipboardRecord::from_capture(capture("large-text-details", &text));
+        repository.save_record(&record).unwrap();
+        let memory = SessionRecordStore::with_loaded(vec![record.clone()])
+            .record_details_view(record.id)
+            .unwrap();
+        let sqlite = SessionRecordStore::with_persistence_page(
+            repository.load_page(HistoryQuery::default()).unwrap(),
+            Arc::clone(&repository) as Arc<dyn RecordPersistence>,
+            Arc::new(AtomicBool::new(true)),
+        )
+        .record_details_view(record.id)
+        .unwrap();
+
+        for details in [&memory, &sqlite] {
+            let json = serde_json::to_string(details).unwrap();
+            let representation = details
+                .representations
+                .iter()
+                .find(|value| value.kind == ClipboardRepresentationKind::UnicodeText)
+                .unwrap();
+            assert!(details.text.as_ref().unwrap().len() <= MAX_DETAIL_TEXT_BYTES);
+            assert!(details.text_truncated);
+            assert!(representation.text.as_ref().unwrap().len() <= MAX_DETAIL_TEXT_BYTES);
+            assert!(representation.truncated);
+            assert!(json.len() < 2 * MAX_DETAIL_TEXT_BYTES + 16 * 1024);
+        }
+        assert_eq!(memory.representations, sqlite.representations);
+    }
+
+    #[test]
+    fn memory_and_sqlite_file_list_details_share_the_same_ipc_budget() {
+        let directory = tempdir().unwrap();
+        let repository = SqliteRepository::open(directory.path().join("history.sqlite3")).unwrap();
+        let paths = (0..4096)
+            .map(|index| format!(r"C:\{}\file-{index}.txt", "x".repeat(3800)))
+            .collect::<Vec<_>>();
+        let record = ClipboardRecord::from_capture(CapturedClipboard {
+            content_identity: ContentIdentity::new("large-file-list-details"),
+            captured_at: Utc::now(),
+            source: SourceIdentity::default(),
+            representations: vec![ClipboardRepresentation::FileList {
+                paths: paths.clone(),
+            }],
+        });
+        repository.save_record(&record).unwrap();
+        let memory = SessionRecordStore::with_loaded(vec![record.clone()])
+            .record_details_view(record.id)
+            .unwrap();
+        let sqlite = SessionRecordStore::with_persistence_page(
+            repository.load_page(HistoryQuery::default()).unwrap(),
+            Arc::clone(&repository) as Arc<dyn RecordPersistence>,
+            Arc::new(AtomicBool::new(true)),
+        )
+        .record_details_view(record.id)
+        .unwrap();
+
+        for details in [&memory, &sqlite] {
+            let projection = details
+                .representations
+                .iter()
+                .find(|value| value.kind == ClipboardRepresentationKind::FileList)
+                .unwrap();
+            let projected = projection.paths.as_ref().unwrap();
+            assert_eq!(projection.item_count, Some(4096));
+            assert_eq!(
+                projection.byte_length,
+                record.representations[0].checked_payload_bytes().unwrap()
+            );
+            assert!(projection.truncated);
+            assert!(projected.len() <= MAX_DETAIL_FILE_LIST_PATHS);
+            assert!(projected.iter().map(String::len).sum::<usize>() <= MAX_DETAIL_FILE_LIST_BYTES);
+            assert!(serde_json::to_string(details).unwrap().len() < 300 * 1024);
+        }
+        assert_eq!(memory.representations, sqlite.representations);
     }
 
     #[test]
@@ -2405,6 +2711,82 @@ mod tests {
                 .all(|summary| summary.group_id == Some(included))
         );
         assert!(included_records.iter().any(|record| record.id == mutate));
+    }
+
+    #[test]
+    fn filtered_multi_page_refresh_failure_recovers_query_and_loaded_range() {
+        let directory = tempdir().unwrap();
+        let repository = SqliteRepository::open(directory.path().join("history.sqlite3")).unwrap();
+        let included = GroupId::new();
+        let excluded = GroupId::new();
+        let base = Utc.with_ymd_and_hms(2026, 8, 27, 10, 0, 0).unwrap();
+        for index in 0..30 {
+            let mut record = ClipboardRecord::from_capture(capture_at(
+                &format!("included-recovery-{index}"),
+                "included",
+                base + Duration::seconds(index),
+            ));
+            record.group_id = Some(included);
+            record.favorite = true;
+            repository.save_record(&record).unwrap();
+        }
+        for index in 0..10 {
+            let mut record = ClipboardRecord::from_capture(capture_at(
+                &format!("excluded-recovery-{index}"),
+                "excluded",
+                base + Duration::seconds(100 + index),
+            ));
+            record.group_id = Some(excluded);
+            record.favorite = true;
+            repository.save_record(&record).unwrap();
+        }
+        let query = HistoryQuery {
+            limit: 10,
+            group_id: Some(included),
+            favorites_only: true,
+            ..HistoryQuery::default()
+        };
+        let first = repository.load_page(query.clone()).unwrap();
+        let second = repository
+            .load_page(HistoryQuery {
+                cursor: first.next_cursor.clone(),
+                ..query.clone()
+            })
+            .unwrap();
+        let persistence = failing_refresh_persistence(Arc::clone(&repository));
+        let store = SessionRecordStore::with_persistence_query_page(
+            query.clone(),
+            first,
+            Arc::clone(&persistence) as Arc<dyn RecordPersistence>,
+            Arc::new(AtomicBool::new(true)),
+        );
+        store.append_page(second);
+        let mutate = store.list()[12].id;
+
+        persistence.fail_next_page.store(true, Ordering::Release);
+        store.update_note(mutate, "committed".to_owned()).unwrap();
+        assert!(store.list().is_empty());
+
+        store.refresh_loaded_window().unwrap();
+        let restored = store.list();
+        assert_eq!(restored.len(), 20);
+        assert!(restored.iter().all(|view| {
+            view.group_id == Some(included)
+                && view.favorite
+                && view.content_kind == ContentKind::Text
+        }));
+        assert_eq!(
+            restored
+                .iter()
+                .find(|view| view.id == mutate)
+                .and_then(|view| view.note.as_ref())
+                .map(RecordNote::as_str),
+            Some("committed")
+        );
+        let next = store.next_page_query().unwrap();
+        assert_eq!(next.group_id, Some(included));
+        assert!(next.favorites_only);
+        assert!(next.cursor.is_some());
     }
 
     #[test]

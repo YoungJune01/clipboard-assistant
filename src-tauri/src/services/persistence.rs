@@ -39,7 +39,10 @@ use crate::domain::{
     GroupId, HistoryCursor, HistoryQuery, Language, RecordId, RecordNote, RetentionPeriod,
     ShortcutModifiers, SourceIdentity, StorageLimit, UserSettings,
 };
-use crate::services::session_records::{MAX_CAPTURE_RECORD_BYTES, REPRESENTATION_OVERHEAD_BYTES};
+use crate::services::session_records::{
+    MAX_CAPTURE_RECORD_BYTES, MAX_DETAIL_FILE_LIST_BYTES, MAX_DETAIL_FILE_LIST_PATHS,
+    MAX_DETAIL_TEXT_BYTES, REPRESENTATION_OVERHEAD_BYTES,
+};
 
 const SCHEMA_VERSION: i64 = 4;
 const DATABASE_FILE: &str = "clipboard-history.sqlite3";
@@ -56,7 +59,6 @@ const BACKUP_WORKER_TIMEOUT: StdDuration = StdDuration::from_secs(120);
 const CONTROL_POLL_INTERVAL: StdDuration = StdDuration::from_millis(25);
 const MIGRATION_LOCK_TIMEOUT: StdDuration = StdDuration::from_secs(10);
 const MIGRATION_MUTEX_PREFIX: &str = "Local\\ClipboardAssistant.StorageMigration.";
-const MAX_DETAIL_TEXT_BYTES: usize = 256 * 1024;
 
 #[derive(Clone, Copy)]
 pub(crate) struct RestoreBudget {
@@ -2684,85 +2686,200 @@ fn load_representation_details(
     record_id: &str,
 ) -> Result<Vec<ClipboardRepresentationDetails>, PersistenceError> {
     let mut statement = connection.prepare(
-        "SELECT kind,
+        "SELECT position, kind,
                 length(CASE WHEN text_value IS NOT NULL THEN CAST(text_value AS BLOB) ELSE blob_value END),
                 CASE WHEN kind = 'unicode_text' THEN substr(CAST(text_value AS BLOB), 1, ?2) ELSE NULL END,
-                CASE WHEN kind IN ('rtf', 'html') THEN substr(blob_value, 1, ?2) ELSE NULL END,
-                CASE WHEN kind = 'file_list' THEN text_value ELSE NULL END
+                CASE WHEN kind IN ('rtf', 'html') THEN substr(blob_value, 1, ?2) ELSE NULL END
          FROM clipboard_representations
          WHERE record_id = ?1 ORDER BY position",
     )?;
     let rows = statement.query_map(params![record_id, MAX_DETAIL_TEXT_BYTES as i64], |row| {
         Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, i64>(1)?,
-            row.get::<_, Option<Vec<u8>>>(2)?,
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, i64>(2)?,
             row.get::<_, Option<Vec<u8>>>(3)?,
-            row.get::<_, Option<String>>(4)?,
+            row.get::<_, Option<Vec<u8>>>(4)?,
         ))
     })?;
     let mut details = Vec::new();
     for row in rows {
-        let (kind, byte_length, unicode_text, rich_bytes, file_list) = row?;
-        let byte_length =
-            usize::try_from(byte_length).map_err(|_| PersistenceError::InvalidData)?;
-        if byte_length > MAX_CAPTURE_RECORD_BYTES {
+        let (position, kind, stored_byte_length, unicode_text, rich_bytes) = row?;
+        let stored_byte_length =
+            usize::try_from(stored_byte_length).map_err(|_| PersistenceError::InvalidData)?;
+        if stored_byte_length > MAX_CAPTURE_RECORD_BYTES {
             return Err(PersistenceError::InvalidData);
         }
-        let (kind, text, paths) = match kind.as_str() {
+        let (kind, byte_length, item_count, text, paths, truncated) = match kind.as_str() {
             "unicode_text" => (
                 ClipboardRepresentationKind::UnicodeText,
-                Some(
-                    String::from_utf8_lossy(&unicode_text.ok_or(PersistenceError::InvalidData)?)
-                        .into_owned(),
-                ),
+                stored_byte_length,
                 None,
+                Some(bounded_utf8_lossy(
+                    &unicode_text.ok_or(PersistenceError::InvalidData)?,
+                    MAX_DETAIL_TEXT_BYTES,
+                )),
+                None,
+                stored_byte_length > MAX_DETAIL_TEXT_BYTES,
             ),
             "rtf" => (
                 ClipboardRepresentationKind::Rtf,
-                Some(
-                    String::from_utf8_lossy(&rich_bytes.ok_or(PersistenceError::InvalidData)?)
-                        .into_owned(),
-                ),
+                stored_byte_length,
                 None,
+                Some(bounded_utf8_lossy(
+                    &rich_bytes.ok_or(PersistenceError::InvalidData)?,
+                    MAX_DETAIL_TEXT_BYTES,
+                )),
+                None,
+                stored_byte_length > MAX_DETAIL_TEXT_BYTES,
             ),
             "html" => (
                 ClipboardRepresentationKind::Html,
-                Some(
-                    String::from_utf8_lossy(&rich_bytes.ok_or(PersistenceError::InvalidData)?)
-                        .into_owned(),
-                ),
+                stored_byte_length,
                 None,
+                Some(bounded_utf8_lossy(
+                    &rich_bytes.ok_or(PersistenceError::InvalidData)?,
+                    MAX_DETAIL_TEXT_BYTES,
+                )),
+                None,
+                stored_byte_length > MAX_DETAIL_TEXT_BYTES,
             ),
-            "png" => (ClipboardRepresentationKind::Png, None, None),
-            "dib_v5" => (ClipboardRepresentationKind::DibV5, None, None),
+            "png" => (
+                ClipboardRepresentationKind::Png,
+                stored_byte_length,
+                None,
+                None,
+                None,
+                false,
+            ),
+            "dib_v5" => (
+                ClipboardRepresentationKind::DibV5,
+                stored_byte_length,
+                None,
+                None,
+                None,
+                false,
+            ),
             "file_list" => {
-                let paths: Vec<String> = serde_json::from_str(
-                    file_list.as_deref().ok_or(PersistenceError::InvalidData)?,
+                let projection = load_file_list_details(connection, record_id, position)?;
+                (
+                    ClipboardRepresentationKind::FileList,
+                    projection.byte_length,
+                    Some(projection.item_count),
+                    None,
+                    Some(projection.paths),
+                    projection.truncated,
                 )
-                .map_err(|_| PersistenceError::InvalidData)?;
-                validate_file_list(&paths)?;
-                (ClipboardRepresentationKind::FileList, None, Some(paths))
             }
             _ => return Err(PersistenceError::InvalidData),
         };
         details.push(ClipboardRepresentationDetails {
             kind,
             byte_length,
+            item_count,
             text,
             paths,
-            truncated: matches!(
-                kind,
-                ClipboardRepresentationKind::UnicodeText
-                    | ClipboardRepresentationKind::Rtf
-                    | ClipboardRepresentationKind::Html
-            ) && byte_length > MAX_DETAIL_TEXT_BYTES,
+            truncated,
         });
     }
     if details.is_empty() {
         return Err(PersistenceError::InvalidData);
     }
     Ok(details)
+}
+
+struct FileListDetailsProjection {
+    byte_length: usize,
+    item_count: usize,
+    paths: Vec<String>,
+    truncated: bool,
+}
+
+fn load_file_list_details(
+    connection: &Connection,
+    record_id: &str,
+    position: i64,
+) -> Result<FileListDetailsProjection, PersistenceError> {
+    let json_valid: i64 = connection.query_row(
+        "SELECT json_valid(text_value) FROM clipboard_representations
+         WHERE record_id = ?1 AND position = ?2 AND kind = 'file_list'",
+        params![record_id, position],
+        |row| row.get(0),
+    )?;
+    if json_valid != 1 {
+        return Err(PersistenceError::InvalidData);
+    }
+    let (item_count, byte_length, invalid_items): (i64, i64, i64) = connection.query_row(
+        "SELECT COUNT(*),
+                COALESCE(SUM(length(CAST(value AS BLOB))), 0),
+                COALESCE(SUM(CASE
+                    WHEN type != 'text' OR length(CAST(value AS BLOB)) = 0
+                         OR instr(value, char(0)) > 0 THEN 1 ELSE 0 END), 0)
+         FROM json_each((SELECT text_value FROM clipboard_representations
+                         WHERE record_id = ?1 AND position = ?2 AND kind = 'file_list'))",
+        params![record_id, position],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    let item_count = usize::try_from(item_count).map_err(|_| PersistenceError::InvalidData)?;
+    let byte_length = usize::try_from(byte_length).map_err(|_| PersistenceError::InvalidData)?;
+    if item_count == 0
+        || item_count > MAX_FILE_LIST_PATHS
+        || byte_length > MAX_FILE_LIST_BYTES
+        || invalid_items != 0
+    {
+        return Err(PersistenceError::InvalidData);
+    }
+
+    let mut statement = connection.prepare(
+        "SELECT substr(CAST(value AS BLOB), 1, ?3), length(CAST(value AS BLOB))
+         FROM json_each((SELECT text_value FROM clipboard_representations
+                         WHERE record_id = ?1 AND position = ?2 AND kind = 'file_list'))
+         LIMIT ?4",
+    )?;
+    let mut rows = statement.query(params![
+        record_id,
+        position,
+        MAX_DETAIL_FILE_LIST_BYTES as i64,
+        MAX_DETAIL_FILE_LIST_PATHS as i64,
+    ])?;
+    let mut paths = Vec::new();
+    let mut projected_bytes = 0_usize;
+    let mut path_was_truncated = false;
+    while let Some(row) = rows.next()? {
+        let bytes: Vec<u8> = row.get(0)?;
+        let original_length =
+            usize::try_from(row.get::<_, i64>(1)?).map_err(|_| PersistenceError::InvalidData)?;
+        let remaining = MAX_DETAIL_FILE_LIST_BYTES.saturating_sub(projected_bytes);
+        if remaining == 0 {
+            break;
+        }
+        let bounded = &bytes[..bytes.len().min(remaining)];
+        let value = bounded_utf8_lossy(bounded, remaining);
+        projected_bytes = projected_bytes.saturating_add(value.len());
+        path_was_truncated |= original_length > bounded.len();
+        paths.push(value);
+        if path_was_truncated {
+            break;
+        }
+    }
+    Ok(FileListDetailsProjection {
+        byte_length,
+        item_count,
+        truncated: path_was_truncated || paths.len() < item_count,
+        paths,
+    })
+}
+
+fn bounded_utf8_lossy(bytes: &[u8], max_bytes: usize) -> String {
+    let value = String::from_utf8_lossy(&bytes[..bytes.len().min(max_bytes)]);
+    if value.len() <= max_bytes {
+        return value.into_owned();
+    }
+    let mut end = max_bytes;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_owned()
 }
 
 fn content_kind_from_details(details: &[ClipboardRepresentationDetails]) -> ContentKind {
