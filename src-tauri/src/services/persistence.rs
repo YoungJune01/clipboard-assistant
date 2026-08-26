@@ -94,6 +94,7 @@ pub enum PersistenceError {
     FileOperation(std::io::Error),
     Database(rusqlite::Error),
     InvalidData,
+    UnsupportedRepresentationKind(String),
     UnsupportedSchema(i64),
     MigrationLockUnavailable,
     MigrationLockTimeout,
@@ -113,6 +114,12 @@ impl fmt::Display for PersistenceError {
             Self::Database(_) => formatter.write_str("local clipboard storage is unavailable"),
             Self::InvalidData => {
                 formatter.write_str("local clipboard storage contains invalid data")
+            }
+            Self::UnsupportedRepresentationKind(kind) => {
+                write!(
+                    formatter,
+                    "clipboard backup contains unsupported format {kind}"
+                )
             }
             Self::UnsupportedSchema(_) => {
                 formatter.write_str("local clipboard storage schema is unsupported")
@@ -135,6 +142,7 @@ impl Error for PersistenceError {
             Self::Database(error) => Some(error),
             Self::WorkerStart(error) => Some(error),
             Self::InvalidData
+            | Self::UnsupportedRepresentationKind(_)
             | Self::UnsupportedSchema(_)
             | Self::MigrationLockUnavailable
             | Self::MigrationLockTimeout
@@ -651,6 +659,7 @@ impl SqliteRepository {
         source_repository.load_settings()?;
         source_repository.load_excluded_applications()?;
         source_repository.load_groups()?;
+        source_repository.validate_restore_representation_kinds()?;
         source_repository.load_recent_bounded(budget)?;
         drop(source_repository);
 
@@ -694,6 +703,23 @@ impl SqliteRepository {
             groups: self.load_groups()?,
             records: self.load_recent_bounded(budget)?,
         })
+    }
+
+    fn validate_restore_representation_kinds(&self) -> Result<(), PersistenceError> {
+        let connection = lock_unpoisoned(&self.connection);
+        let unsupported = connection
+            .query_row(
+                "SELECT kind FROM clipboard_representations
+                 WHERE kind IN ('rtf', 'html', 'file_list')
+                 ORDER BY kind LIMIT 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if let Some(kind) = unsupported {
+            return Err(PersistenceError::UnsupportedRepresentationKind(kind));
+        }
+        Ok(())
     }
 
     pub fn load_settings(&self) -> Result<UserSettings, PersistenceError> {
@@ -2387,6 +2413,67 @@ mod tests {
                 .is_err()
         );
         assert_eq!(repository.load_recent(10).unwrap(), vec![expected]);
+    }
+
+    #[test]
+    fn restore_rejects_unsupported_representation_kinds_without_modifying_live_database() {
+        let directory = tempdir().unwrap();
+        let repository = SqliteRepository::open(directory.path().join("live.sqlite3")).unwrap();
+        let expected_record = text_record("live", Utc::now(), "keep me");
+        let expected_settings = UserSettings {
+            language: Language::En,
+            retention: RetentionPeriod::Forever,
+            accent_color: AccentColor::Rose,
+            ..UserSettings::default()
+        };
+        repository.save_record(&expected_record).unwrap();
+        repository.save_settings(expected_settings).unwrap();
+
+        for kind in ["rtf", "html", "file_list"] {
+            let source_path = directory
+                .path()
+                .join(format!("unsupported-{kind}.clipbackup"));
+            let source = SqliteRepository::open(source_path.clone()).unwrap();
+            let source_record = text_record("source", Utc::now(), "replace me");
+            source.save_record(&source_record).unwrap();
+            lock_unpoisoned(&source.connection)
+                .execute(
+                    "UPDATE clipboard_representations
+                     SET kind = ?1, text_value = NULL, blob_value = ?2
+                     WHERE record_id = ?3",
+                    params![
+                        kind,
+                        b"UNSUPPORTED_SECRET_PAYLOAD",
+                        source_record.id.as_uuid().to_string()
+                    ],
+                )
+                .unwrap();
+            drop(source);
+
+            let error = repository
+                .restore_from(
+                    &source_path,
+                    RestoreBudget {
+                        max_records: 500,
+                        max_total_bytes: crate::services::session_records::DEFAULT_STORE_BYTES,
+                        max_record_bytes:
+                            crate::services::session_records::MAX_CAPTURE_RECORD_BYTES,
+                    },
+                )
+                .unwrap_err();
+
+            assert!(matches!(
+                &error,
+                PersistenceError::UnsupportedRepresentationKind(error_kind)
+                    if error_kind == kind
+            ));
+            assert!(!error.to_string().contains("UNSUPPORTED_SECRET_PAYLOAD"));
+            assert_eq!(
+                repository.load_recent(10).unwrap(),
+                vec![expected_record.clone()]
+            );
+            assert_eq!(repository.load_settings().unwrap(), expected_settings);
+        }
     }
 
     #[test]
