@@ -568,6 +568,14 @@ impl SessionRecordStore {
         group_id: Option<GroupId>,
     ) -> Result<SessionRecordView, SessionRecordError> {
         let _serial = self.mutation_coordinator.lock();
+        self.update_group_coordinated(id, group_id)
+    }
+
+    pub(crate) fn update_group_coordinated(
+        &self,
+        id: RecordId,
+        group_id: Option<GroupId>,
+    ) -> Result<SessionRecordView, SessionRecordError> {
         self.load_record_for_mutation(id)?;
         let mut state = lock_unpoisoned(&self.state);
         let record = state
@@ -599,6 +607,11 @@ impl SessionRecordStore {
     }
 
     pub fn clear_group(&self, group_id: GroupId) -> usize {
+        let _serial = self.mutation_coordinator.lock();
+        self.clear_group_coordinated(group_id)
+    }
+
+    pub(crate) fn clear_group_coordinated(&self, group_id: GroupId) -> usize {
         let mut state = lock_unpoisoned(&self.state);
         let mut changed = 0;
         for record in &mut state.records {

@@ -142,8 +142,7 @@ impl ClipboardGroups {
         Ok(groups.clone())
     }
 
-    fn delete(&self, id: domain::GroupId) -> Result<(), String> {
-        let _coordinated = self.mutation_coordinator.lock();
+    fn delete_coordinated(&self, id: domain::GroupId) -> Result<(), String> {
         let mut groups = lock_unpoisoned(&self.groups);
         let index = groups
             .iter()
@@ -160,7 +159,7 @@ impl ClipboardGroups {
         Ok(())
     }
 
-    fn contains(&self, id: domain::GroupId) -> bool {
+    fn contains_coordinated(&self, id: domain::GroupId) -> bool {
         lock_unpoisoned(&self.groups)
             .iter()
             .any(|group| group.id == id)
@@ -677,7 +676,8 @@ fn spawn_clipboard_event_drain(
 mod runtime_tests {
     use super::{
         ActiveGroup, ActiveGroupState, ApplicationSettings, ClipboardGroupView, ClipboardGroups,
-        HotkeyStatus, spawn_clipboard_event_drain, spawn_periodic_retention,
+        HotkeyStatus, delete_clipboard_group_state, spawn_clipboard_event_drain,
+        spawn_periodic_retention, update_record_group_state,
     };
     use crate::{
         domain::{
@@ -1019,6 +1019,217 @@ mod runtime_tests {
     }
 
     #[test]
+    fn group_delete_waits_for_restore_and_clears_database_page_cache_and_active_group() {
+        let directory = tempdir().unwrap();
+        let live = SqliteRepository::open(directory.path().join("live.sqlite3")).unwrap();
+        let source_path = directory.path().join("source.clipbackup");
+        let source = SqliteRepository::open(source_path.clone()).unwrap();
+        let group_id = crate::domain::GroupId::new();
+        source.save_group(group_id, "Restored").unwrap();
+        let mut restored_record = crate::domain::ClipboardRecord::from_capture(CapturedClipboard {
+            content_identity: ContentIdentity::new("restored-group-record"),
+            captured_at: Utc::now(),
+            source: SourceIdentity::default(),
+            representations: vec![ClipboardRepresentation::UnicodeText {
+                text: "grouped".to_owned(),
+            }],
+        });
+        restored_record.group_id = Some(group_id);
+        source.save_record(&restored_record).unwrap();
+        drop(source);
+
+        let storage_available = Arc::new(AtomicBool::new(true));
+        let persistence =
+            PersistenceWorker::start(Arc::clone(&live), Arc::clone(&storage_available)).unwrap();
+        let coordinator = Arc::new(PersistenceMutationCoordinator::default());
+        let records = Arc::new(SessionRecordStore::with_persistence_page_and_coordinator(
+            live.load_page(crate::domain::HistoryQuery::default())
+                .unwrap(),
+            Arc::clone(&persistence) as Arc<dyn RecordPersistence>,
+            storage_available,
+            Arc::clone(&coordinator),
+        ));
+        let groups = Arc::new(ClipboardGroups {
+            groups: Mutex::new(Vec::new()),
+            repository: Some(Arc::clone(&live)),
+            mutation_coordinator: coordinator,
+        });
+        let active = Arc::new(ActiveGroupState(Mutex::new(ActiveGroup::All)));
+        let (restored_tx, restored_rx) = std::sync::mpsc::sync_channel(1);
+        let (publish_tx, publish_rx) = std::sync::mpsc::sync_channel(1);
+        let restoring = {
+            let records = Arc::clone(&records);
+            let groups = Arc::clone(&groups);
+            let active = Arc::clone(&active);
+            let persistence = Arc::clone(&persistence);
+            std::thread::spawn(move || {
+                records.with_restore_guard(|guard| {
+                    let restored = persistence
+                        .restore(
+                            source_path,
+                            RestoreBudget {
+                                max_records: MAX_SESSION_RECORDS,
+                                max_total_bytes: DEFAULT_STORE_BYTES,
+                                max_record_bytes: MAX_CAPTURE_RECORD_BYTES,
+                            },
+                        )
+                        .unwrap();
+                    restored_tx.send(()).unwrap();
+                    publish_rx.recv().unwrap();
+                    guard.apply_page(crate::domain::HistoryQuery::default(), restored.page);
+                    groups.replace_all_coordinated(restored.groups);
+                    active.set(ActiveGroup::Group(group_id));
+                });
+            })
+        };
+        restored_rx.recv().unwrap();
+        let (deleted_tx, deleted_rx) = std::sync::mpsc::sync_channel(1);
+        let deleting = {
+            let groups = Arc::clone(&groups);
+            let records = Arc::clone(&records);
+            let active = Arc::clone(&active);
+            std::thread::spawn(move || {
+                deleted_tx
+                    .send(delete_clipboard_group_state(
+                        group_id, &groups, &records, &active,
+                    ))
+                    .unwrap()
+            })
+        };
+
+        assert!(
+            deleted_rx
+                .recv_timeout(std::time::Duration::from_millis(50))
+                .is_err()
+        );
+        publish_tx.send(()).unwrap();
+        restoring.join().unwrap();
+        assert!(deleted_rx.recv().unwrap().unwrap());
+        deleting.join().unwrap();
+
+        assert!(groups.list().is_empty());
+        assert_eq!(active.current(), ActiveGroup::Ungrouped);
+        assert!(live.load_groups().unwrap().is_empty());
+        assert_eq!(
+            live.record_details(restored_record.id).unwrap().group_id,
+            None
+        );
+        assert_eq!(
+            records
+                .list()
+                .iter()
+                .find(|view| view.id == restored_record.id)
+                .and_then(|view| view.group_id),
+            None
+        );
+    }
+
+    #[test]
+    fn record_group_update_waits_for_restore_and_rejects_a_removed_group() {
+        let directory = tempdir().unwrap();
+        let live = SqliteRepository::open(directory.path().join("live.sqlite3")).unwrap();
+        let stale_group = crate::domain::GroupId::new();
+        live.save_group(stale_group, "Before restore").unwrap();
+        let source_path = directory.path().join("source.clipbackup");
+        let source = SqliteRepository::open(source_path.clone()).unwrap();
+        let restored_record = crate::domain::ClipboardRecord::from_capture(CapturedClipboard {
+            content_identity: ContentIdentity::new("restored-ungrouped-record"),
+            captured_at: Utc::now(),
+            source: SourceIdentity::default(),
+            representations: vec![ClipboardRepresentation::UnicodeText {
+                text: "ungrouped".to_owned(),
+            }],
+        });
+        source.save_record(&restored_record).unwrap();
+        drop(source);
+
+        let storage_available = Arc::new(AtomicBool::new(true));
+        let persistence =
+            PersistenceWorker::start(Arc::clone(&live), Arc::clone(&storage_available)).unwrap();
+        let coordinator = Arc::new(PersistenceMutationCoordinator::default());
+        let records = Arc::new(SessionRecordStore::with_persistence_page_and_coordinator(
+            live.load_page(crate::domain::HistoryQuery::default())
+                .unwrap(),
+            Arc::clone(&persistence) as Arc<dyn RecordPersistence>,
+            storage_available,
+            Arc::clone(&coordinator),
+        ));
+        let groups = Arc::new(ClipboardGroups {
+            groups: Mutex::new(vec![ClipboardGroupView {
+                id: stale_group,
+                name: "Before restore".to_owned(),
+            }]),
+            repository: Some(Arc::clone(&live)),
+            mutation_coordinator: coordinator,
+        });
+        let (restored_tx, restored_rx) = std::sync::mpsc::sync_channel(1);
+        let (publish_tx, publish_rx) = std::sync::mpsc::sync_channel(1);
+        let restoring = {
+            let records = Arc::clone(&records);
+            let groups = Arc::clone(&groups);
+            let persistence = Arc::clone(&persistence);
+            std::thread::spawn(move || {
+                records.with_restore_guard(|guard| {
+                    let restored = persistence
+                        .restore(
+                            source_path,
+                            RestoreBudget {
+                                max_records: MAX_SESSION_RECORDS,
+                                max_total_bytes: DEFAULT_STORE_BYTES,
+                                max_record_bytes: MAX_CAPTURE_RECORD_BYTES,
+                            },
+                        )
+                        .unwrap();
+                    restored_tx.send(()).unwrap();
+                    publish_rx.recv().unwrap();
+                    guard.apply_page(crate::domain::HistoryQuery::default(), restored.page);
+                    groups.replace_all_coordinated(restored.groups);
+                });
+            })
+        };
+        restored_rx.recv().unwrap();
+        let (updated_tx, updated_rx) = std::sync::mpsc::sync_channel(1);
+        let updating = {
+            let groups = Arc::clone(&groups);
+            let records = Arc::clone(&records);
+            std::thread::spawn(move || {
+                updated_tx
+                    .send(update_record_group_state(
+                        restored_record.id,
+                        Some(stale_group),
+                        &groups,
+                        &records,
+                    ))
+                    .unwrap()
+            })
+        };
+
+        assert!(
+            updated_rx
+                .recv_timeout(std::time::Duration::from_millis(50))
+                .is_err()
+        );
+        publish_tx.send(()).unwrap();
+        restoring.join().unwrap();
+        assert!(updated_rx.recv().unwrap().is_err());
+        updating.join().unwrap();
+
+        assert!(!groups.contains_coordinated(stale_group));
+        assert_eq!(
+            live.record_details(restored_record.id).unwrap().group_id,
+            None
+        );
+        assert_eq!(
+            records
+                .list()
+                .iter()
+                .find(|view| view.id == restored_record.id)
+                .and_then(|view| view.group_id),
+            None
+        );
+    }
+
+    #[test]
     fn periodic_retention_runs_while_idle_and_stops_promptly() {
         let (ticks, observed) = std::sync::mpsc::channel();
         let (stop, thread) =
@@ -1234,12 +1445,13 @@ fn set_active_group(
     active: tauri::State<'_, Arc<ActiveGroupState>>,
     app: tauri::AppHandle,
 ) -> Result<ActiveGroupView, String> {
+    let _coordinated = groups.mutation_coordinator.lock();
     let value = match kind.as_str() {
         "all" => ActiveGroup::All,
         "ungrouped" => ActiveGroup::Ungrouped,
         "group" => {
             let id = group_id.ok_or_else(|| "clipboard group is required".to_owned())?;
-            if !groups.contains(id) {
+            if !groups.contains_coordinated(id) {
                 return Err("clipboard group is no longer available".to_owned());
             }
             ActiveGroup::Group(id)
@@ -1302,10 +1514,9 @@ fn delete_clipboard_group(
     active: tauri::State<'_, Arc<ActiveGroupState>>,
     app: tauri::AppHandle,
 ) -> Result<(), String> {
-    groups.delete(group_id)?;
-    records.clear_group(group_id);
-    if active.current() == ActiveGroup::Group(group_id) {
-        active.set(ActiveGroup::Ungrouped);
+    let active_changed =
+        delete_clipboard_group_state(group_id, groups.inner(), records.inner(), active.inner())?;
+    if active_changed {
         let _ = app.emit(
             "active-group-changed",
             ActiveGroupView::from(ActiveGroup::Ungrouped),
@@ -1317,6 +1528,23 @@ fn delete_clipboard_group(
 }
 
 #[cfg(windows)]
+fn delete_clipboard_group_state(
+    group_id: domain::GroupId,
+    groups: &ClipboardGroups,
+    records: &SessionRecordStore,
+    active: &ActiveGroupState,
+) -> Result<bool, String> {
+    let _coordinated = groups.mutation_coordinator.lock();
+    groups.delete_coordinated(group_id)?;
+    records.clear_group_coordinated(group_id);
+    let active_changed = active.current() == ActiveGroup::Group(group_id);
+    if active_changed {
+        active.set(ActiveGroup::Ungrouped);
+    }
+    Ok(active_changed)
+}
+
+#[cfg(windows)]
 #[tauri::command]
 fn update_record_group(
     record_id: domain::RecordId,
@@ -1325,14 +1553,25 @@ fn update_record_group(
     records: tauri::State<'_, Arc<SessionRecordStore>>,
     app: tauri::AppHandle,
 ) -> Result<SessionRecordView, String> {
-    if group_id.is_some_and(|id| !groups.contains(id)) {
-        return Err("clipboard group is no longer available".to_owned());
-    }
-    let result = SessionRecordCommands::new(records.inner())
-        .update_group(record_id, group_id)
-        .map_err(|error| error.to_string());
+    let result = update_record_group_state(record_id, group_id, groups.inner(), records.inner());
     let _ = app.emit("clipboard-records-changed", ());
     result
+}
+
+#[cfg(windows)]
+fn update_record_group_state(
+    record_id: domain::RecordId,
+    group_id: Option<domain::GroupId>,
+    groups: &ClipboardGroups,
+    records: &SessionRecordStore,
+) -> Result<SessionRecordView, String> {
+    let _coordinated = groups.mutation_coordinator.lock();
+    if group_id.is_some_and(|id| !groups.contains_coordinated(id)) {
+        return Err("clipboard group is no longer available".to_owned());
+    }
+    records
+        .update_group_coordinated(record_id, group_id)
+        .map_err(|error| error.to_string())
 }
 
 #[cfg(windows)]
