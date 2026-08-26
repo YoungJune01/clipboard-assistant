@@ -51,6 +51,9 @@ const CF_DIBV5_FORMAT: u32 = 17;
 const MAX_TEXT_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
 const MAX_IMAGE_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
 const MAX_CAPTURE_PAYLOAD_BYTES: usize = MAX_CAPTURE_RECORD_BYTES;
+// Resource boundary only; file contents are not copied.
+const MAX_CAPTURE_FILE_COUNT: usize = 4096;
+const FILE_PATH_RESOURCE_OVERHEAD_BYTES: usize = size_of::<String>();
 const PRODUCT_WRITE_TRANSACTION_TIMEOUT: Duration = Duration::from_secs(2);
 const PRODUCT_WRITE_PENDING_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PENDING_EVENTS: usize = 1024;
@@ -403,6 +406,11 @@ fn validate_representations(
     if representations.is_empty() {
         return Err(ClipboardWriteError::Empty);
     }
+    if checked_representation_bytes(representations)
+        .is_none_or(|bytes| bytes > MAX_CAPTURE_RECORD_BYTES)
+    {
+        return Err(ClipboardWriteError::PayloadTooLarge);
+    }
     for (index, representation) in representations.iter().enumerate() {
         if representations[..index]
             .iter()
@@ -517,6 +525,127 @@ trait ClipboardPendingMemory {
     fn transfer(&mut self);
 }
 
+trait GlobalMemoryApi: Clone {
+    type Handle: Copy;
+
+    fn unlock(&self, handle: Self::Handle) -> windows::core::Result<()>;
+    fn free(&self, handle: Self::Handle);
+}
+
+struct OwnedGlobalMemory<A: GlobalMemoryApi> {
+    handle: Option<A::Handle>,
+    locked: bool,
+    api: A,
+}
+
+impl<A: GlobalMemoryApi> OwnedGlobalMemory<A> {
+    fn new(handle: A::Handle, api: A) -> Self {
+        Self {
+            handle: Some(handle),
+            locked: false,
+            api,
+        }
+    }
+
+    fn mark_locked(&mut self) {
+        self.locked = true;
+    }
+
+    fn unlock(&mut self) -> windows::core::Result<()> {
+        if !self.locked {
+            return Ok(());
+        }
+        let result = self
+            .api
+            .unlock(self.handle.expect("owned global memory must have a handle"));
+        if result.is_ok() {
+            self.locked = false;
+        }
+        result
+    }
+
+    #[cfg(test)]
+    fn is_locked(&self) -> bool {
+        self.locked
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct FakeableGlobalMemoryApi {
+    outcomes: Arc<Mutex<VecDeque<bool>>>,
+    operations: Arc<Mutex<Vec<&'static str>>>,
+}
+
+#[cfg(test)]
+impl FakeableGlobalMemoryApi {
+    fn new(outcomes: impl IntoIterator<Item = bool>) -> Self {
+        Self {
+            outcomes: Arc::new(Mutex::new(outcomes.into_iter().collect())),
+            operations: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    fn operations(&self) -> Vec<&'static str> {
+        self.operations.lock().unwrap().clone()
+    }
+}
+
+#[cfg(test)]
+impl GlobalMemoryApi for FakeableGlobalMemoryApi {
+    type Handle = usize;
+
+    fn unlock(&self, _handle: Self::Handle) -> windows::core::Result<()> {
+        self.operations.lock().unwrap().push("unlock");
+        if self.outcomes.lock().unwrap().pop_front().unwrap_or(true) {
+            Ok(())
+        } else {
+            Err(windows::core::Error::from_win32())
+        }
+    }
+
+    fn free(&self, _handle: Self::Handle) {
+        self.operations.lock().unwrap().push("free");
+    }
+}
+
+#[cfg(test)]
+impl OwnedGlobalMemory<FakeableGlobalMemoryApi> {
+    fn new_for_test(handle: usize, locked: bool, api: FakeableGlobalMemoryApi) -> Self {
+        Self {
+            handle: Some(handle),
+            locked,
+            api,
+        }
+    }
+}
+
+impl<A: GlobalMemoryApi> ClipboardPendingMemory for OwnedGlobalMemory<A> {
+    type Handle = A::Handle;
+
+    fn handle(&self) -> Self::Handle {
+        assert!(!self.locked, "locked global memory cannot be transferred");
+        self.handle
+            .expect("pending global memory must own its handle")
+    }
+
+    fn transfer(&mut self) {
+        assert!(!self.locked, "locked global memory cannot be transferred");
+        self.handle = None;
+    }
+}
+
+impl<A: GlobalMemoryApi> Drop for OwnedGlobalMemory<A> {
+    fn drop(&mut self) {
+        if self.locked && self.unlock().is_err() {
+            return;
+        }
+        if let Some(handle) = self.handle.take() {
+            self.api.free(handle);
+        }
+    }
+}
+
 trait ClipboardGlobalAllocator {
     type Memory: ClipboardPendingMemory;
 
@@ -559,6 +688,21 @@ where
     Ok((pending, clipboard))
 }
 
+#[cfg(test)]
+fn prepare_representations_then_open<A, O, F>(
+    representations: &[ClipboardRepresentation],
+    formats: RegisteredFormats,
+    allocator: &A,
+    open: F,
+) -> Result<PreparedClipboardWrite<A::Memory, O>, ClipboardWriteError>
+where
+    A: ClipboardGlobalAllocator,
+    F: FnOnce() -> Result<O, ClipboardWriteError>,
+{
+    let prepared = prepare_representations(representations, formats)?;
+    prepare_then_open(&prepared, allocator, open)
+}
+
 trait ClipboardTransferApi<H: Copy> {
     fn empty(&mut self) -> Result<(), ClipboardWriteError>;
     fn set(&mut self, format: u32, handle: H) -> Result<(), ClipboardWriteError>;
@@ -576,39 +720,32 @@ fn transfer_pending_payloads<M: ClipboardPendingMemory>(
     Ok(())
 }
 
-struct PendingGlobalMemory(Option<HGLOBAL>);
+#[derive(Clone, Copy)]
+struct Win32GlobalMemoryApi;
 
-impl ClipboardPendingMemory for PendingGlobalMemory {
+impl GlobalMemoryApi for Win32GlobalMemoryApi {
     type Handle = HGLOBAL;
 
-    fn handle(&self) -> Self::Handle {
-        self.0.expect("pending global memory must own its handle")
+    fn unlock(&self, handle: Self::Handle) -> windows::core::Result<()> {
+        global_unlock(handle)
     }
 
-    fn transfer(&mut self) {
-        self.0 = None;
-    }
-}
-
-impl Drop for PendingGlobalMemory {
-    fn drop(&mut self) {
-        if let Some(memory) = self.0.take() {
-            let _ = unsafe { GlobalFree(Some(memory)) };
-        }
+    fn free(&self, handle: Self::Handle) {
+        let _ = unsafe { GlobalFree(Some(handle)) };
     }
 }
 
 struct Win32GlobalAllocator;
 
 impl ClipboardGlobalAllocator for Win32GlobalAllocator {
-    type Memory = PendingGlobalMemory;
+    type Memory = OwnedGlobalMemory<Win32GlobalMemoryApi>;
 
     fn allocate_and_copy(&self, bytes: &[u8]) -> Result<Self::Memory, ClipboardWriteError> {
         let memory =
             unsafe { GlobalAlloc(GMEM_MOVEABLE, bytes.len().max(1)) }.map_err(|error| {
                 ClipboardWriteError::Windows(ClipboardWriteOperation::Allocate, error)
             })?;
-        let pending = PendingGlobalMemory(Some(memory));
+        let mut pending = OwnedGlobalMemory::new(memory, Win32GlobalMemoryApi);
         let pointer = unsafe { GlobalLock(memory) }.cast::<u8>();
         if pointer.is_null() {
             return Err(ClipboardWriteError::Windows(
@@ -616,10 +753,11 @@ impl ClipboardGlobalAllocator for Win32GlobalAllocator {
                 windows::core::Error::from_win32(),
             ));
         }
+        pending.mark_locked();
         if !bytes.is_empty() {
             unsafe { ptr::copy_nonoverlapping(bytes.as_ptr(), pointer, bytes.len()) };
         }
-        global_unlock(memory).map_err(|error| {
+        pending.unlock().map_err(|error| {
             ClipboardWriteError::Windows(ClipboardWriteOperation::Unlock, error)
         })?;
         Ok(pending)
@@ -657,7 +795,7 @@ fn prepare_representations(
     formats: RegisteredFormats,
 ) -> Result<Vec<PreparedClipboardPayload>, ClipboardWriteError> {
     validate_representations(representations)?;
-    representations
+    let prepared: Vec<_> = representations
         .iter()
         .map(|representation| {
             let (format, bytes) = match representation {
@@ -682,7 +820,19 @@ fn prepare_representations(
             };
             Ok(PreparedClipboardPayload { format, bytes })
         })
-        .collect()
+        .collect::<Result<_, ClipboardWriteError>>()?;
+    let prepared_bytes = prepared.iter().try_fold(0_usize, |total, payload| {
+        total
+            .checked_add(payload.bytes.len())
+            .and_then(|bytes| {
+                bytes.checked_add(crate::services::session_records::REPRESENTATION_OVERHEAD_BYTES)
+            })
+            .ok_or(ClipboardWriteError::PayloadTooLarge)
+    })?;
+    if prepared_bytes > MAX_CAPTURE_RECORD_BYTES {
+        return Err(ClipboardWriteError::PayloadTooLarge);
+    }
+    Ok(prepared)
 }
 
 fn validate_file_paths(paths: &[String]) -> Result<(), ClipboardWriteError> {
@@ -1509,23 +1659,87 @@ impl ClipboardReadError {
             (None, None) => unreachable!("combined clipboard result must contain an error"),
         }
     }
+
+    fn is_cleanup_failure(&self) -> bool {
+        matches!(
+            self,
+            Self::Windows(ClipboardReadOperation::GlobalUnlock, _) | Self::OperationAndClose { .. }
+        )
+    }
 }
 
-struct ClipboardGuard {
+trait ClipboardCloser: Clone {
+    fn close(&self) -> windows::core::Result<()>;
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct FakeableClipboardCloser {
+    outcomes: Arc<Mutex<VecDeque<bool>>>,
+    calls: Arc<Mutex<usize>>,
+}
+
+#[cfg(test)]
+impl FakeableClipboardCloser {
+    fn new(outcomes: impl IntoIterator<Item = bool>) -> Self {
+        Self {
+            outcomes: Arc::new(Mutex::new(outcomes.into_iter().collect())),
+            calls: Arc::new(Mutex::new(0)),
+        }
+    }
+
+    fn calls(&self) -> usize {
+        *self.calls.lock().unwrap()
+    }
+}
+
+#[cfg(test)]
+impl ClipboardCloser for FakeableClipboardCloser {
+    fn close(&self) -> windows::core::Result<()> {
+        *self.calls.lock().unwrap() += 1;
+        if self.outcomes.lock().unwrap().pop_front().unwrap_or(true) {
+            Ok(())
+        } else {
+            Err(windows::core::Error::from_win32())
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Win32ClipboardCloser;
+
+impl ClipboardCloser for Win32ClipboardCloser {
+    fn close(&self) -> windows::core::Result<()> {
+        unsafe { CloseClipboard() }
+    }
+}
+
+struct ClipboardGuard<C: ClipboardCloser = Win32ClipboardCloser> {
     open: bool,
+    closer: C,
 }
 
 impl ClipboardGuard {
     fn open_with_retry() -> Result<Self, ClipboardReadError> {
         const DELAYS_MS: [u64; 5] = [5, 10, 20, 40, 80];
         let mut last_error = match unsafe { OpenClipboard(None) } {
-            Ok(()) => return Ok(Self { open: true }),
+            Ok(()) => {
+                return Ok(Self {
+                    open: true,
+                    closer: Win32ClipboardCloser,
+                });
+            }
             Err(error) => error,
         };
         for delay in DELAYS_MS {
             thread::sleep(std::time::Duration::from_millis(delay));
             match unsafe { OpenClipboard(None) } {
-                Ok(()) => return Ok(Self { open: true }),
+                Ok(()) => {
+                    return Ok(Self {
+                        open: true,
+                        closer: Win32ClipboardCloser,
+                    });
+                }
                 Err(error) => last_error = error,
             }
         }
@@ -1534,20 +1748,29 @@ impl ClipboardGuard {
             last_error,
         ))
     }
+}
 
+impl<C: ClipboardCloser> ClipboardGuard<C> {
     fn close(mut self) -> windows::core::Result<()> {
-        let result = unsafe { CloseClipboard() };
-        self.open = false;
+        let result = self.closer.close();
+        if result.is_ok() {
+            self.open = false;
+        }
         result
     }
 }
 
-impl Drop for ClipboardGuard {
+#[cfg(test)]
+impl ClipboardGuard<FakeableClipboardCloser> {
+    fn new_for_test(closer: FakeableClipboardCloser) -> Self {
+        Self { open: true, closer }
+    }
+}
+
+impl<C: ClipboardCloser> Drop for ClipboardGuard<C> {
     fn drop(&mut self) {
-        if self.open {
-            unsafe {
-                let _ = CloseClipboard();
-            }
+        if self.open && self.closer.close().is_ok() {
+            self.open = false;
         }
     }
 }
@@ -1597,7 +1820,7 @@ impl ClipboardMemoryReader for Win32ClipboardMemory {
 
     fn copy_and_unlock(
         &self,
-        lock: Self::Locked,
+        mut lock: Self::Locked,
         size: usize,
     ) -> Result<Vec<u8>, ClipboardReadError> {
         let bytes = unsafe { std::slice::from_raw_parts(lock.pointer.cast::<u8>(), size) }.to_vec();
@@ -1710,7 +1933,7 @@ fn read_bounded_representations(
             .collect();
     image_candidates.sort_unstable_by_key(|(_, size, _)| *size);
     for (format, size, png) in image_candidates {
-        if let Some(bytes) = copy_format_unchanged(reader, format, size) {
+        if let Some(bytes) = copy_format_unchanged(reader, format, size)? {
             representations.push(if png {
                 ClipboardRepresentation::Png { bytes }
             } else {
@@ -1733,7 +1956,7 @@ fn read_bounded_representations_with_files(
 
     if let Some(size) = probe_format_size(reader, CF_UNICODETEXT_FORMAT)
         .filter(|size| text_source_fits_budget(*size, budget))
-        && let Some(bytes) = copy_format_unchanged(reader, CF_UNICODETEXT_FORMAT, size)
+        && let Some(bytes) = copy_format_unchanged(reader, CF_UNICODETEXT_FORMAT, size)?
         && let Ok(text) = decode_unicode_text(&bytes)
     {
         push_if_fits(
@@ -1747,7 +1970,7 @@ fn read_bounded_representations_with_files(
         let remaining = budget.saturating_sub(representation_bytes(&representations));
         if let Some(size) = probe_format_size(reader, format)
             .filter(|size| binary_source_fits_budget(*size, remaining))
-            && let Some(bytes) = copy_format_unchanged(reader, format, size)
+            && let Some(bytes) = copy_format_unchanged(reader, format, size)?
         {
             let representation = if rich {
                 ClipboardRepresentation::Rtf { bytes }
@@ -1772,7 +1995,7 @@ fn read_bounded_representations_with_files(
         .collect();
     image_candidates.sort_unstable_by_key(|(_, size, _)| *size);
     for (format, size, png) in image_candidates {
-        if let Some(bytes) = copy_format_unchanged(reader, format, size) {
+        if let Some(bytes) = copy_format_unchanged(reader, format, size)? {
             representations.push(if png {
                 ClipboardRepresentation::Png { bytes }
             } else {
@@ -1793,8 +2016,12 @@ fn copy_format_unchanged(
     reader: &impl ClipboardMemoryReader,
     format: u32,
     expected_size: usize,
-) -> Option<Vec<u8>> {
-    copy_unchanged(reader, format, expected_size).ok().flatten()
+) -> Result<Option<Vec<u8>>, ClipboardReadError> {
+    match copy_unchanged(reader, format, expected_size) {
+        Ok(bytes) => Ok(bytes),
+        Err(error) if error.is_cleanup_failure() => Err(error),
+        Err(_) => Ok(None),
+    }
 }
 
 fn binary_source_fits_budget(source_bytes: usize, budget: usize) -> bool {
@@ -1827,7 +2054,7 @@ fn read_file_list(
     let Some(count) = reader.count()? else {
         return Ok(());
     };
-    if count == 0 {
+    if count == 0 || count > MAX_CAPTURE_FILE_COUNT {
         return Ok(());
     }
     let remaining = budget.saturating_sub(representation_bytes(representations));
@@ -1835,8 +2062,15 @@ fn read_file_list(
         remaining.saturating_sub(crate::services::session_records::REPRESENTATION_OVERHEAD_BYTES);
     let mut paths = Vec::new();
     let mut utf8_bytes = 0_usize;
+    let mut path_overhead_bytes = 0_usize;
     for index in 0..count {
         let length = reader.path_len(index)?;
+        if length == 0 {
+            return Err(ClipboardReadError::InvalidFileList);
+        }
+        path_overhead_bytes = path_overhead_bytes
+            .checked_add(FILE_PATH_RESOURCE_OVERHEAD_BYTES)
+            .ok_or(ClipboardReadError::InvalidFileList)?;
         let units = length
             .checked_add(1)
             .ok_or(ClipboardReadError::InvalidFileList)?;
@@ -1845,7 +2079,8 @@ fn read_file_list(
             .ok_or(ClipboardReadError::InvalidFileList)?;
         if allocation_bytes > MAX_CAPTURE_PAYLOAD_BYTES
             || utf8_bytes
-                .checked_add(length)
+                .checked_add(path_overhead_bytes)
+                .and_then(|bytes| bytes.checked_add(length))
                 .is_none_or(|bytes| bytes > payload_budget)
         {
             return Ok(());
@@ -1863,7 +2098,10 @@ fn read_file_list(
         utf8_bytes = utf8_bytes
             .checked_add(path.len())
             .ok_or(ClipboardReadError::InvalidFileList)?;
-        if utf8_bytes > payload_budget {
+        if utf8_bytes
+            .checked_add(path_overhead_bytes)
+            .is_none_or(|bytes| bytes > payload_budget)
+        {
             return Ok(());
         }
         paths.push(path);
@@ -1904,9 +2142,10 @@ fn text_source_fits_budget(source_bytes: usize, budget: usize) -> bool {
         .is_some_and(|bytes| bytes <= budget)
 }
 
-struct GlobalMemoryLock {
-    memory: HGLOBAL,
+struct GlobalMemoryLock<A: GlobalMemoryApi = Win32GlobalMemoryApi> {
+    memory: A::Handle,
     pointer: *mut std::ffi::c_void,
+    api: A,
 }
 
 impl GlobalMemoryLock {
@@ -1918,23 +2157,45 @@ impl GlobalMemoryLock {
                 windows::core::Error::from_win32(),
             ))
         } else {
-            Ok(Self { memory, pointer })
+            Ok(Self {
+                memory,
+                pointer,
+                api: Win32GlobalMemoryApi,
+            })
         }
     }
+}
 
-    fn unlock(mut self) -> Result<(), ClipboardReadError> {
-        let result = global_unlock(self.memory);
-        self.pointer = std::ptr::null_mut();
+impl<A: GlobalMemoryApi> GlobalMemoryLock<A> {
+    fn unlock(&mut self) -> Result<(), ClipboardReadError> {
+        let result = self.api.unlock(self.memory);
+        if result.is_ok() {
+            self.pointer = std::ptr::null_mut();
+        }
         result.map_err(|error| {
             ClipboardReadError::windows(ClipboardReadOperation::GlobalUnlock, error)
         })
     }
+
+    #[cfg(test)]
+    fn new_for_test(memory: A::Handle, pointer: *mut std::ffi::c_void, api: A) -> Self {
+        Self {
+            memory,
+            pointer,
+            api,
+        }
+    }
+
+    #[cfg(test)]
+    fn is_locked(&self) -> bool {
+        !self.pointer.is_null()
+    }
 }
 
-impl Drop for GlobalMemoryLock {
+impl<A: GlobalMemoryApi> Drop for GlobalMemoryLock<A> {
     fn drop(&mut self) {
-        if !self.pointer.is_null() {
-            let _ = global_unlock(self.memory);
+        if !self.pointer.is_null() && self.api.unlock(self.memory).is_ok() {
+            self.pointer = std::ptr::null_mut();
         }
     }
 }
@@ -2604,9 +2865,9 @@ mod tests {
         combine_clipboard_operation_and_close, decode_unicode_text, finish_product_write,
         latest_clipboard_event_channel, latest_clipboard_event_channel_with_policy,
         orchestrate_listener_initialization, prepare_pending_payloads, prepare_representations,
-        prepare_then_open, read_bounded_representations, read_bounded_representations_with_files,
-        representation_bytes, route_event, serialize_dropfiles, transfer_pending_payloads,
-        validate_representations,
+        prepare_representations_then_open, prepare_then_open, read_bounded_representations,
+        read_bounded_representations_with_files, representation_bytes, route_event,
+        serialize_dropfiles, transfer_pending_payloads, validate_representations,
     };
     use crate::domain::{
         CapturedClipboard, ClipboardRepresentation, ContentIdentity, SourceIdentity,
@@ -3354,6 +3615,7 @@ mod tests {
         lock_errors: Vec<u32>,
         locked_sizes: HashMap<u32, Result<usize, ()>>,
         copy_errors: Vec<u32>,
+        unlock_errors: Vec<u32>,
         copies: RefCell<Vec<u32>>,
         operations: RefCell<Vec<(&'static str, u32)>>,
     }
@@ -3410,6 +3672,12 @@ mod tests {
             self.operations.borrow_mut().push(("copy", locked.format));
             if self.copy_errors.contains(&locked.format) {
                 return Err(ClipboardReadError::windows(
+                    super::ClipboardReadOperation::GetData,
+                    windows::core::Error::from_win32(),
+                ));
+            }
+            if self.unlock_errors.contains(&locked.format) {
+                return Err(ClipboardReadError::windows(
                     super::ClipboardReadOperation::GlobalUnlock,
                     windows::core::Error::from_win32(),
                 ));
@@ -3424,6 +3692,7 @@ mod tests {
     #[derive(Default)]
     struct FakeClipboardFiles {
         paths: Vec<Vec<u16>>,
+        count_override: Option<usize>,
         fail_length_at: Option<usize>,
         fail_data_at: Option<usize>,
         queried: RefCell<Vec<usize>>,
@@ -3431,7 +3700,9 @@ mod tests {
 
     impl ClipboardFileReader for FakeClipboardFiles {
         fn count(&self) -> Result<Option<usize>, ClipboardReadError> {
-            Ok((!self.paths.is_empty()).then_some(self.paths.len()))
+            Ok(self
+                .count_override
+                .or_else(|| (!self.paths.is_empty()).then_some(self.paths.len())))
         }
 
         fn path_len(&self, index: usize) -> Result<usize, ClipboardReadError> {
@@ -3672,6 +3943,220 @@ mod tests {
         }
     }
 
+    #[test]
+    fn read_unlock_failure_is_not_downgraded_to_a_missing_format() {
+        let formats = RegisteredFormats {
+            png: 100,
+            rtf: 101,
+            html: 102,
+        };
+        let reader = FakeClipboardMemory {
+            payloads: HashMap::from([(CF_UNICODETEXT_FORMAT, [b'o', 0, b'k', 0, 0, 0].to_vec())]),
+            unlock_errors: vec![CF_UNICODETEXT_FORMAT],
+            ..Default::default()
+        };
+
+        let result = read_bounded_representations_with_files(
+            &reader,
+            &FakeClipboardFiles::default(),
+            formats,
+            1024,
+        );
+
+        assert!(matches!(
+            result,
+            Err(ClipboardReadError::Windows(
+                super::ClipboardReadOperation::GlobalUnlock,
+                _
+            ))
+        ));
+    }
+
+    #[test]
+    fn locked_guard_retries_unlock_on_drop_and_frees_only_after_success() {
+        let api = super::FakeableGlobalMemoryApi::new([false, true]);
+        {
+            let mut memory = super::OwnedGlobalMemory::new_for_test(7, true, api.clone());
+            assert!(memory.unlock().is_err());
+            assert!(memory.is_locked());
+        }
+        assert_eq!(api.operations(), ["unlock", "unlock", "free"]);
+    }
+
+    #[test]
+    fn read_lock_retains_locked_state_and_retries_unlock_on_drop() {
+        let api = super::FakeableGlobalMemoryApi::new([false, true]);
+        let mut lock = super::GlobalMemoryLock::new_for_test(
+            7,
+            std::ptr::dangling_mut::<std::ffi::c_void>(),
+            api.clone(),
+        );
+        assert!(lock.is_locked());
+        assert!(lock.unlock().is_err());
+        assert!(lock.is_locked());
+        drop(lock);
+
+        assert_eq!(api.operations(), ["unlock", "unlock"]);
+    }
+
+    #[test]
+    fn read_unlock_and_close_failures_are_aggregated() {
+        let operation = ClipboardReadError::windows(
+            super::ClipboardReadOperation::GlobalUnlock,
+            windows::core::Error::from_win32(),
+        );
+        let combined = combine_clipboard_operation_and_close::<(), _, _>(
+            Err(operation),
+            Err(windows::core::Error::from_win32()),
+        )
+        .map_err(ClipboardReadError::from_combined)
+        .unwrap_err();
+
+        assert!(matches!(
+            combined,
+            ClipboardReadError::OperationAndClose { operation, .. }
+                if matches!(
+                    *operation,
+                    ClipboardReadError::Windows(
+                        super::ClipboardReadOperation::GlobalUnlock,
+                        _
+                    )
+                )
+        ));
+    }
+
+    #[test]
+    fn read_clipboard_guard_retries_close_on_drop() {
+        let closer = super::FakeableClipboardCloser::new([false, true]);
+        {
+            let guard = super::ClipboardGuard::new_for_test(closer.clone());
+            assert!(guard.close().is_err());
+        }
+        assert_eq!(closer.calls(), 2);
+    }
+
+    #[test]
+    fn publication_rejects_aggregate_logical_budget_before_preparation() {
+        let formats = RegisteredFormats {
+            png: 100,
+            rtf: 101,
+            html: 102,
+        };
+        let half = MAX_CAPTURE_PAYLOAD_BYTES / 2;
+        let representations = [
+            ClipboardRepresentation::Rtf {
+                bytes: vec![1; half],
+            },
+            ClipboardRepresentation::Html {
+                bytes: vec![2; half],
+            },
+        ];
+
+        let state = FakeAllocationState::default();
+        let allocator = FakeAllocator {
+            fail_at: None,
+            failure: super::ClipboardWriteOperation::Allocate,
+            state: state.clone(),
+        };
+        let result =
+            prepare_representations_then_open(&representations, formats, &allocator, || {
+                state.operations.lock().unwrap().push("open");
+                Ok(())
+            });
+
+        assert!(matches!(result, Err(ClipboardWriteError::PayloadTooLarge)));
+        assert!(state.operations.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn publication_rejects_expanded_windows_payload_before_allocation_or_open() {
+        let formats = RegisteredFormats {
+            png: 100,
+            rtf: 101,
+            html: 102,
+        };
+        let representations = [ClipboardRepresentation::UnicodeText {
+            text: "a".repeat(MAX_CAPTURE_PAYLOAD_BYTES / 2 + 1),
+        }];
+        let state = FakeAllocationState::default();
+        let allocator = FakeAllocator {
+            fail_at: None,
+            failure: super::ClipboardWriteOperation::Allocate,
+            state: state.clone(),
+        };
+        let result =
+            prepare_representations_then_open(&representations, formats, &allocator, || {
+                state.operations.lock().unwrap().push("open");
+                Ok(())
+            });
+
+        assert!(matches!(result, Err(ClipboardWriteError::PayloadTooLarge)));
+        assert!(state.operations.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn excessive_file_count_skips_file_list_without_querying_items() {
+        let formats = RegisteredFormats {
+            png: 100,
+            rtf: 101,
+            html: 102,
+        };
+        let reader = FakeClipboardMemory {
+            payloads: HashMap::from([(CF_UNICODETEXT_FORMAT, [b'o', 0, b'k', 0, 0, 0].to_vec())]),
+            ..Default::default()
+        };
+        let files = FakeClipboardFiles {
+            count_override: Some(super::MAX_CAPTURE_FILE_COUNT + 1),
+            ..Default::default()
+        };
+
+        let captured =
+            read_bounded_representations_with_files(&reader, &files, formats, 1024).unwrap();
+
+        assert!(matches!(
+            captured.as_slice(),
+            [ClipboardRepresentation::UnicodeText { text }] if text == "ok"
+        ));
+        assert!(files.queried.borrow().is_empty());
+    }
+
+    #[test]
+    fn zero_length_or_changing_file_path_keeps_other_formats() {
+        let formats = RegisteredFormats {
+            png: 100,
+            rtf: 101,
+            html: 102,
+        };
+        let reader = FakeClipboardMemory {
+            payloads: HashMap::from([
+                (CF_UNICODETEXT_FORMAT, [b'o', 0, b'k', 0, 0, 0].to_vec()),
+                (formats.html, b"<b>ok</b>".to_vec()),
+            ]),
+            ..Default::default()
+        };
+        for files in [
+            FakeClipboardFiles {
+                paths: vec![Vec::new()],
+                ..Default::default()
+            },
+            FakeClipboardFiles {
+                paths: vec![r"C:\one.txt".encode_utf16().collect()],
+                fail_data_at: Some(0),
+                ..Default::default()
+            },
+        ] {
+            let captured =
+                read_bounded_representations_with_files(&reader, &files, formats, 1024).unwrap();
+            assert!(matches!(
+                captured.as_slice(),
+                [
+                    ClipboardRepresentation::UnicodeText { text },
+                    ClipboardRepresentation::Html { bytes },
+                ] if text == "ok" && bytes == b"<b>ok</b>"
+            ));
+        }
+    }
+
     #[derive(Clone, Default)]
     struct FakeAllocationState {
         operations: Arc<Mutex<Vec<&'static str>>>,
@@ -3857,14 +4342,15 @@ mod tests {
             rtf: 101,
             html: 102,
         };
-        let exact =
+        let logical =
             "C:\\界.txt".len() + crate::services::session_records::REPRESENTATION_OVERHEAD_BYTES;
+        let required = logical + super::FILE_PATH_RESOURCE_OVERHEAD_BYTES;
 
         let rejected = read_bounded_representations_with_files(
             &FakeClipboardMemory::default(),
             &files,
             formats,
-            exact - 1,
+            required - 1,
         )
         .unwrap();
         assert!(rejected.is_empty());
@@ -3873,10 +4359,10 @@ mod tests {
             &FakeClipboardMemory::default(),
             &files,
             formats,
-            exact,
+            required,
         )
         .unwrap();
-        assert_eq!(representation_bytes(&captured), exact);
+        assert_eq!(representation_bytes(&captured), logical);
         assert!(matches!(
             captured.as_slice(),
             [ClipboardRepresentation::FileList { paths }] if paths == &["C:\\界.txt"]
