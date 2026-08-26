@@ -459,6 +459,7 @@ impl Fixture {
             captures: Arc::new(Mutex::new(VecDeque::from([Ok(TargetSnapshot {
                 window: Window(100),
                 focused_control: Some(Window(101)),
+                focused_control_thread_id: Some(12),
                 identity: identity(),
                 lifecycle_token: crate::domain::TargetToken::from_platform_value(1),
                 focused_control_instance_id: Some(2),
@@ -505,6 +506,7 @@ impl Fixture {
         *self.target.captures.lock().unwrap() = VecDeque::from([Ok(TargetSnapshot {
             window: Window(100),
             focused_control: Some(Window(101)),
+            focused_control_thread_id: Some(12),
             identity,
             lifecycle_token: crate::domain::TargetToken::from_platform_value(1),
             focused_control_instance_id: Some(2),

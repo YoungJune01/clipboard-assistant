@@ -3,6 +3,7 @@ use std::{
     fmt,
     sync::{
         Arc, Mutex, MutexGuard, Weak,
+        atomic::{AtomicU64, Ordering},
         mpsc::{self, RecvTimeoutError, Sender},
     },
     thread::{self, JoinHandle},
@@ -81,6 +82,9 @@ pub(crate) fn observer_action_for_visibility(visible: bool) -> ObserverAction {
 
 struct PanelState {
     visible: bool,
+    manually_positioned: bool,
+    dragging: bool,
+    resizing: bool,
     focus_domain_depth: usize,
     owner: Option<MonitorIdentity>,
     anchor: Option<PhysicalPoint>,
@@ -90,7 +94,7 @@ struct PanelState {
 pub struct PanelService<M, W> {
     monitor: M,
     window: W,
-    panel_dip_size: DipSize,
+    panel_dip_size: Mutex<DipSize>,
     state: Arc<Mutex<PanelState>>,
 }
 
@@ -103,9 +107,12 @@ where
         Self {
             monitor,
             window,
-            panel_dip_size,
+            panel_dip_size: Mutex::new(panel_dip_size),
             state: Arc::new(Mutex::new(PanelState {
                 visible: false,
+                manually_positioned: false,
+                dragging: false,
+                resizing: false,
                 focus_domain_depth: 0,
                 owner: None,
                 anchor: None,
@@ -123,6 +130,9 @@ where
         {
             let mut state = lock_unpoisoned(&self.state);
             state.visible = true;
+            state.manually_positioned = false;
+            state.dragging = false;
+            state.resizing = false;
             state.owner = Some(snapshot.identity.clone());
             state.anchor = Some(snapshot.pointer);
             state.environment = Some(DisplayEnvironment::from(&snapshot));
@@ -140,6 +150,10 @@ where
             };
         }
         Ok(())
+    }
+
+    pub fn set_panel_dip_size(&self, size: DipSize) {
+        *lock_unpoisoned(&self.panel_dip_size) = size;
     }
 
     pub fn hide(&self) -> Result<(), PanelError> {
@@ -168,7 +182,7 @@ where
     }
 
     pub fn reposition_if_visible(&self) -> Result<(), PanelError> {
-        if self.is_visible() {
+        if self.is_visible() && !self.is_manually_positioned() {
             let snapshot = self.query_owner_snapshot()?;
             self.apply_snapshot(&snapshot)?;
             let mut state = lock_unpoisoned(&self.state);
@@ -181,7 +195,7 @@ where
     }
 
     pub fn owner_environment_changed(&self) -> Result<bool, PanelError> {
-        if !self.is_visible() {
+        if !self.is_visible() || self.is_manually_positioned() {
             return Ok(false);
         }
         let snapshot = self.query_owner_snapshot()?;
@@ -196,10 +210,54 @@ where
             .map(|identity| identity.as_str().to_owned())
     }
 
+    pub fn begin_dragging(&self) {
+        let mut state = lock_unpoisoned(&self.state);
+        if state.visible {
+            state.manually_positioned = true;
+            state.dragging = true;
+        }
+    }
+
+    pub fn finish_dragging(&self) -> Result<(), PanelError> {
+        let focus_result = if self.is_visible() {
+            self.window
+                .focus()
+                .map_err(|error| PanelError::Window(Box::new(error)))
+        } else {
+            Ok(())
+        };
+        lock_unpoisoned(&self.state).dragging = false;
+        focus_result
+    }
+
+    pub fn begin_resizing(&self) {
+        let mut state = lock_unpoisoned(&self.state);
+        if state.visible {
+            state.manually_positioned = true;
+            state.resizing = true;
+        }
+    }
+
+    pub fn finish_resizing(&self) -> Result<(), PanelError> {
+        let focus_result = if self.is_visible() {
+            self.window
+                .focus()
+                .map_err(|error| PanelError::Window(Box::new(error)))
+        } else {
+            Ok(())
+        };
+        lock_unpoisoned(&self.state).resizing = false;
+        focus_result
+    }
+
     pub fn on_focus_changed(&self, focused: bool) -> Result<(), PanelError> {
         let should_hide = {
             let state = lock_unpoisoned(&self.state);
-            !focused && state.visible && state.focus_domain_depth == 0
+            !focused
+                && state.visible
+                && !state.dragging
+                && !state.resizing
+                && state.focus_domain_depth == 0
         };
         if should_hide { self.hide() } else { Ok(()) }
     }
@@ -214,6 +272,10 @@ where
 
     pub fn is_visible(&self) -> bool {
         lock_unpoisoned(&self.state).visible
+    }
+
+    fn is_manually_positioned(&self) -> bool {
+        lock_unpoisoned(&self.state).manually_positioned
     }
 
     pub fn verified_visibility(&self) -> Result<bool, PanelError> {
@@ -248,7 +310,7 @@ where
         let bounds = place_panel(
             snapshot.pointer,
             snapshot.work_area,
-            self.panel_dip_size,
+            *lock_unpoisoned(&self.panel_dip_size),
             snapshot.dpi,
         );
         self.window
@@ -270,6 +332,9 @@ impl Error for PanelStateError {}
 
 fn clear_visible_state(state: &mut PanelState) {
     state.visible = false;
+    state.manually_positioned = false;
+    state.dragging = false;
+    state.resizing = false;
     state.owner = None;
     state.anchor = None;
     state.environment = None;
@@ -294,8 +359,8 @@ fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 #[cfg(windows)]
 pub const QUICK_PANEL_DIP_SIZE: DipSize = DipSize {
-    width: 420,
-    height: 520,
+    width: 360,
+    height: 460,
 };
 
 #[cfg(windows)]
@@ -411,6 +476,7 @@ type WindowsPanelService = PanelService<WindowsMonitor, TauriPanelWindow>;
 pub struct PanelController {
     service: WindowsPanelService,
     observer: Mutex<Option<PanelObserver>>,
+    resize_generation: AtomicU64,
 }
 
 #[cfg(windows)]
@@ -423,10 +489,20 @@ impl PanelController {
                 QUICK_PANEL_DIP_SIZE,
             ),
             observer: Mutex::new(None),
+            resize_generation: AtomicU64::new(0),
         }
     }
 
     pub fn show(self: &Arc<Self>) -> Result<(), PanelError> {
+        if let (Ok(size), Ok(scale)) = (
+            self.service.window.0.inner_size(),
+            self.service.window.0.scale_factor(),
+        ) {
+            self.service.set_panel_dip_size(DipSize {
+                width: (f64::from(size.width) / scale).round().max(1.0) as u32,
+                height: (f64::from(size.height) / scale).round().max(1.0) as u32,
+            });
+        }
         let result = self.service.show();
         self.update_observer();
         result
@@ -450,6 +526,42 @@ impl PanelController {
 
     pub fn reposition_if_visible(&self) -> Result<(), PanelError> {
         self.service.reposition_if_visible()
+    }
+
+    pub fn begin_dragging(&self) {
+        self.service.begin_dragging();
+    }
+
+    pub fn finish_dragging(&self) -> Result<(), PanelError> {
+        self.service.finish_dragging()
+    }
+
+    pub fn begin_resizing(&self) {
+        self.service.begin_resizing();
+    }
+
+    pub fn finish_resizing(&self) -> Result<(), PanelError> {
+        self.service.finish_resizing()
+    }
+
+    pub fn note_native_bounds_change(self: &Arc<Self>) {
+        self.service.begin_resizing();
+        let generation = self.resize_generation.fetch_add(1, Ordering::AcqRel) + 1;
+        let controller = Arc::downgrade(self);
+        let window = self.service.window.0.clone();
+        let _ = thread::Builder::new()
+            .name("quick-panel-resize-settle".to_owned())
+            .spawn(move || {
+                thread::sleep(Duration::from_millis(180));
+                let _ = window.run_on_main_thread(move || {
+                    let Some(controller) = controller.upgrade() else {
+                        return;
+                    };
+                    if controller.resize_generation.load(Ordering::Acquire) == generation {
+                        let _ = controller.finish_resizing();
+                    }
+                });
+            });
     }
 
     pub fn on_focus_changed(&self, focused: bool) -> Result<(), PanelError> {

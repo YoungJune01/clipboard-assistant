@@ -30,12 +30,13 @@ use windows::{
 use std::{marker::PhantomData, rc::Rc};
 
 use crate::domain::{
-    ClipboardRecord, ClipboardRepresentation, ContentIdentity, GroupId, Language, RecordId,
-    RecordNote, RetentionPeriod, SourceIdentity, UserSettings,
+    AccentColor, CaptureSound, ClipboardRecord, ClipboardRepresentation, ContentIdentity, GroupId,
+    Language, RecordId, RecordNote, RetentionPeriod, ShortcutModifiers, SourceIdentity,
+    UserSettings,
 };
 use crate::services::session_records::REPRESENTATION_OVERHEAD_BYTES;
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 const DATABASE_FILE: &str = "clipboard-history.sqlite3";
 const MIGRATION_TEMP_SUFFIX: &str = ".migrate-v2";
 const MIGRATION_BACKUP_SUFFIX: &str = ".migrate-v1-backup";
@@ -44,6 +45,7 @@ pub(crate) const DATABASE_MAX_PAYLOAD_BYTES: usize = 512 * 1024 * 1024;
 const DATABASE_INCREMENTAL_VACUUM_PAGES: usize = 256;
 const WORK_QUEUE_CAPACITY: usize = 64;
 const WORKER_TIMEOUT: StdDuration = StdDuration::from_secs(2);
+const BACKUP_WORKER_TIMEOUT: StdDuration = StdDuration::from_secs(120);
 const CONTROL_POLL_INTERVAL: StdDuration = StdDuration::from_millis(25);
 const MIGRATION_LOCK_TIMEOUT: StdDuration = StdDuration::from_secs(10);
 const MIGRATION_MUTEX_PREFIX: &str = "Local\\ClipboardAssistant.StorageMigration.";
@@ -53,6 +55,14 @@ pub(crate) struct RestoreBudget {
     pub(crate) max_records: usize,
     pub(crate) max_total_bytes: usize,
     pub(crate) max_record_bytes: usize,
+}
+
+#[derive(Debug)]
+pub(crate) struct RestoredData {
+    pub(crate) settings: UserSettings,
+    pub(crate) excluded_applications: Vec<String>,
+    pub(crate) groups: Vec<(GroupId, String)>,
+    pub(crate) records: Vec<ClipboardRecord>,
 }
 
 #[derive(Clone, Copy)]
@@ -142,6 +152,8 @@ impl From<rusqlite::Error> for PersistenceError {
 pub trait RecordPersistence: Send + Sync {
     fn save_record(&self, record: &ClipboardRecord) -> Result<(), PersistenceError>;
     fn update_note(&self, id: RecordId, note: Option<&RecordNote>) -> Result<(), PersistenceError>;
+    fn delete_record(&self, id: RecordId) -> Result<(), PersistenceError>;
+    fn clear_records(&self) -> Result<(), PersistenceError>;
 }
 
 enum PersistenceCommand {
@@ -154,11 +166,20 @@ enum PersistenceCommand {
         Option<RecordNote>,
         mpsc::SyncSender<Result<(), PersistenceError>>,
     ),
+    DeleteRecord(RecordId, mpsc::SyncSender<Result<(), PersistenceError>>),
+    ClearRecords(mpsc::SyncSender<Result<(), PersistenceError>>),
     SaveSettings(UserSettings, mpsc::SyncSender<Result<(), PersistenceError>>),
+    SaveExcludedApplications(Vec<String>, mpsc::SyncSender<Result<(), PersistenceError>>),
     Prune(
         RetentionPeriod,
         DateTime<Utc>,
         mpsc::SyncSender<Result<usize, PersistenceError>>,
+    ),
+    Backup(PathBuf, mpsc::SyncSender<Result<(), PersistenceError>>),
+    Restore(
+        PathBuf,
+        RestoreBudget,
+        mpsc::SyncSender<Result<RestoredData, PersistenceError>>,
     ),
 }
 
@@ -182,12 +203,24 @@ trait PersistenceBackend: Send + Sync {
     fn persist_record(&self, record: &ClipboardRecord) -> Result<(), PersistenceError>;
     fn persist_note(&self, id: RecordId, note: Option<&RecordNote>)
     -> Result<(), PersistenceError>;
+    fn delete_record(&self, id: RecordId) -> Result<(), PersistenceError>;
+    fn clear_records(&self) -> Result<(), PersistenceError>;
     fn persist_settings(&self, settings: UserSettings) -> Result<(), PersistenceError>;
+    fn persist_excluded_applications(
+        &self,
+        applications: &[String],
+    ) -> Result<(), PersistenceError>;
     fn prune_records(
         &self,
         retention: RetentionPeriod,
         now: DateTime<Utc>,
     ) -> Result<usize, PersistenceError>;
+    fn backup_database(&self, destination: &Path) -> Result<(), PersistenceError>;
+    fn restore_database(
+        &self,
+        source: &Path,
+        budget: RestoreBudget,
+    ) -> Result<RestoredData, PersistenceError>;
 }
 
 static THREAD_REAPER: LazyLock<Sender<JoinHandle<()>>> = LazyLock::new(|| {
@@ -244,6 +277,15 @@ impl PersistenceWorker {
         result.map_err(|error| self.degrade_with(error))
     }
 
+    pub fn save_excluded_applications(
+        &self,
+        applications: &[String],
+    ) -> Result<(), PersistenceError> {
+        self.request(|reply| {
+            PersistenceCommand::SaveExcludedApplications(applications.to_vec(), reply)
+        })
+    }
+
     pub fn prune(
         &self,
         retention: RetentionPeriod,
@@ -255,6 +297,26 @@ impl PersistenceWorker {
             .recv_timeout(self.response_timeout)
             .map_err(|_| self.degrade())?;
         result.map_err(|error| self.degrade_with(error))
+    }
+
+    pub(crate) fn backup(&self, destination: PathBuf) -> Result<(), PersistenceError> {
+        let (reply, response) = mpsc::sync_channel(1);
+        self.enqueue(PersistenceCommand::Backup(destination, reply))?;
+        response
+            .recv_timeout(BACKUP_WORKER_TIMEOUT)
+            .map_err(|_| PersistenceError::WorkerUnavailable)?
+    }
+
+    pub(crate) fn restore(
+        &self,
+        source: PathBuf,
+        budget: RestoreBudget,
+    ) -> Result<RestoredData, PersistenceError> {
+        let (reply, response) = mpsc::sync_channel(1);
+        self.enqueue(PersistenceCommand::Restore(source, budget, reply))?;
+        response
+            .recv_timeout(BACKUP_WORKER_TIMEOUT)
+            .map_err(|_| PersistenceError::WorkerUnavailable)?
     }
 
     fn enqueue(&self, command: PersistenceCommand) -> Result<(), PersistenceError> {
@@ -332,6 +394,14 @@ impl RecordPersistence for PersistenceWorker {
     fn update_note(&self, id: RecordId, note: Option<&RecordNote>) -> Result<(), PersistenceError> {
         self.request(|reply| PersistenceCommand::UpdateNote(id, note.cloned(), reply))
     }
+
+    fn delete_record(&self, id: RecordId) -> Result<(), PersistenceError> {
+        self.request(|reply| PersistenceCommand::DeleteRecord(id, reply))
+    }
+
+    fn clear_records(&self) -> Result<(), PersistenceError> {
+        self.request(PersistenceCommand::ClearRecords)
+    }
 }
 
 impl Drop for PersistenceWorker {
@@ -399,8 +469,35 @@ fn run_persistence_worker(
                     repository_healthy = false;
                 }
             }
+            PersistenceCommand::DeleteRecord(id, reply) => {
+                let result = repository.delete_record(id);
+                let failed = result.is_err();
+                let _ = reply.send(result);
+                if failed {
+                    storage_available.store(false, Ordering::Release);
+                    repository_healthy = false;
+                }
+            }
+            PersistenceCommand::ClearRecords(reply) => {
+                let result = repository.clear_records();
+                let failed = result.is_err();
+                let _ = reply.send(result);
+                if failed {
+                    storage_available.store(false, Ordering::Release);
+                    repository_healthy = false;
+                }
+            }
             PersistenceCommand::SaveSettings(settings, reply) => {
                 let result = repository.persist_settings(settings);
+                let failed = result.is_err();
+                let _ = reply.send(result);
+                if failed {
+                    storage_available.store(false, Ordering::Release);
+                    repository_healthy = false;
+                }
+            }
+            PersistenceCommand::SaveExcludedApplications(applications, reply) => {
+                let result = repository.persist_excluded_applications(&applications);
                 let failed = result.is_err();
                 let _ = reply.send(result);
                 if failed {
@@ -417,6 +514,12 @@ fn run_persistence_worker(
                     repository_healthy = false;
                 }
             }
+            PersistenceCommand::Backup(destination, reply) => {
+                let _ = reply.send(repository.backup_database(&destination));
+            }
+            PersistenceCommand::Restore(source, budget, reply) => {
+                let _ = reply.send(repository.restore_database(&source, budget));
+            }
         }
         processed = processed.saturating_add(1);
     }
@@ -426,10 +529,19 @@ fn reply_unavailable(command: PersistenceCommand) {
     match command {
         PersistenceCommand::SaveRecord(_, reply)
         | PersistenceCommand::UpdateNote(_, _, reply)
-        | PersistenceCommand::SaveSettings(_, reply) => {
+        | PersistenceCommand::DeleteRecord(_, reply)
+        | PersistenceCommand::ClearRecords(reply)
+        | PersistenceCommand::SaveSettings(_, reply)
+        | PersistenceCommand::SaveExcludedApplications(_, reply) => {
             let _ = reply.send(Err(PersistenceError::WorkerUnavailable));
         }
         PersistenceCommand::Prune(_, _, reply) => {
+            let _ = reply.send(Err(PersistenceError::WorkerUnavailable));
+        }
+        PersistenceCommand::Backup(_, reply) => {
+            let _ = reply.send(Err(PersistenceError::WorkerUnavailable));
+        }
+        PersistenceCommand::Restore(_, _, reply) => {
             let _ = reply.send(Err(PersistenceError::WorkerUnavailable));
         }
     }
@@ -503,6 +615,87 @@ impl SqliteRepository {
             .map_err(Into::into)
     }
 
+    fn backup_to(&self, destination: &Path) -> Result<(), PersistenceError> {
+        if same_file_path(&self.path, destination) {
+            return Err(PersistenceError::InvalidData);
+        }
+        let temporary = backup_work_path(destination, ".exporting");
+        remove_path_and_sidecars(&temporary)?;
+        let result = (|| {
+            let connection = lock_unpoisoned(&self.connection);
+            connection.backup(rusqlite::MAIN_DB, &temporary, None)?;
+            validate_backup_file(&temporary)?;
+            if destination.exists() {
+                fs::remove_file(destination).map_err(PersistenceError::FileOperation)?;
+            }
+            fs::rename(&temporary, destination).map_err(PersistenceError::FileOperation)?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = remove_path_and_sidecars(&temporary);
+        }
+        result
+    }
+
+    fn restore_from(
+        &self,
+        source: &Path,
+        budget: RestoreBudget,
+    ) -> Result<RestoredData, PersistenceError> {
+        if same_file_path(&self.path, source) {
+            return Err(PersistenceError::InvalidData);
+        }
+        validate_backup_file(source)?;
+        let source_repository =
+            SqliteRepository::open_with_quota(source.to_path_buf(), self.quota)?;
+        source_repository.load_settings()?;
+        source_repository.load_excluded_applications()?;
+        source_repository.load_groups()?;
+        source_repository.load_recent_bounded(budget)?;
+        drop(source_repository);
+
+        let rollback = backup_work_path(&self.path, ".restore-rollback");
+        remove_path_and_sidecars(&rollback)?;
+        let mut connection = lock_unpoisoned(&self.connection);
+        connection.backup(rusqlite::MAIN_DB, &rollback, None)?;
+        let restore_result = (|| {
+            connection.restore(
+                rusqlite::MAIN_DB,
+                source,
+                None::<fn(rusqlite::backup::Progress)>,
+            )?;
+            connection.pragma_update(None, "foreign_keys", "ON")?;
+            let integrity: String =
+                connection.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
+            if integrity != "ok" || database_version_from_connection(&connection)? != SCHEMA_VERSION
+            {
+                return Err(PersistenceError::InvalidData);
+            }
+            let transaction = connection.transaction()?;
+            enforce_disk_quota(&transaction, self.quota)?;
+            transaction.commit()?;
+            Ok(())
+        })();
+        if let Err(error) = restore_result {
+            let rollback_result = connection.restore(
+                rusqlite::MAIN_DB,
+                &rollback,
+                None::<fn(rusqlite::backup::Progress)>,
+            );
+            let _ = remove_path_and_sidecars(&rollback);
+            return rollback_result
+                .map_or(Err(PersistenceError::WorkerUnavailable), |_| Err(error));
+        }
+        remove_path_and_sidecars(&rollback)?;
+        drop(connection);
+        Ok(RestoredData {
+            settings: self.load_settings()?,
+            excluded_applications: self.load_excluded_applications()?,
+            groups: self.load_groups()?,
+            records: self.load_recent_bounded(budget)?,
+        })
+    }
+
     pub fn load_settings(&self) -> Result<UserSettings, PersistenceError> {
         let connection = lock_unpoisoned(&self.connection);
         let language = setting(&connection, "language")?
@@ -511,10 +704,129 @@ impl SqliteRepository {
         let retention = setting(&connection, "retention")?
             .and_then(|value| parse_retention(&value))
             .unwrap_or_default();
+        let start_at_sign_in = setting(&connection, "start_at_sign_in")?
+            .and_then(|value| parse_bool(&value))
+            .unwrap_or(false);
+        let start_minimized = setting(&connection, "start_minimized")?
+            .and_then(|value| parse_bool(&value))
+            .unwrap_or(false);
+        let show_tray_icon = setting(&connection, "show_tray_icon")?
+            .and_then(|value| parse_bool(&value))
+            .unwrap_or(true);
+        let accent_color = setting(&connection, "accent_color")?
+            .and_then(|value| parse_accent_color(&value))
+            .unwrap_or_default();
+        let sound_enabled = setting(&connection, "sound_enabled")?
+            .and_then(|value| parse_bool(&value))
+            .unwrap_or(true);
+        let capture_sound = setting(&connection, "capture_sound")?
+            .and_then(|value| parse_capture_sound(&value))
+            .unwrap_or_default();
+        let quick_paste_enabled = setting(&connection, "quick_paste_enabled")?
+            .and_then(|value| parse_bool(&value))
+            .unwrap_or(false);
+        let activation_shortcut = setting(&connection, "activation_shortcut")?
+            .and_then(|value| serde_json::from_str(&value).ok())
+            .unwrap_or_default();
+        let group_shortcut_modifiers = setting(&connection, "group_shortcut_modifiers")?
+            .and_then(|value| serde_json::from_str(&value).ok())
+            .unwrap_or(ShortcutModifiers::CTRL_ALT);
+        let quick_paste_modifiers = setting(&connection, "quick_paste_modifiers")?
+            .and_then(|value| serde_json::from_str(&value).ok())
+            .or_else(|| {
+                setting(&connection, "quick_paste_modifier")
+                    .ok()
+                    .flatten()
+                    .and_then(|value| legacy_quick_paste_modifiers(&value))
+            })
+            .unwrap_or(ShortcutModifiers::CTRL_ALT);
         Ok(UserSettings {
             language,
             retention,
+            start_at_sign_in,
+            start_minimized,
+            show_tray_icon,
+            accent_color,
+            sound_enabled,
+            capture_sound,
+            activation_shortcut,
+            group_shortcut_modifiers,
+            quick_paste_enabled,
+            quick_paste_modifiers,
         })
+    }
+
+    pub fn load_groups(&self) -> Result<Vec<(GroupId, String)>, PersistenceError> {
+        let connection = lock_unpoisoned(&self.connection);
+        let mut statement = connection.prepare(
+            "SELECT id, name FROM clipboard_groups ORDER BY position, name COLLATE NOCASE",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut groups = Vec::new();
+        for row in rows {
+            let (id, name) = row?;
+            groups.push((
+                GroupId::parse(&id).map_err(|_| PersistenceError::InvalidData)?,
+                name,
+            ));
+        }
+        Ok(groups)
+    }
+
+    pub fn save_group(&self, id: GroupId, name: &str) -> Result<(), PersistenceError> {
+        let _migration_guard = self
+            .migration_locks
+            .acquire(&self.path, MIGRATION_LOCK_TIMEOUT)?;
+        let connection = lock_unpoisoned(&self.connection);
+        connection.execute(
+            "INSERT INTO clipboard_groups(id, name, position) \
+             VALUES (?1, ?2, COALESCE((SELECT MAX(position) + 1 FROM clipboard_groups), 0)) \
+             ON CONFLICT(id) DO UPDATE SET name = excluded.name",
+            params![id.as_uuid().to_string(), name],
+        )?;
+        Ok(())
+    }
+
+    pub fn save_group_order(&self, ids: &[GroupId]) -> Result<(), PersistenceError> {
+        let _migration_guard = self
+            .migration_locks
+            .acquire(&self.path, MIGRATION_LOCK_TIMEOUT)?;
+        let mut connection = lock_unpoisoned(&self.connection);
+        let transaction = connection.transaction()?;
+        for (position, id) in ids.iter().enumerate() {
+            let changed = transaction.execute(
+                "UPDATE clipboard_groups SET position = ?1 WHERE id = ?2",
+                params![position as i64, id.as_uuid().to_string()],
+            )?;
+            if changed != 1 {
+                return Err(PersistenceError::InvalidData);
+            }
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn delete_group(&self, id: GroupId) -> Result<usize, PersistenceError> {
+        let _migration_guard = self
+            .migration_locks
+            .acquire(&self.path, MIGRATION_LOCK_TIMEOUT)?;
+        let mut connection = lock_unpoisoned(&self.connection);
+        let transaction = connection.transaction()?;
+        let moved = transaction.execute(
+            "UPDATE clipboard_records SET group_id = NULL WHERE group_id = ?1",
+            [id.as_uuid().to_string()],
+        )?;
+        let deleted = transaction.execute(
+            "DELETE FROM clipboard_groups WHERE id = ?1",
+            [id.as_uuid().to_string()],
+        )?;
+        if deleted != 1 {
+            return Err(PersistenceError::InvalidData);
+        }
+        transaction.commit()?;
+        Ok(moved)
     }
 
     pub fn save_settings(&self, settings: UserSettings) -> Result<(), PersistenceError> {
@@ -529,6 +841,82 @@ impl SqliteRepository {
             "retention",
             retention_value(settings.retention),
         )?;
+        save_setting(
+            &transaction,
+            "start_at_sign_in",
+            bool_value(settings.start_at_sign_in),
+        )?;
+        save_setting(
+            &transaction,
+            "start_minimized",
+            bool_value(settings.start_minimized),
+        )?;
+        save_setting(
+            &transaction,
+            "show_tray_icon",
+            bool_value(settings.show_tray_icon),
+        )?;
+        save_setting(
+            &transaction,
+            "accent_color",
+            accent_color_value(settings.accent_color),
+        )?;
+        save_setting(
+            &transaction,
+            "sound_enabled",
+            bool_value(settings.sound_enabled),
+        )?;
+        save_setting(
+            &transaction,
+            "capture_sound",
+            capture_sound_value(settings.capture_sound),
+        )?;
+        save_setting(
+            &transaction,
+            "quick_paste_enabled",
+            bool_value(settings.quick_paste_enabled),
+        )?;
+        let activation_shortcut = serde_json::to_string(&settings.activation_shortcut)
+            .map_err(|_| PersistenceError::InvalidData)?;
+        let group_shortcut_modifiers = serde_json::to_string(&settings.group_shortcut_modifiers)
+            .map_err(|_| PersistenceError::InvalidData)?;
+        let quick_paste_modifiers = serde_json::to_string(&settings.quick_paste_modifiers)
+            .map_err(|_| PersistenceError::InvalidData)?;
+        save_setting(&transaction, "activation_shortcut", &activation_shortcut)?;
+        save_setting(
+            &transaction,
+            "group_shortcut_modifiers",
+            &group_shortcut_modifiers,
+        )?;
+        save_setting(
+            &transaction,
+            "quick_paste_modifiers",
+            &quick_paste_modifiers,
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn load_excluded_applications(&self) -> Result<Vec<String>, PersistenceError> {
+        let connection = lock_unpoisoned(&self.connection);
+        setting(&connection, "excluded_applications")?
+            .map(|value| serde_json::from_str(&value).map_err(|_| PersistenceError::InvalidData))
+            .transpose()
+            .map(Option::unwrap_or_default)
+    }
+
+    pub fn save_excluded_applications(
+        &self,
+        applications: &[String],
+    ) -> Result<(), PersistenceError> {
+        let _migration_guard = self
+            .migration_locks
+            .acquire(&self.path, MIGRATION_LOCK_TIMEOUT)?;
+        let mut connection = lock_unpoisoned(&self.connection);
+        let transaction = connection.transaction()?;
+        let value =
+            serde_json::to_string(applications).map_err(|_| PersistenceError::InvalidData)?;
+        save_setting(&transaction, "excluded_applications", &value)?;
         transaction.commit()?;
         Ok(())
     }
@@ -643,6 +1031,19 @@ impl SqliteRepository {
     }
 }
 
+fn legacy_quick_paste_modifiers(value: &str) -> Option<ShortcutModifiers> {
+    match value {
+        "ctrl_alt" => Some(ShortcutModifiers::CTRL_ALT),
+        "ctrl_shift" => Some(ShortcutModifiers::CTRL_SHIFT),
+        "alt_shift" => Some(ShortcutModifiers {
+            alt: true,
+            shift: true,
+            ..ShortcutModifiers::default()
+        }),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 fn save_record_transaction(
     connection: &mut Connection,
@@ -745,6 +1146,29 @@ impl RecordPersistence for SqliteRepository {
         }
         Ok(())
     }
+
+    fn delete_record(&self, id: RecordId) -> Result<(), PersistenceError> {
+        let _migration_guard = self
+            .migration_locks
+            .acquire(&self.path, MIGRATION_LOCK_TIMEOUT)?;
+        let connection = lock_unpoisoned(&self.connection);
+        connection.execute(
+            "DELETE FROM clipboard_records WHERE id = ?1",
+            [id.as_uuid().to_string()],
+        )?;
+        incremental_vacuum(&connection, self.quota)?;
+        Ok(())
+    }
+
+    fn clear_records(&self) -> Result<(), PersistenceError> {
+        let _migration_guard = self
+            .migration_locks
+            .acquire(&self.path, MIGRATION_LOCK_TIMEOUT)?;
+        let connection = lock_unpoisoned(&self.connection);
+        connection.execute("DELETE FROM clipboard_records", [])?;
+        incremental_vacuum(&connection, self.quota)?;
+        Ok(())
+    }
 }
 
 impl PersistenceBackend for SqliteRepository {
@@ -760,8 +1184,23 @@ impl PersistenceBackend for SqliteRepository {
         RecordPersistence::update_note(self, id, note)
     }
 
+    fn delete_record(&self, id: RecordId) -> Result<(), PersistenceError> {
+        RecordPersistence::delete_record(self, id)
+    }
+
+    fn clear_records(&self) -> Result<(), PersistenceError> {
+        RecordPersistence::clear_records(self)
+    }
+
     fn persist_settings(&self, settings: UserSettings) -> Result<(), PersistenceError> {
         SqliteRepository::save_settings(self, settings)
+    }
+
+    fn persist_excluded_applications(
+        &self,
+        applications: &[String],
+    ) -> Result<(), PersistenceError> {
+        SqliteRepository::save_excluded_applications(self, applications)
     }
 
     fn prune_records(
@@ -771,6 +1210,70 @@ impl PersistenceBackend for SqliteRepository {
     ) -> Result<usize, PersistenceError> {
         SqliteRepository::prune(self, retention, now)
     }
+
+    fn backup_database(&self, destination: &Path) -> Result<(), PersistenceError> {
+        self.backup_to(destination)
+    }
+
+    fn restore_database(
+        &self,
+        source: &Path,
+        budget: RestoreBudget,
+    ) -> Result<RestoredData, PersistenceError> {
+        self.restore_from(source, budget)
+    }
+}
+
+fn same_file_path(left: &Path, right: &Path) -> bool {
+    let normalize = |path: &Path| {
+        fs::canonicalize(path).unwrap_or_else(|_| {
+            let parent = path.parent().unwrap_or_else(|| Path::new("."));
+            let parent = fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
+            path.file_name()
+                .map_or(parent.clone(), |name| parent.join(name))
+        })
+    };
+    normalize(left) == normalize(right)
+}
+
+fn backup_work_path(path: &Path, suffix: &str) -> PathBuf {
+    let mut value = path.as_os_str().to_os_string();
+    value.push(suffix);
+    PathBuf::from(value)
+}
+
+fn remove_path_and_sidecars(path: &Path) -> Result<(), PersistenceError> {
+    for candidate in [
+        path.to_path_buf(),
+        sqlite_sidecar_path(path, "-wal"),
+        sqlite_sidecar_path(path, "-shm"),
+        sqlite_sidecar_path(path, "-journal"),
+    ] {
+        if candidate.exists() {
+            fs::remove_file(candidate).map_err(PersistenceError::FileOperation)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_backup_file(path: &Path) -> Result<(), PersistenceError> {
+    if !path.is_file() {
+        return Err(PersistenceError::InvalidData);
+    }
+    let connection = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let integrity: String = connection.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
+    if integrity != "ok" {
+        return Err(PersistenceError::InvalidData);
+    }
+    let version = database_version_from_connection(&connection)?;
+    if version != SCHEMA_VERSION {
+        return Err(if version > SCHEMA_VERSION {
+            PersistenceError::UnsupportedSchema(version)
+        } else {
+            PersistenceError::InvalidData
+        });
+    }
+    Ok(())
 }
 
 trait MigrationFileOps {
@@ -1246,6 +1749,17 @@ fn migrate(connection: &mut Connection) -> Result<(), PersistenceError> {
         create_schema(connection)?;
     } else if version == 1 {
         return Err(PersistenceError::UnsupportedSchema(version));
+    } else if version == 2 {
+        connection.execute_batch(
+            "BEGIN IMMEDIATE;
+             CREATE TABLE clipboard_groups (
+                    id TEXT PRIMARY KEY NOT NULL,
+                    name TEXT NOT NULL,
+                    position INTEGER NOT NULL
+             );
+             PRAGMA user_version = 3;
+             COMMIT;",
+        )?;
     }
     Ok(())
 }
@@ -1280,7 +1794,12 @@ fn create_schema(connection: &mut Connection) -> Result<(), PersistenceError> {
                 key TEXT PRIMARY KEY NOT NULL,
                 value TEXT NOT NULL
          );
-         PRAGMA user_version = 2;
+         CREATE TABLE clipboard_groups (
+                id TEXT PRIMARY KEY NOT NULL,
+                name TEXT NOT NULL,
+                position INTEGER NOT NULL
+         );
+         PRAGMA user_version = 3;
          COMMIT;",
     )?;
     Ok(())
@@ -1558,6 +2077,42 @@ fn parse_language(value: &str) -> Option<Language> {
     }
 }
 
+fn accent_color_value(color: AccentColor) -> &'static str {
+    match color {
+        AccentColor::Blue => "blue",
+        AccentColor::Teal => "teal",
+        AccentColor::Rose => "rose",
+        AccentColor::Violet => "violet",
+        AccentColor::Amber => "amber",
+    }
+}
+
+fn parse_accent_color(value: &str) -> Option<AccentColor> {
+    match value {
+        "blue" => Some(AccentColor::Blue),
+        "teal" => Some(AccentColor::Teal),
+        "rose" => Some(AccentColor::Rose),
+        "violet" => Some(AccentColor::Violet),
+        "amber" => Some(AccentColor::Amber),
+        _ => None,
+    }
+}
+
+fn capture_sound_value(sound: CaptureSound) -> &'static str {
+    match sound {
+        CaptureSound::Default => "default",
+        CaptureSound::Custom => "custom",
+    }
+}
+
+fn parse_capture_sound(value: &str) -> Option<CaptureSound> {
+    match value {
+        "default" => Some(CaptureSound::Default),
+        "custom" => Some(CaptureSound::Custom),
+        _ => None,
+    }
+}
+
 fn retention_value(retention: RetentionPeriod) -> &'static str {
     match retention {
         RetentionPeriod::OneDay => "one_day",
@@ -1579,6 +2134,18 @@ fn parse_retention(value: &str) -> Option<RetentionPeriod> {
     }
 }
 
+fn bool_value(value: bool) -> &'static str {
+    if value { "true" } else { "false" }
+}
+
+fn parse_bool(value: &str) -> Option<bool> {
+    match value {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
+}
+
 fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
         .lock()
@@ -1588,6 +2155,7 @@ fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::Shortcut;
     use chrono::TimeZone;
     #[cfg(windows)]
     use static_assertions::assert_not_impl_any;
@@ -1637,7 +2205,22 @@ mod tests {
             Ok(())
         }
 
+        fn delete_record(&self, _id: RecordId) -> Result<(), PersistenceError> {
+            Ok(())
+        }
+
+        fn clear_records(&self) -> Result<(), PersistenceError> {
+            Ok(())
+        }
+
         fn persist_settings(&self, _settings: UserSettings) -> Result<(), PersistenceError> {
+            Ok(())
+        }
+
+        fn persist_excluded_applications(
+            &self,
+            _applications: &[String],
+        ) -> Result<(), PersistenceError> {
             Ok(())
         }
 
@@ -1647,6 +2230,23 @@ mod tests {
             _now: DateTime<Utc>,
         ) -> Result<usize, PersistenceError> {
             Ok(0)
+        }
+
+        fn backup_database(&self, _destination: &Path) -> Result<(), PersistenceError> {
+            Ok(())
+        }
+
+        fn restore_database(
+            &self,
+            _source: &Path,
+            _budget: RestoreBudget,
+        ) -> Result<RestoredData, PersistenceError> {
+            Ok(RestoredData {
+                settings: UserSettings::default(),
+                excluded_applications: Vec::new(),
+                groups: Vec::new(),
+                records: Vec::new(),
+            })
         }
     }
 
@@ -1713,6 +2313,134 @@ mod tests {
                 text: text.to_owned(),
             }],
         })
+    }
+
+    #[test]
+    fn backup_and_restore_preserve_records_groups_notes_and_settings() {
+        let directory = tempdir().unwrap();
+        let live_path = directory.path().join("live.sqlite3");
+        let backup_path = directory.path().join("history.clipbackup");
+        let repository = SqliteRepository::open(live_path).unwrap();
+        let group = GroupId::new();
+        repository.save_group(group, "Accounts").unwrap();
+        let mut expected = record("backup-record", Utc::now());
+        expected.group_id = Some(group);
+        repository.save_record(&expected).unwrap();
+        repository
+            .save_settings(UserSettings {
+                language: Language::En,
+                retention: RetentionPeriod::Forever,
+                accent_color: AccentColor::Rose,
+                ..UserSettings::default()
+            })
+            .unwrap();
+
+        repository.backup_to(&backup_path).unwrap();
+        RecordPersistence::clear_records(repository.as_ref()).unwrap();
+        repository.delete_group(group).unwrap();
+        repository.save_settings(UserSettings::default()).unwrap();
+
+        let restored = repository
+            .restore_from(
+                &backup_path,
+                RestoreBudget {
+                    max_records: 500,
+                    max_total_bytes: crate::services::session_records::DEFAULT_STORE_BYTES,
+                    max_record_bytes: crate::services::session_records::MAX_CAPTURE_RECORD_BYTES,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(restored.records, vec![expected]);
+        assert_eq!(restored.groups, vec![(group, "Accounts".to_owned())]);
+        assert_eq!(restored.settings.language, Language::En);
+        assert_eq!(restored.settings.retention, RetentionPeriod::Forever);
+        assert_eq!(restored.settings.accent_color, AccentColor::Rose);
+        assert_eq!(repository.load_recent(10).unwrap(), restored.records);
+    }
+
+    #[test]
+    fn invalid_restore_does_not_modify_live_database() {
+        let directory = tempdir().unwrap();
+        let repository = SqliteRepository::open(directory.path().join("live.sqlite3")).unwrap();
+        let expected = text_record("live", Utc::now(), "keep me");
+        repository.save_record(&expected).unwrap();
+        let invalid = directory.path().join("invalid.clipbackup");
+        fs::write(&invalid, b"not sqlite").unwrap();
+
+        assert!(
+            repository
+                .restore_from(
+                    &invalid,
+                    RestoreBudget {
+                        max_records: 500,
+                        max_total_bytes: crate::services::session_records::DEFAULT_STORE_BYTES,
+                        max_record_bytes:
+                            crate::services::session_records::MAX_CAPTURE_RECORD_BYTES,
+                    },
+                )
+                .is_err()
+        );
+        assert_eq!(repository.load_recent(10).unwrap(), vec![expected]);
+    }
+
+    #[test]
+    fn backup_rejects_the_live_database_path() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("live.sqlite3");
+        let repository = SqliteRepository::open(path.clone()).unwrap();
+
+        assert!(matches!(
+            repository.backup_to(&path),
+            Err(PersistenceError::InvalidData)
+        ));
+    }
+
+    #[test]
+    fn delete_and_clear_remove_records_without_touching_settings() {
+        let directory = tempdir().unwrap();
+        let repository = SqliteRepository::open(directory.path().join("history.sqlite3")).unwrap();
+        let now = Utc::now();
+        let first = text_record("first", now, "one");
+        let second = text_record("second", now + Duration::seconds(1), "two");
+        repository.save_record(&first).unwrap();
+        repository.save_record(&second).unwrap();
+
+        RecordPersistence::delete_record(repository.as_ref(), first.id).unwrap();
+        let loaded = repository.load_recent(10).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].id, second.id);
+
+        RecordPersistence::clear_records(repository.as_ref()).unwrap();
+        assert!(repository.load_recent(10).unwrap().is_empty());
+        assert_eq!(repository.load_settings().unwrap(), UserSettings::default());
+    }
+
+    #[test]
+    fn group_order_persists_and_deleting_a_group_ungroups_its_records() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("history.sqlite3");
+        let repository = SqliteRepository::open(path.clone()).unwrap();
+        let first = GroupId::new();
+        let second = GroupId::new();
+        repository.save_group(first, "First").unwrap();
+        repository.save_group(second, "Second").unwrap();
+        repository.save_group_order(&[second, first]).unwrap();
+
+        let mut grouped = text_record("grouped", Utc::now(), "value");
+        grouped.group_id = Some(first);
+        repository.save_record(&grouped).unwrap();
+        assert_eq!(repository.delete_group(first).unwrap(), 1);
+        drop(repository);
+
+        let reopened = SqliteRepository::open(path).unwrap();
+        assert_eq!(
+            reopened.load_groups().unwrap(),
+            vec![(second, "Second".to_owned())]
+        );
+        let records = reopened.load_recent(10).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].group_id, None);
     }
 
     fn create_v1_database(
@@ -2497,6 +3225,9 @@ mod tests {
         let id = record.id;
         {
             let repository = SqliteRepository::open(path.clone()).unwrap();
+            repository
+                .save_excluded_applications(&["KeePass.exe".to_owned(), "mstsc.exe".to_owned()])
+                .unwrap();
             repository.save_record(&record).unwrap();
             repository
                 .update_note(id, Some(&RecordNote::new("updated").unwrap()))
@@ -2505,11 +3236,29 @@ mod tests {
                 .save_settings(UserSettings {
                     language: Language::En,
                     retention: RetentionPeriod::Forever,
+                    start_at_sign_in: true,
+                    start_minimized: true,
+                    show_tray_icon: true,
+                    accent_color: AccentColor::Rose,
+                    sound_enabled: false,
+                    capture_sound: CaptureSound::Custom,
+                    activation_shortcut: Shortcut::default(),
+                    group_shortcut_modifiers: ShortcutModifiers::CTRL_ALT,
+                    quick_paste_enabled: true,
+                    quick_paste_modifiers: ShortcutModifiers {
+                        alt: true,
+                        shift: true,
+                        ..ShortcutModifiers::default()
+                    },
                 })
                 .unwrap();
         }
 
         let repository = SqliteRepository::open(path).unwrap();
+        assert_eq!(
+            repository.load_excluded_applications().unwrap(),
+            vec!["KeePass.exe".to_owned(), "mstsc.exe".to_owned()]
+        );
         assert_eq!(
             repository.load_recent(1).unwrap()[0]
                 .note
@@ -2522,6 +3271,20 @@ mod tests {
             UserSettings {
                 language: Language::En,
                 retention: RetentionPeriod::Forever,
+                start_at_sign_in: true,
+                start_minimized: true,
+                show_tray_icon: true,
+                accent_color: AccentColor::Rose,
+                sound_enabled: false,
+                capture_sound: CaptureSound::Custom,
+                activation_shortcut: Shortcut::default(),
+                group_shortcut_modifiers: ShortcutModifiers::CTRL_ALT,
+                quick_paste_enabled: true,
+                quick_paste_modifiers: ShortcutModifiers {
+                    alt: true,
+                    shift: true,
+                    ..ShortcutModifiers::default()
+                },
             }
         );
     }
@@ -2580,6 +3343,7 @@ mod tests {
             .save_settings(UserSettings {
                 language: Language::En,
                 retention: RetentionPeriod::Forever,
+                ..UserSettings::default()
             })
             .unwrap();
         drop(worker);

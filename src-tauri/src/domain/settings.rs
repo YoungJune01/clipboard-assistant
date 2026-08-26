@@ -19,6 +19,129 @@ pub enum RetentionPeriod {
     Forever,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccentColor {
+    #[default]
+    Blue,
+    Teal,
+    Rose,
+    Violet,
+    Amber,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CaptureSound {
+    #[default]
+    Default,
+    Custom,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShortcutModifiers {
+    pub ctrl: bool,
+    pub alt: bool,
+    pub shift: bool,
+    pub win: bool,
+}
+
+impl ShortcutModifiers {
+    pub const CTRL_ALT: Self = Self {
+        ctrl: true,
+        alt: true,
+        shift: false,
+        win: false,
+    };
+
+    pub const CTRL_SHIFT: Self = Self {
+        ctrl: true,
+        alt: false,
+        shift: true,
+        win: false,
+    };
+
+    pub fn is_safe_global_shortcut(self) -> bool {
+        self.ctrl || self.alt || self.win
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShortcutKey {
+    A,
+    B,
+    C,
+    D,
+    E,
+    F,
+    G,
+    H,
+    I,
+    J,
+    K,
+    L,
+    M,
+    N,
+    O,
+    P,
+    Q,
+    R,
+    S,
+    T,
+    U,
+    #[default]
+    V,
+    W,
+    X,
+    Y,
+    Z,
+    Digit0,
+    Digit1,
+    Digit2,
+    Digit3,
+    Digit4,
+    Digit5,
+    Digit6,
+    Digit7,
+    Digit8,
+    Digit9,
+    F1,
+    F2,
+    F3,
+    F4,
+    F5,
+    F6,
+    F7,
+    F8,
+    F9,
+    F10,
+    F11,
+    F12,
+    Left,
+    Right,
+    Up,
+    Down,
+    Space,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Shortcut {
+    pub modifiers: ShortcutModifiers,
+    pub key: ShortcutKey,
+}
+
+impl Default for Shortcut {
+    fn default() -> Self {
+        Self {
+            modifiers: ShortcutModifiers::CTRL_SHIFT,
+            key: ShortcutKey::V,
+        }
+    }
+}
+
 impl RetentionPeriod {
     pub fn days(self) -> Option<i64> {
         match self {
@@ -31,10 +154,39 @@ impl RetentionPeriod {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UserSettings {
     pub language: Language,
     pub retention: RetentionPeriod,
+    pub start_at_sign_in: bool,
+    pub start_minimized: bool,
+    pub show_tray_icon: bool,
+    pub accent_color: AccentColor,
+    pub sound_enabled: bool,
+    pub capture_sound: CaptureSound,
+    pub activation_shortcut: Shortcut,
+    pub group_shortcut_modifiers: ShortcutModifiers,
+    pub quick_paste_enabled: bool,
+    pub quick_paste_modifiers: ShortcutModifiers,
+}
+
+impl Default for UserSettings {
+    fn default() -> Self {
+        Self {
+            language: Language::default(),
+            retention: RetentionPeriod::default(),
+            start_at_sign_in: false,
+            start_minimized: false,
+            show_tray_icon: true,
+            accent_color: AccentColor::default(),
+            sound_enabled: true,
+            capture_sound: CaptureSound::default(),
+            activation_shortcut: Shortcut::default(),
+            group_shortcut_modifiers: ShortcutModifiers::CTRL_ALT,
+            quick_paste_enabled: false,
+            quick_paste_modifiers: ShortcutModifiers::CTRL_ALT,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -74,7 +226,8 @@ impl Default for PasteSettings {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppSettings, ClipboardSettings, Language, PasteSettings, RetentionPeriod, UserSettings,
+        AccentColor, AppSettings, CaptureSound, ClipboardSettings, Language, PasteSettings,
+        RetentionPeriod, Shortcut, ShortcutKey, ShortcutModifiers, UserSettings,
     };
 
     #[test]
@@ -84,6 +237,16 @@ mod tests {
             UserSettings {
                 language: Language::ZhCn,
                 retention: RetentionPeriod::ThirtyDays,
+                start_at_sign_in: false,
+                start_minimized: false,
+                show_tray_icon: true,
+                accent_color: AccentColor::Blue,
+                sound_enabled: true,
+                capture_sound: CaptureSound::Default,
+                activation_shortcut: Shortcut::default(),
+                group_shortcut_modifiers: ShortcutModifiers::CTRL_ALT,
+                quick_paste_enabled: false,
+                quick_paste_modifiers: ShortcutModifiers::CTRL_ALT,
             }
         );
         assert_eq!(RetentionPeriod::Forever.days(), None);
@@ -111,6 +274,20 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<AppSettings>(&json).unwrap(),
             settings
+        );
+    }
+
+    #[test]
+    fn shortcut_defaults_and_validation_are_stable() {
+        assert_eq!(Shortcut::default().key, ShortcutKey::V);
+        assert_eq!(Shortcut::default().modifiers, ShortcutModifiers::CTRL_SHIFT);
+        assert!(ShortcutModifiers::CTRL_ALT.is_safe_global_shortcut());
+        assert!(
+            !ShortcutModifiers {
+                shift: true,
+                ..ShortcutModifiers::default()
+            }
+            .is_safe_global_shortcut()
         );
     }
 }

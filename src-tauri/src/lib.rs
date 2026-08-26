@@ -15,16 +15,166 @@ use services::paste::{QuickPanelPasteCoordinator, SafePasteService};
 #[cfg(windows)]
 use services::persistence::{PersistenceWorker, RestoreBudget, SqliteRepository};
 #[cfg(windows)]
-use services::session_records::{SessionRecordCommands, SessionRecordStore, SessionRecordView};
+use services::session_records::{
+    ImagePreviewView, SessionRecordCommands, SessionRecordStore, SessionRecordView,
+};
 
 #[cfg(windows)]
 use tauri::{Emitter, Manager};
 
 #[cfg(windows)]
-use domain::{Language, RetentionPeriod, UserSettings};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
+
+#[cfg(windows)]
+use domain::{
+    AccentColor, CaptureSound, Language, RetentionPeriod, Shortcut, ShortcutKey, ShortcutModifiers,
+    UserSettings,
+};
 
 #[cfg(windows)]
 use serde::Serialize;
+
+#[cfg(windows)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ClipboardGroupView {
+    id: domain::GroupId,
+    name: String,
+}
+
+#[cfg(windows)]
+struct ClipboardGroups {
+    groups: Mutex<Vec<ClipboardGroupView>>,
+    repository: Option<Arc<SqliteRepository>>,
+}
+
+#[cfg(windows)]
+impl ClipboardGroups {
+    fn list(&self) -> Vec<ClipboardGroupView> {
+        lock_unpoisoned(&self.groups).clone()
+    }
+
+    fn create(&self, name: String) -> Result<ClipboardGroupView, String> {
+        let name = validate_group_name(name)?;
+        let mut groups = lock_unpoisoned(&self.groups);
+        if groups
+            .iter()
+            .any(|group| group.name.eq_ignore_ascii_case(&name))
+        {
+            return Err("clipboard group name already exists".to_owned());
+        }
+        let group = ClipboardGroupView {
+            id: domain::GroupId::new(),
+            name,
+        };
+        let repository = self
+            .repository
+            .as_ref()
+            .ok_or_else(|| "clipboard group was not saved to local storage".to_owned())?;
+        repository
+            .save_group(group.id, &group.name)
+            .map_err(|error| error.to_string())?;
+        groups.push(group.clone());
+        Ok(group)
+    }
+
+    fn rename(&self, id: domain::GroupId, name: String) -> Result<ClipboardGroupView, String> {
+        let name = validate_group_name(name)?;
+        let mut groups = lock_unpoisoned(&self.groups);
+        if groups
+            .iter()
+            .any(|group| group.id != id && group.name.eq_ignore_ascii_case(&name))
+        {
+            return Err("clipboard group name already exists".to_owned());
+        }
+        let group = groups
+            .iter_mut()
+            .find(|group| group.id == id)
+            .ok_or_else(|| "clipboard group is no longer available".to_owned())?;
+        let repository = self
+            .repository
+            .as_ref()
+            .ok_or_else(|| "clipboard group was not saved to local storage".to_owned())?;
+        repository
+            .save_group(id, &name)
+            .map_err(|error| error.to_string())?;
+        group.name = name;
+        Ok(group.clone())
+    }
+
+    fn move_group(
+        &self,
+        id: domain::GroupId,
+        direction: i8,
+    ) -> Result<Vec<ClipboardGroupView>, String> {
+        let mut groups = lock_unpoisoned(&self.groups);
+        let index = groups
+            .iter()
+            .position(|group| group.id == id)
+            .ok_or_else(|| "clipboard group is no longer available".to_owned())?;
+        let target = if direction < 0 {
+            index.checked_sub(1)
+        } else if direction > 0 && index + 1 < groups.len() {
+            Some(index + 1)
+        } else {
+            None
+        };
+        let Some(target) = target else {
+            return Ok(groups.clone());
+        };
+        groups.swap(index, target);
+        let repository = self
+            .repository
+            .as_ref()
+            .ok_or_else(|| "clipboard group order was not saved to local storage".to_owned())?;
+        if let Err(error) =
+            repository.save_group_order(&groups.iter().map(|group| group.id).collect::<Vec<_>>())
+        {
+            groups.swap(index, target);
+            return Err(error.to_string());
+        }
+        Ok(groups.clone())
+    }
+
+    fn delete(&self, id: domain::GroupId) -> Result<(), String> {
+        let mut groups = lock_unpoisoned(&self.groups);
+        let index = groups
+            .iter()
+            .position(|group| group.id == id)
+            .ok_or_else(|| "clipboard group is no longer available".to_owned())?;
+        let repository = self
+            .repository
+            .as_ref()
+            .ok_or_else(|| "clipboard group was not deleted from local storage".to_owned())?;
+        repository
+            .delete_group(id)
+            .map_err(|error| error.to_string())?;
+        groups.remove(index);
+        Ok(())
+    }
+
+    fn contains(&self, id: domain::GroupId) -> bool {
+        lock_unpoisoned(&self.groups)
+            .iter()
+            .any(|group| group.id == id)
+    }
+
+    fn replace_all(&self, groups: Vec<(domain::GroupId, String)>) {
+        *lock_unpoisoned(&self.groups) = groups
+            .into_iter()
+            .map(|(id, name)| ClipboardGroupView { id, name })
+            .collect();
+    }
+}
+
+#[cfg(windows)]
+fn validate_group_name(name: String) -> Result<String, String> {
+    let name = name.trim().to_owned();
+    if name.is_empty() || name.contains(['\r', '\n']) || name.chars().count() > 30 {
+        return Err("clipboard group name is invalid".to_owned());
+    }
+    Ok(name)
+}
 
 #[cfg(windows)]
 type WindowsSafePasteService = SafePasteService<
@@ -49,20 +199,103 @@ struct ClipboardRuntime {
 
 #[cfg(windows)]
 struct HotkeyRuntime {
-    hotkey: Mutex<Option<platform::windows::hotkey::GlobalHotkey>>,
+    activation: Mutex<Option<platform::windows::hotkey::GlobalHotkey>>,
+    groups: Mutex<Option<platform::windows::hotkey::GroupHotkeys>>,
+    quick_paste: Mutex<Option<platform::windows::hotkey::QuickPasteHotkeys>>,
 }
 
 #[cfg(windows)]
 impl Drop for HotkeyRuntime {
     fn drop(&mut self) {
-        if let Some(hotkey) = self
-            .hotkey
-            .get_mut()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take()
-        {
-            hotkey.shutdown();
+        drop(
+            self.activation
+                .get_mut()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take(),
+        );
+        drop(
+            self.groups
+                .get_mut()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take(),
+        );
+        drop(
+            self.quick_paste
+                .get_mut()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take(),
+        );
+    }
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ActiveGroup {
+    #[default]
+    All,
+    Ungrouped,
+    Group(domain::GroupId),
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ActiveGroupView {
+    kind: &'static str,
+    group_id: Option<domain::GroupId>,
+}
+
+#[cfg(windows)]
+impl From<ActiveGroup> for ActiveGroupView {
+    fn from(active: ActiveGroup) -> Self {
+        match active {
+            ActiveGroup::All => Self {
+                kind: "all",
+                group_id: None,
+            },
+            ActiveGroup::Ungrouped => Self {
+                kind: "ungrouped",
+                group_id: None,
+            },
+            ActiveGroup::Group(group_id) => Self {
+                kind: "group",
+                group_id: Some(group_id),
+            },
         }
+    }
+}
+
+#[cfg(windows)]
+struct ActiveGroupState(Mutex<ActiveGroup>);
+
+#[cfg(windows)]
+impl ActiveGroupState {
+    fn current(&self) -> ActiveGroup {
+        *lock_unpoisoned(&self.0)
+    }
+
+    fn set(&self, active: ActiveGroup) {
+        *lock_unpoisoned(&self.0) = active;
+    }
+
+    fn switch(&self, direction: i8, groups: &[ClipboardGroupView]) -> ActiveGroup {
+        let mut choices = Vec::with_capacity(groups.len() + 2);
+        choices.push(ActiveGroup::All);
+        choices.push(ActiveGroup::Ungrouped);
+        choices.extend(groups.iter().map(|group| ActiveGroup::Group(group.id)));
+        let current = self.current();
+        let index = choices
+            .iter()
+            .position(|choice| *choice == current)
+            .unwrap_or(0);
+        let next = if direction < 0 {
+            index.checked_sub(1).unwrap_or(choices.len() - 1)
+        } else {
+            (index + 1) % choices.len()
+        };
+        self.set(choices[next]);
+        choices[next]
     }
 }
 
@@ -76,13 +309,48 @@ enum HotkeyStatus {
 }
 
 #[cfg(windows)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SettingsView {
     language: Language,
     retention: RetentionPeriod,
+    start_at_sign_in: bool,
+    start_minimized: bool,
+    show_tray_icon: bool,
+    accent_color: AccentColor,
+    sound_enabled: bool,
+    capture_sound: CaptureSound,
+    custom_sound_available: bool,
+    activation_shortcut: Shortcut,
+    group_shortcut_modifiers: ShortcutModifiers,
+    quick_paste_enabled: bool,
+    quick_paste_modifiers: ShortcutModifiers,
     storage_available: bool,
     hotkey_status: HotkeyStatus,
+    capture_paused: bool,
+    excluded_applications: Vec<String>,
+}
+
+#[cfg(windows)]
+struct DesktopRuntime {
+    tray: TrayIcon,
+    exiting: AtomicBool,
+}
+
+#[cfg(windows)]
+impl DesktopRuntime {
+    fn set_language(&self, language: Language) {
+        let tooltip = match language {
+            Language::ZhCn => "剪贴板助手",
+            Language::En => "Clipboard Assistant",
+        };
+        let _ = self.tray.set_tooltip(Some(tooltip));
+    }
+}
+
+#[cfg(windows)]
+fn mark_application_exiting(exiting: &AtomicBool) {
+    exiting.store(true, Ordering::Release);
 }
 
 #[cfg(windows)]
@@ -92,6 +360,8 @@ struct ApplicationSettings {
     records: Arc<SessionRecordStore>,
     storage_available: Arc<AtomicBool>,
     hotkey_status: Mutex<HotkeyStatus>,
+    custom_sound_path: std::path::PathBuf,
+    capture_policy: Arc<platform::windows::clipboard::CapturePolicy>,
 }
 
 #[cfg(windows)]
@@ -101,8 +371,21 @@ impl ApplicationSettings {
         SettingsView {
             language: current.language,
             retention: current.retention,
+            start_at_sign_in: current.start_at_sign_in,
+            start_minimized: current.start_minimized,
+            show_tray_icon: current.show_tray_icon,
+            accent_color: current.accent_color,
+            sound_enabled: current.sound_enabled,
+            capture_sound: current.capture_sound,
+            custom_sound_available: self.custom_sound_path.is_file(),
+            activation_shortcut: current.activation_shortcut,
+            group_shortcut_modifiers: current.group_shortcut_modifiers,
+            quick_paste_enabled: current.quick_paste_enabled,
+            quick_paste_modifiers: current.quick_paste_modifiers,
             storage_available: self.storage_available.load(Ordering::Acquire),
             hotkey_status: *lock_unpoisoned(&self.hotkey_status),
+            capture_paused: self.capture_policy.is_paused(),
+            excluded_applications: self.capture_policy.excluded_applications(),
         }
     }
 
@@ -117,6 +400,88 @@ impl ApplicationSettings {
         self.persist_settings();
         self.prune_expired();
         self.view()
+    }
+
+    fn update_start_at_sign_in(&self, enabled: bool) -> SettingsView {
+        lock_unpoisoned(&self.current).start_at_sign_in = enabled;
+        self.persist_settings();
+        self.view()
+    }
+
+    fn update_start_minimized(&self, enabled: bool) -> SettingsView {
+        lock_unpoisoned(&self.current).start_minimized = enabled;
+        self.persist_settings();
+        self.view()
+    }
+
+    fn update_show_tray_icon(&self, enabled: bool) -> SettingsView {
+        let mut current = lock_unpoisoned(&self.current);
+        current.show_tray_icon = enabled;
+        if !enabled {
+            current.start_minimized = false;
+        }
+        drop(current);
+        self.persist_settings();
+        self.view()
+    }
+
+    fn update_accent_color(&self, accent_color: AccentColor) -> SettingsView {
+        lock_unpoisoned(&self.current).accent_color = accent_color;
+        self.persist_settings();
+        self.view()
+    }
+
+    fn update_sound_enabled(&self, enabled: bool) -> SettingsView {
+        lock_unpoisoned(&self.current).sound_enabled = enabled;
+        self.persist_settings();
+        self.view()
+    }
+
+    fn update_capture_sound(&self, capture_sound: CaptureSound) -> SettingsView {
+        lock_unpoisoned(&self.current).capture_sound = capture_sound;
+        self.persist_settings();
+        self.view()
+    }
+
+    fn update_shortcuts(
+        &self,
+        activation: Shortcut,
+        group_modifiers: ShortcutModifiers,
+        quick_paste_enabled: bool,
+        quick_paste_modifiers: ShortcutModifiers,
+    ) -> SettingsView {
+        let mut current = lock_unpoisoned(&self.current);
+        current.activation_shortcut = activation;
+        current.group_shortcut_modifiers = group_modifiers;
+        current.quick_paste_enabled = quick_paste_enabled;
+        current.quick_paste_modifiers = quick_paste_modifiers;
+        drop(current);
+        self.persist_settings();
+        self.view()
+    }
+
+    fn replace_current(&self, settings: UserSettings) -> SettingsView {
+        *lock_unpoisoned(&self.current) = settings;
+        self.view()
+    }
+
+    fn current(&self) -> UserSettings {
+        *lock_unpoisoned(&self.current)
+    }
+
+    fn play_capture_sound(&self) {
+        let current = *lock_unpoisoned(&self.current);
+        if !current.sound_enabled {
+            return;
+        }
+        let result = match current.capture_sound {
+            CaptureSound::Default => platform::windows::sound::play_default(),
+            CaptureSound::Custom if self.custom_sound_path.is_file() => {
+                platform::windows::sound::play_file(&self.custom_sound_path)
+            }
+            CaptureSound::Custom => platform::windows::sound::play_default(),
+        };
+        let _ = result;
     }
 
     fn prune_expired(&self) -> usize {
@@ -141,6 +506,53 @@ impl ApplicationSettings {
             self.storage_available.store(false, Ordering::Release);
         }
     }
+
+    fn update_capture_paused(&self, paused: bool) -> SettingsView {
+        self.capture_policy.set_paused(paused);
+        self.view()
+    }
+
+    fn update_excluded_applications(
+        &self,
+        applications: Vec<String>,
+    ) -> Result<SettingsView, String> {
+        let applications = normalize_excluded_applications(applications)?;
+        if let Some(persistence) = &self.persistence {
+            persistence
+                .save_excluded_applications(&applications)
+                .map_err(|error| error.to_string())?;
+        } else {
+            return Err("local clipboard storage is unavailable".to_owned());
+        }
+        self.capture_policy.set_excluded_applications(applications);
+        Ok(self.view())
+    }
+}
+
+#[cfg(windows)]
+fn normalize_excluded_applications(applications: Vec<String>) -> Result<Vec<String>, String> {
+    if applications.len() > 50 {
+        return Err("too_many_excluded_applications".to_owned());
+    }
+    let mut normalized = Vec::new();
+    for application in applications {
+        let trimmed = application.trim();
+        let name = std::path::Path::new(trimmed)
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or(trimmed)
+            .trim();
+        if name.is_empty() || name.chars().count() > 128 || name.contains(['/', '\\']) {
+            return Err("invalid_excluded_application".to_owned());
+        }
+        if !normalized
+            .iter()
+            .any(|existing: &String| existing.eq_ignore_ascii_case(name))
+        {
+            normalized.push(name.to_owned());
+        }
+    }
+    Ok(normalized)
 }
 
 #[cfg(windows)]
@@ -241,7 +653,8 @@ fn spawn_clipboard_event_drain(
 #[cfg(all(test, windows))]
 mod runtime_tests {
     use super::{
-        ApplicationSettings, HotkeyStatus, spawn_clipboard_event_drain, spawn_periodic_retention,
+        ActiveGroup, ActiveGroupState, ApplicationSettings, ClipboardGroupView, HotkeyStatus,
+        spawn_clipboard_event_drain, spawn_periodic_retention,
     };
     use crate::{
         domain::{
@@ -258,6 +671,32 @@ mod runtime_tests {
         atomic::{AtomicBool, Ordering},
     };
     use tempfile::tempdir;
+
+    #[test]
+    fn active_group_switching_wraps_in_both_directions() {
+        let group = ClipboardGroupView {
+            id: crate::domain::GroupId::new(),
+            name: "Accounts".to_owned(),
+        };
+        let active = ActiveGroupState(Mutex::new(ActiveGroup::All));
+
+        assert_eq!(
+            active.switch(-1, std::slice::from_ref(&group)),
+            ActiveGroup::Group(group.id)
+        );
+        assert_eq!(
+            active.switch(1, std::slice::from_ref(&group)),
+            ActiveGroup::All
+        );
+        assert_eq!(
+            active.switch(1, std::slice::from_ref(&group)),
+            ActiveGroup::Ungrouped
+        );
+        assert_eq!(
+            active.switch(1, std::slice::from_ref(&group)),
+            ActiveGroup::Group(group.id)
+        );
+    }
 
     #[test]
     fn clipboard_event_drain_stops_even_when_event_senders_remain_alive() {
@@ -348,6 +787,8 @@ mod runtime_tests {
             records: Arc::clone(&records),
             storage_available: Arc::clone(&storage_available),
             hotkey_status: Mutex::new(HotkeyStatus::Unavailable),
+            custom_sound_path: std::path::PathBuf::new(),
+            capture_policy: Arc::new(crate::platform::windows::clipboard::CapturePolicy::default()),
         };
 
         settings.update_retention(RetentionPeriod::SevenDays);
@@ -374,6 +815,28 @@ mod runtime_tests {
     }
 
     #[test]
+    fn hiding_the_tray_also_disables_start_minimized() {
+        let settings = ApplicationSettings {
+            current: Mutex::new(UserSettings {
+                start_minimized: true,
+                show_tray_icon: true,
+                ..UserSettings::default()
+            }),
+            persistence: None,
+            records: Arc::new(SessionRecordStore::default()),
+            storage_available: Arc::new(AtomicBool::new(false)),
+            hotkey_status: Mutex::new(HotkeyStatus::Unavailable),
+            custom_sound_path: std::path::PathBuf::new(),
+            capture_policy: Arc::new(crate::platform::windows::clipboard::CapturePolicy::default()),
+        };
+
+        let view = settings.update_show_tray_icon(false);
+
+        assert!(!view.show_tray_icon);
+        assert!(!view.start_minimized);
+    }
+
+    #[test]
     fn periodic_retention_prunes_expired_memory_without_clipboard_activity() {
         let records = Arc::new(SessionRecordStore::default());
         assert!(records.capture(CapturedClipboard {
@@ -393,6 +856,8 @@ mod runtime_tests {
             records: Arc::clone(&records),
             storage_available: Arc::new(AtomicBool::new(false)),
             hotkey_status: Mutex::new(HotkeyStatus::Unavailable),
+            custom_sound_path: std::path::PathBuf::new(),
+            capture_policy: Arc::new(crate::platform::windows::clipboard::CapturePolicy::default()),
         });
         let (pruned, observed) = std::sync::mpsc::channel();
         let settings_for_tick = Arc::clone(&settings);
@@ -458,6 +923,17 @@ fn list_session_records(
 
 #[cfg(windows)]
 #[tauri::command]
+fn get_record_image_preview(
+    record_id: domain::RecordId,
+    records: tauri::State<'_, Arc<SessionRecordStore>>,
+) -> Result<ImagePreviewView, String> {
+    SessionRecordCommands::new(records.inner())
+        .image_preview(record_id)
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(windows)]
+#[tauri::command]
 fn update_record_note(
     record_id: domain::RecordId,
     note: String,
@@ -474,8 +950,197 @@ fn update_record_note(
 
 #[cfg(windows)]
 #[tauri::command]
+fn delete_session_record(
+    record_id: domain::RecordId,
+    records: tauri::State<'_, Arc<SessionRecordStore>>,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    SessionRecordCommands::new(records.inner())
+        .delete(record_id)
+        .map_err(|error| error.to_string())?;
+    let _ = app.emit("clipboard-records-changed", ());
+    Ok(())
+}
+
+#[cfg(windows)]
+#[tauri::command]
+fn undo_delete_session_record(
+    record_id: domain::RecordId,
+    records: tauri::State<'_, Arc<SessionRecordStore>>,
+    app: tauri::AppHandle,
+) -> Result<SessionRecordView, String> {
+    let restored = SessionRecordCommands::new(records.inner())
+        .restore_last_deleted(record_id)
+        .map_err(|error| error.to_string())?;
+    let _ = app.emit("clipboard-records-changed", ());
+    Ok(restored)
+}
+
+#[cfg(windows)]
+#[tauri::command]
+fn clear_clipboard_history(
+    records: tauri::State<'_, Arc<SessionRecordStore>>,
+    app: tauri::AppHandle,
+) -> Result<usize, String> {
+    let removed = SessionRecordCommands::new(records.inner())
+        .clear()
+        .map_err(|error| error.to_string())?;
+    let _ = app.emit("clipboard-records-changed", ());
+    Ok(removed)
+}
+
+#[cfg(windows)]
+#[tauri::command]
+fn list_clipboard_groups(
+    groups: tauri::State<'_, Arc<ClipboardGroups>>,
+) -> Vec<ClipboardGroupView> {
+    groups.list()
+}
+
+#[cfg(windows)]
+#[tauri::command]
+fn get_active_group(active: tauri::State<'_, Arc<ActiveGroupState>>) -> ActiveGroupView {
+    active.current().into()
+}
+
+#[cfg(windows)]
+#[tauri::command]
+fn set_active_group(
+    kind: String,
+    group_id: Option<domain::GroupId>,
+    groups: tauri::State<'_, Arc<ClipboardGroups>>,
+    active: tauri::State<'_, Arc<ActiveGroupState>>,
+    app: tauri::AppHandle,
+) -> Result<ActiveGroupView, String> {
+    let value = match kind.as_str() {
+        "all" => ActiveGroup::All,
+        "ungrouped" => ActiveGroup::Ungrouped,
+        "group" => {
+            let id = group_id.ok_or_else(|| "clipboard group is required".to_owned())?;
+            if !groups.contains(id) {
+                return Err("clipboard group is no longer available".to_owned());
+            }
+            ActiveGroup::Group(id)
+        }
+        _ => return Err("clipboard group selection is invalid".to_owned()),
+    };
+    active.set(value);
+    let view = ActiveGroupView::from(value);
+    let _ = app.emit("active-group-changed", view);
+    Ok(view)
+}
+
+#[cfg(windows)]
+#[tauri::command]
+fn create_clipboard_group(
+    name: String,
+    groups: tauri::State<'_, Arc<ClipboardGroups>>,
+    app: tauri::AppHandle,
+) -> Result<ClipboardGroupView, String> {
+    let group = groups.create(name)?;
+    let _ = app.emit("clipboard-groups-changed", ());
+    Ok(group)
+}
+
+#[cfg(windows)]
+#[tauri::command]
+fn rename_clipboard_group(
+    group_id: domain::GroupId,
+    name: String,
+    groups: tauri::State<'_, Arc<ClipboardGroups>>,
+    app: tauri::AppHandle,
+) -> Result<ClipboardGroupView, String> {
+    let group = groups.rename(group_id, name)?;
+    let _ = app.emit("clipboard-groups-changed", ());
+    Ok(group)
+}
+
+#[cfg(windows)]
+#[tauri::command]
+fn move_clipboard_group(
+    group_id: domain::GroupId,
+    direction: i8,
+    groups: tauri::State<'_, Arc<ClipboardGroups>>,
+    app: tauri::AppHandle,
+) -> Result<Vec<ClipboardGroupView>, String> {
+    if direction != -1 && direction != 1 {
+        return Err("clipboard group direction is invalid".to_owned());
+    }
+    let ordered = groups.move_group(group_id, direction)?;
+    let _ = app.emit("clipboard-groups-changed", ());
+    Ok(ordered)
+}
+
+#[cfg(windows)]
+#[tauri::command]
+fn delete_clipboard_group(
+    group_id: domain::GroupId,
+    groups: tauri::State<'_, Arc<ClipboardGroups>>,
+    records: tauri::State<'_, Arc<SessionRecordStore>>,
+    active: tauri::State<'_, Arc<ActiveGroupState>>,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    groups.delete(group_id)?;
+    records.clear_group(group_id);
+    if active.current() == ActiveGroup::Group(group_id) {
+        active.set(ActiveGroup::Ungrouped);
+        let _ = app.emit(
+            "active-group-changed",
+            ActiveGroupView::from(ActiveGroup::Ungrouped),
+        );
+    }
+    let _ = app.emit("clipboard-groups-changed", ());
+    let _ = app.emit("clipboard-records-changed", ());
+    Ok(())
+}
+
+#[cfg(windows)]
+#[tauri::command]
+fn update_record_group(
+    record_id: domain::RecordId,
+    group_id: Option<domain::GroupId>,
+    groups: tauri::State<'_, Arc<ClipboardGroups>>,
+    records: tauri::State<'_, Arc<SessionRecordStore>>,
+    app: tauri::AppHandle,
+) -> Result<SessionRecordView, String> {
+    if group_id.is_some_and(|id| !groups.contains(id)) {
+        return Err("clipboard group is no longer available".to_owned());
+    }
+    let result = SessionRecordCommands::new(records.inner())
+        .update_group(record_id, group_id)
+        .map_err(|error| error.to_string());
+    let _ = app.emit("clipboard-records-changed", ());
+    result
+}
+
+#[cfg(windows)]
+#[tauri::command]
 fn get_settings(settings: tauri::State<'_, Arc<ApplicationSettings>>) -> SettingsView {
     settings.view()
+}
+
+#[cfg(windows)]
+#[tauri::command]
+fn update_capture_paused(
+    paused: bool,
+    settings: tauri::State<'_, Arc<ApplicationSettings>>,
+    app: tauri::AppHandle,
+) -> SettingsView {
+    let view = settings.update_capture_paused(paused);
+    let _ = app.emit("settings-changed", view.clone());
+    view
+}
+
+#[cfg(windows)]
+#[tauri::command]
+fn update_excluded_applications(
+    applications: Vec<String>,
+    settings: tauri::State<'_, Arc<ApplicationSettings>>,
+    app: tauri::AppHandle,
+) -> Result<SettingsView, String> {
+    let view = settings.update_excluded_applications(applications)?;
+    let _ = app.emit("settings-changed", view.clone());
+    Ok(view)
 }
 
 #[cfg(windows)]
@@ -483,10 +1148,12 @@ fn get_settings(settings: tauri::State<'_, Arc<ApplicationSettings>>) -> Setting
 fn update_language(
     language: Language,
     settings: tauri::State<'_, Arc<ApplicationSettings>>,
+    desktop: tauri::State<'_, Arc<DesktopRuntime>>,
     app: tauri::AppHandle,
 ) -> SettingsView {
     let view = settings.update_language(language);
-    let _ = app.emit("settings-changed", view);
+    desktop.set_language(language);
+    let _ = app.emit("settings-changed", &view);
     view
 }
 
@@ -498,9 +1165,519 @@ fn update_retention(
     app: tauri::AppHandle,
 ) -> SettingsView {
     let view = settings.update_retention(retention);
-    let _ = app.emit("settings-changed", view);
+    let _ = app.emit("settings-changed", &view);
     let _ = app.emit("clipboard-records-changed", ());
     view
+}
+
+#[cfg(windows)]
+#[tauri::command]
+fn update_start_at_sign_in(
+    enabled: bool,
+    settings: tauri::State<'_, Arc<ApplicationSettings>>,
+    app: tauri::AppHandle,
+) -> Result<SettingsView, String> {
+    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+    platform::windows::startup::set_start_at_sign_in(enabled, &executable)?;
+    let view = settings.update_start_at_sign_in(enabled);
+    let _ = app.emit("settings-changed", &view);
+    Ok(view)
+}
+
+#[cfg(windows)]
+#[tauri::command]
+fn update_start_minimized(
+    enabled: bool,
+    settings: tauri::State<'_, Arc<ApplicationSettings>>,
+    app: tauri::AppHandle,
+) -> SettingsView {
+    let view = settings.update_start_minimized(enabled);
+    let _ = app.emit("settings-changed", &view);
+    view
+}
+
+#[cfg(windows)]
+#[tauri::command]
+fn update_show_tray_icon(
+    enabled: bool,
+    settings: tauri::State<'_, Arc<ApplicationSettings>>,
+    desktop: tauri::State<'_, Arc<DesktopRuntime>>,
+    app: tauri::AppHandle,
+) -> Result<SettingsView, String> {
+    desktop
+        .tray
+        .set_visible(enabled)
+        .map_err(|error| error.to_string())?;
+    let view = settings.update_show_tray_icon(enabled);
+    let _ = app.emit("settings-changed", &view);
+    Ok(view)
+}
+
+#[cfg(windows)]
+#[tauri::command]
+fn update_accent_color(
+    accent_color: AccentColor,
+    settings: tauri::State<'_, Arc<ApplicationSettings>>,
+    app: tauri::AppHandle,
+) -> SettingsView {
+    let view = settings.update_accent_color(accent_color);
+    let _ = app.emit("settings-changed", &view);
+    view
+}
+
+#[cfg(windows)]
+#[tauri::command]
+fn update_sound_enabled(
+    enabled: bool,
+    settings: tauri::State<'_, Arc<ApplicationSettings>>,
+    app: tauri::AppHandle,
+) -> SettingsView {
+    let view = settings.update_sound_enabled(enabled);
+    let _ = app.emit("settings-changed", &view);
+    view
+}
+
+#[cfg(windows)]
+#[tauri::command]
+fn update_capture_sound(
+    capture_sound: CaptureSound,
+    settings: tauri::State<'_, Arc<ApplicationSettings>>,
+    app: tauri::AppHandle,
+) -> Result<SettingsView, String> {
+    if capture_sound == CaptureSound::Custom && !settings.custom_sound_path.is_file() {
+        return Err("custom capture sound is unavailable".to_owned());
+    }
+    let view = settings.update_capture_sound(capture_sound);
+    let _ = app.emit("settings-changed", &view);
+    Ok(view)
+}
+
+#[cfg(windows)]
+#[tauri::command]
+fn choose_custom_sound(
+    settings: tauri::State<'_, Arc<ApplicationSettings>>,
+    app: tauri::AppHandle,
+) -> Result<Option<SettingsView>, String> {
+    let Some(source) = rfd::FileDialog::new()
+        .add_filter("WAV audio", &["wav"])
+        .pick_file()
+    else {
+        return Ok(None);
+    };
+    if !source
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("wav"))
+    {
+        return Err("custom capture sound must be a WAV file".to_owned());
+    }
+    let metadata = std::fs::metadata(&source).map_err(|error| error.to_string())?;
+    if metadata.len() > 10 * 1024 * 1024 {
+        return Err("custom capture sound exceeds 10 MB".to_owned());
+    }
+    let header = std::fs::read(&source).map_err(|error| error.to_string())?;
+    if header.len() < 12 || &header[0..4] != b"RIFF" || &header[8..12] != b"WAVE" {
+        return Err("custom capture sound is not a valid WAV file".to_owned());
+    }
+    if let Some(parent) = settings.custom_sound_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    if source != settings.custom_sound_path {
+        std::fs::copy(&source, &settings.custom_sound_path).map_err(|error| error.to_string())?;
+    }
+    let view = settings.update_capture_sound(CaptureSound::Custom);
+    settings.play_capture_sound();
+    let _ = app.emit("settings-changed", &view);
+    Ok(Some(view))
+}
+
+#[cfg(windows)]
+#[tauri::command]
+fn export_backup(settings: tauri::State<'_, Arc<ApplicationSettings>>) -> Result<bool, String> {
+    let Some(destination) = rfd::FileDialog::new()
+        .add_filter("Clipboard Assistant backup", &["clipbackup"])
+        .set_file_name(format!(
+            "clipboard-assistant-backup-{}.clipbackup",
+            chrono::Local::now().format("%Y-%m-%d")
+        ))
+        .save_file()
+    else {
+        return Ok(false);
+    };
+    let persistence = settings
+        .persistence
+        .as_ref()
+        .ok_or_else(|| "local clipboard storage is unavailable".to_owned())?;
+    persistence
+        .backup(destination)
+        .map_err(|error| error.to_string())?;
+    Ok(true)
+}
+
+#[cfg(windows)]
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+fn restore_backup(
+    settings: tauri::State<'_, Arc<ApplicationSettings>>,
+    runtime: tauri::State<'_, HotkeyRuntime>,
+    groups: tauri::State<'_, Arc<ClipboardGroups>>,
+    records: tauri::State<'_, Arc<SessionRecordStore>>,
+    active: tauri::State<'_, Arc<ActiveGroupState>>,
+    coordinator: tauri::State<'_, Arc<WindowsQuickPanelCoordinator>>,
+    desktop: tauri::State<'_, Arc<DesktopRuntime>>,
+    app: tauri::AppHandle,
+) -> Result<Option<SettingsView>, String> {
+    let Some(source) = rfd::FileDialog::new()
+        .add_filter("Clipboard Assistant backup", &["clipbackup"])
+        .pick_file()
+    else {
+        return Ok(None);
+    };
+    let persistence = settings
+        .persistence
+        .as_ref()
+        .ok_or_else(|| "local clipboard storage is unavailable".to_owned())?;
+    let restored = persistence
+        .restore(
+            source,
+            RestoreBudget {
+                max_records: services::session_records::MAX_SESSION_RECORDS,
+                max_total_bytes: services::session_records::DEFAULT_STORE_BYTES,
+                max_record_bytes: services::session_records::MAX_CAPTURE_RECORD_BYTES,
+            },
+        )
+        .map_err(|error| error.to_string())?;
+
+    let previous = settings.current();
+    let mut effective = restored.settings;
+    if effective.capture_sound == CaptureSound::Custom && !settings.custom_sound_path.is_file() {
+        effective.capture_sound = CaptureSound::Default;
+    }
+    if !effective.show_tray_icon {
+        effective.start_minimized = false;
+    }
+    if validate_shortcuts(
+        effective.activation_shortcut,
+        effective.group_shortcut_modifiers,
+        effective.quick_paste_modifiers,
+    )
+    .is_err()
+        || reconfigure_hotkeys(
+            effective.activation_shortcut,
+            effective.group_shortcut_modifiers,
+            effective.quick_paste_enabled,
+            effective.quick_paste_modifiers,
+            previous,
+            &runtime,
+            groups.inner(),
+            records.inner(),
+            active.inner(),
+            coordinator.inner(),
+            &app,
+        )
+        .is_err()
+    {
+        effective.activation_shortcut = previous.activation_shortcut;
+        effective.group_shortcut_modifiers = previous.group_shortcut_modifiers;
+        effective.quick_paste_enabled = previous.quick_paste_enabled;
+        effective.quick_paste_modifiers = previous.quick_paste_modifiers;
+    }
+
+    records.replace_all(restored.records);
+    groups.replace_all(restored.groups);
+    active.set(ActiveGroup::All);
+    let startup_updated = std::env::current_exe()
+        .ok()
+        .and_then(|executable| {
+            platform::windows::startup::set_start_at_sign_in(
+                effective.start_at_sign_in,
+                &executable,
+            )
+            .ok()
+        })
+        .is_some();
+    if !startup_updated {
+        effective.start_at_sign_in = previous.start_at_sign_in;
+    }
+    if desktop.tray.set_visible(effective.show_tray_icon).is_err() {
+        effective.show_tray_icon = previous.show_tray_icon;
+        effective.start_minimized = previous.start_minimized;
+    }
+    desktop.set_language(effective.language);
+    settings
+        .capture_policy
+        .set_excluded_applications(normalize_excluded_applications(
+            restored.excluded_applications,
+        )?);
+    let view = settings.replace_current(effective);
+    settings.persist_settings();
+    let _ = app.emit("clipboard-records-changed", ());
+    let _ = app.emit("clipboard-groups-changed", ());
+    let _ = app.emit(
+        "active-group-changed",
+        ActiveGroupView::from(ActiveGroup::All),
+    );
+    let _ = app.emit("settings-changed", &view);
+    Ok(Some(view))
+}
+
+#[cfg(windows)]
+#[tauri::command]
+fn preview_capture_sound(settings: tauri::State<'_, Arc<ApplicationSettings>>) {
+    settings.play_capture_sound();
+}
+
+#[cfg(windows)]
+fn validate_shortcuts(
+    activation: Shortcut,
+    group_modifiers: ShortcutModifiers,
+    quick_paste_modifiers: ShortcutModifiers,
+) -> Result<(), String> {
+    if !activation.modifiers.is_safe_global_shortcut()
+        || !group_modifiers.is_safe_global_shortcut()
+        || !quick_paste_modifiers.is_safe_global_shortcut()
+    {
+        return Err("shortcut_requires_ctrl_alt_or_win".to_owned());
+    }
+    if (activation.key == ShortcutKey::Left || activation.key == ShortcutKey::Right)
+        && activation.modifiers == group_modifiers
+    {
+        return Err("shortcut_conflict".to_owned());
+    }
+    if matches!(
+        activation.key,
+        ShortcutKey::Digit1
+            | ShortcutKey::Digit2
+            | ShortcutKey::Digit3
+            | ShortcutKey::Digit4
+            | ShortcutKey::Digit5
+            | ShortcutKey::Digit6
+            | ShortcutKey::Digit7
+            | ShortcutKey::Digit8
+            | ShortcutKey::Digit9
+    ) && activation.modifiers == quick_paste_modifiers
+    {
+        return Err("shortcut_conflict".to_owned());
+    }
+    if activation.modifiers.alt && activation.key == ShortcutKey::F4
+        || activation.modifiers.win && activation.key == ShortcutKey::L
+    {
+        return Err("shortcut_reserved".to_owned());
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn start_activation_hotkey(
+    shortcut: Shortcut,
+    app: tauri::AppHandle,
+    coordinator: Arc<WindowsQuickPanelCoordinator>,
+) -> Result<platform::windows::hotkey::GlobalHotkey, String> {
+    platform::windows::hotkey::GlobalHotkey::start(shortcut, move || {
+        let coordinator = Arc::clone(&coordinator);
+        let _ = app.run_on_main_thread(move || {
+            let _ = coordinator.toggle();
+        });
+    })
+    .map_err(|error| error.to_string())
+}
+
+#[cfg(windows)]
+fn start_group_hotkeys(
+    modifiers: ShortcutModifiers,
+    app: tauri::AppHandle,
+    active: Arc<ActiveGroupState>,
+    groups: Arc<ClipboardGroups>,
+    coordinator: Arc<WindowsQuickPanelCoordinator>,
+) -> Result<platform::windows::hotkey::GroupHotkeys, String> {
+    platform::windows::hotkey::GroupHotkeys::start(modifiers, move |direction| {
+        let app = app.clone();
+        let active = Arc::clone(&active);
+        let groups = Arc::clone(&groups);
+        let coordinator = Arc::clone(&coordinator);
+        let _ = app.clone().run_on_main_thread(move || {
+            let view = ActiveGroupView::from(active.switch(direction, &groups.list()));
+            let _ = app.emit("active-group-changed", view);
+            let _ = coordinator.show();
+        });
+    })
+    .map_err(|error| error.to_string())
+}
+
+#[cfg(windows)]
+fn start_quick_paste_hotkeys(
+    modifiers: ShortcutModifiers,
+    app: tauri::AppHandle,
+    records: Arc<SessionRecordStore>,
+    active: Arc<ActiveGroupState>,
+    coordinator: Arc<WindowsQuickPanelCoordinator>,
+) -> Result<platform::windows::hotkey::QuickPasteHotkeys, String> {
+    platform::windows::hotkey::QuickPasteHotkeys::start(modifiers, move |index| {
+        let records = Arc::clone(&records);
+        let active = Arc::clone(&active);
+        let coordinator = Arc::clone(&coordinator);
+        let app = app.clone();
+        let _ = app.run_on_main_thread(move || {
+            let selected = records
+                .list()
+                .into_iter()
+                .filter(|record| match active.current() {
+                    ActiveGroup::All => true,
+                    ActiveGroup::Ungrouped => record.group_id.is_none(),
+                    ActiveGroup::Group(id) => record.group_id == Some(id),
+                })
+                .nth(index);
+            let Some(selected) = selected else {
+                return;
+            };
+            if let Some(representations) = records.representations(selected.id) {
+                let _ = coordinator.direct_paste(&representations);
+            }
+        });
+    })
+    .map_err(|error| error.to_string())
+}
+
+#[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
+fn reconfigure_hotkeys(
+    activation: Shortcut,
+    group_modifiers: ShortcutModifiers,
+    quick_paste_enabled: bool,
+    quick_paste_modifiers: ShortcutModifiers,
+    previous: UserSettings,
+    runtime: &HotkeyRuntime,
+    groups: &Arc<ClipboardGroups>,
+    records: &Arc<SessionRecordStore>,
+    active: &Arc<ActiveGroupState>,
+    coordinator: &Arc<WindowsQuickPanelCoordinator>,
+    app: &tauri::AppHandle,
+) -> Result<(), String> {
+    drop(lock_unpoisoned(&runtime.activation).take());
+    drop(lock_unpoisoned(&runtime.groups).take());
+    drop(lock_unpoisoned(&runtime.quick_paste).take());
+
+    let register = || -> Result<_, String> {
+        let activation_registration =
+            start_activation_hotkey(activation, app.clone(), Arc::clone(coordinator))?;
+        let group_registration = start_group_hotkeys(
+            group_modifiers,
+            app.clone(),
+            Arc::clone(active),
+            Arc::clone(groups),
+            Arc::clone(coordinator),
+        )?;
+        let quick_paste_registration = quick_paste_enabled
+            .then(|| {
+                start_quick_paste_hotkeys(
+                    quick_paste_modifiers,
+                    app.clone(),
+                    Arc::clone(records),
+                    Arc::clone(active),
+                    Arc::clone(coordinator),
+                )
+            })
+            .transpose()?;
+        Ok((
+            activation_registration,
+            group_registration,
+            quick_paste_registration,
+        ))
+    };
+    let registrations = match register() {
+        Ok(registrations) => registrations,
+        Err(error) => {
+            *lock_unpoisoned(&runtime.activation) = start_activation_hotkey(
+                previous.activation_shortcut,
+                app.clone(),
+                Arc::clone(coordinator),
+            )
+            .ok();
+            *lock_unpoisoned(&runtime.groups) = start_group_hotkeys(
+                previous.group_shortcut_modifiers,
+                app.clone(),
+                Arc::clone(active),
+                Arc::clone(groups),
+                Arc::clone(coordinator),
+            )
+            .ok();
+            *lock_unpoisoned(&runtime.quick_paste) = previous
+                .quick_paste_enabled
+                .then(|| {
+                    start_quick_paste_hotkeys(
+                        previous.quick_paste_modifiers,
+                        app.clone(),
+                        Arc::clone(records),
+                        Arc::clone(active),
+                        Arc::clone(coordinator),
+                    )
+                })
+                .transpose()
+                .ok()
+                .flatten();
+            return Err(error);
+        }
+    };
+    *lock_unpoisoned(&runtime.activation) = Some(registrations.0);
+    *lock_unpoisoned(&runtime.groups) = Some(registrations.1);
+    *lock_unpoisoned(&runtime.quick_paste) = registrations.2;
+    Ok(())
+}
+
+#[cfg(windows)]
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+fn update_shortcuts(
+    activation: Shortcut,
+    group_modifiers: ShortcutModifiers,
+    quick_paste_enabled: bool,
+    quick_paste_modifiers: ShortcutModifiers,
+    settings: tauri::State<'_, Arc<ApplicationSettings>>,
+    runtime: tauri::State<'_, HotkeyRuntime>,
+    groups: tauri::State<'_, Arc<ClipboardGroups>>,
+    records: tauri::State<'_, Arc<SessionRecordStore>>,
+    active: tauri::State<'_, Arc<ActiveGroupState>>,
+    coordinator: tauri::State<'_, Arc<WindowsQuickPanelCoordinator>>,
+    app: tauri::AppHandle,
+) -> Result<SettingsView, String> {
+    validate_shortcuts(activation, group_modifiers, quick_paste_modifiers)?;
+    reconfigure_hotkeys(
+        activation,
+        group_modifiers,
+        quick_paste_enabled,
+        quick_paste_modifiers,
+        settings.current(),
+        &runtime,
+        groups.inner(),
+        records.inner(),
+        active.inner(),
+        coordinator.inner(),
+        &app,
+    )?;
+    *lock_unpoisoned(&settings.hotkey_status) = HotkeyStatus::Available;
+    let view = settings.update_shortcuts(
+        activation,
+        group_modifiers,
+        quick_paste_enabled,
+        quick_paste_modifiers,
+    );
+    let _ = app.emit("settings-changed", &view);
+    Ok(view)
+}
+
+#[cfg(windows)]
+fn show_settings_window(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window("settings") {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+    }
+}
+
+#[cfg(windows)]
+#[tauri::command]
+fn exit_application(app: tauri::AppHandle, desktop: tauri::State<'_, Arc<DesktopRuntime>>) {
+    mark_application_exiting(&desktop.exiting);
+    app.exit(0);
 }
 
 #[cfg(windows)]
@@ -519,9 +1696,29 @@ fn toggle_quick_panel(
     coordinator.toggle()
 }
 
+#[cfg(windows)]
+#[tauri::command]
+fn begin_quick_panel_drag(controller: tauri::State<'_, Arc<PanelController>>) {
+    controller.begin_dragging();
+}
+
+#[cfg(windows)]
+#[tauri::command]
+fn finish_quick_panel_drag(
+    controller: tauri::State<'_, Arc<PanelController>>,
+) -> Result<(), String> {
+    controller
+        .finish_dragging()
+        .map_err(|error| error.to_string())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let builder = tauri::Builder::default();
+    #[cfg(windows)]
+    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+        show_settings_window(app);
+    }));
     #[cfg(windows)]
     let builder = builder
         .setup(|app| {
@@ -531,7 +1728,12 @@ pub fn run() {
             platform::windows::configure_quick_panel_style(panel.hwnd()?)?;
             let panel_controller = Arc::new(PanelController::new(panel));
             let storage_available = Arc::new(AtomicBool::new(false));
-            let (repository, user_settings, loaded_records) = app
+            let app_data_dir = app.path().app_data_dir().ok();
+            let custom_sound_path = app_data_dir
+                .as_ref()
+                .map(|directory| directory.join("capture-sound.wav"))
+                .unwrap_or_default();
+            let (repository, user_settings, excluded_applications, loaded_records) = app
                 .path()
                 .app_data_dir()
                 .ok()
@@ -548,15 +1750,27 @@ pub fn run() {
                             max_record_bytes: services::session_records::MAX_CAPTURE_RECORD_BYTES,
                         })
                         .ok()?;
-                    Some((repository, settings, records))
+                    let exclusions = repository.load_excluded_applications().ok()?;
+                    Some((repository, settings, exclusions, records))
                 })
                 .map_or(
-                    (None, UserSettings::default(), Vec::new()),
-                    |(repository, settings, records)| {
+                    (None, UserSettings::default(), Vec::new(), Vec::new()),
+                    |(repository, settings, exclusions, records)| {
                         storage_available.store(true, Ordering::Release);
-                        (Some(repository), settings, records)
+                        (Some(repository), settings, exclusions, records)
                     },
                 );
+            let loaded_groups = repository
+                .as_ref()
+                .and_then(|repository| repository.load_groups().ok())
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(id, name)| ClipboardGroupView { id, name })
+                .collect();
+            let groups = Arc::new(ClipboardGroups {
+                groups: Mutex::new(loaded_groups),
+                repository: repository.clone(),
+            });
             let persistence = repository.and_then(|repository| {
                 PersistenceWorker::start(repository, Arc::clone(&storage_available)).ok()
             });
@@ -574,10 +1788,14 @@ pub fn run() {
                     Arc::clone(&storage_available),
                 )),
             };
+            let capture_policy = Arc::new(platform::windows::clipboard::CapturePolicy::new(
+                normalize_excluded_applications(excluded_applications).unwrap_or_default(),
+            ));
             let (clipboard_events, clipboard_receiver) =
-                platform::windows::clipboard::latest_clipboard_event_channel(Arc::clone(
-                    &session_records,
-                ));
+                platform::windows::clipboard::latest_clipboard_event_channel_with_policy(
+                    Arc::clone(&session_records),
+                    Arc::clone(&capture_policy),
+                );
             let listener =
                 platform::windows::clipboard::ClipboardListener::start(clipboard_events)?;
             let settings_state = Arc::new(ApplicationSettings {
@@ -586,12 +1804,49 @@ pub fn run() {
                 records: Arc::clone(&session_records),
                 storage_available,
                 hotkey_status: Mutex::new(HotkeyStatus::Unavailable),
+                custom_sound_path,
+                capture_policy,
             });
+            let settings_window = app
+                .get_webview_window("settings")
+                .ok_or_else(|| "settings window is missing".to_owned())?;
+            let tray = TrayIconBuilder::with_id("main-tray")
+                .show_menu_on_left_click(false)
+                .tooltip("剪贴板助手")
+                .icon(
+                    app.default_window_icon()
+                        .ok_or_else(|| "application icon is missing".to_owned())?
+                        .clone(),
+                )
+                .on_tray_icon_event(|tray, event| {
+                    if matches!(
+                        event,
+                        TrayIconEvent::Click {
+                            button: MouseButton::Left,
+                            button_state: MouseButtonState::Up,
+                            ..
+                        }
+                    ) {
+                        show_settings_window(tray.app_handle());
+                    }
+                })
+                .build(app)?;
+            tray.set_visible(user_settings.show_tray_icon)?;
+            let desktop = Arc::new(DesktopRuntime {
+                tray,
+                exiting: AtomicBool::new(false),
+            });
+            desktop.set_language(user_settings.language);
+            if !user_settings.start_minimized {
+                settings_window.show()?;
+                settings_window.set_focus()?;
+            }
             let app_handle = app.handle().clone();
             let settings_for_drain = Arc::clone(&settings_state);
             let (event_drain_stop, event_drain) =
                 spawn_clipboard_event_drain(clipboard_receiver, move || {
                     settings_for_drain.prune_expired();
+                    settings_for_drain.play_capture_sound();
                     let _ = app_handle.emit("clipboard-records-changed", ());
                     let _ = app_handle.emit("settings-changed", settings_for_drain.view());
                 })?;
@@ -615,25 +1870,57 @@ pub fn run() {
                 Arc::clone(&panel_controller),
                 paste,
             ));
-            let hotkey_app = app.handle().clone();
-            let hotkey_coordinator = Arc::clone(&coordinator);
-            let hotkey = platform::windows::hotkey::GlobalHotkey::start(move || {
-                let coordinator = Arc::clone(&hotkey_coordinator);
-                let _ = hotkey_app.run_on_main_thread(move || {
-                    let _ = coordinator.toggle();
-                });
-            });
-            *lock_unpoisoned(&settings_state.hotkey_status) = match &hotkey {
+            let active_group = Arc::new(ActiveGroupState(Mutex::new(ActiveGroup::All)));
+            let activation_hotkey = start_activation_hotkey(
+                user_settings.activation_shortcut,
+                app.handle().clone(),
+                Arc::clone(&coordinator),
+            );
+            *lock_unpoisoned(&settings_state.hotkey_status) = match &activation_hotkey {
                 Ok(_) => HotkeyStatus::Available,
-                Err(platform::windows::hotkey::HotkeyError::Conflict) => HotkeyStatus::Conflict,
+                Err(error) if error.contains("already in use") => HotkeyStatus::Conflict,
                 Err(_) => HotkeyStatus::Unavailable,
             };
+            let group_hotkeys = start_group_hotkeys(
+                user_settings.group_shortcut_modifiers,
+                app.handle().clone(),
+                Arc::clone(&active_group),
+                Arc::clone(&groups),
+                Arc::clone(&coordinator),
+            );
+            let quick_paste_hotkeys = if user_settings.quick_paste_enabled {
+                match start_quick_paste_hotkeys(
+                    user_settings.quick_paste_modifiers,
+                    app.handle().clone(),
+                    Arc::clone(&session_records),
+                    Arc::clone(&active_group),
+                    Arc::clone(&coordinator),
+                ) {
+                    Ok(hotkeys) => Some(hotkeys),
+                    Err(_) => {
+                        settings_state.update_shortcuts(
+                            user_settings.activation_shortcut,
+                            user_settings.group_shortcut_modifiers,
+                            false,
+                            user_settings.quick_paste_modifiers,
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
             app.manage(Arc::clone(&panel_controller));
-            app.manage(session_records);
-            app.manage(coordinator);
+            app.manage(Arc::clone(&groups));
+            app.manage(Arc::clone(&session_records));
+            app.manage(Arc::clone(&coordinator));
+            app.manage(active_group);
             app.manage(Arc::clone(&settings_state));
+            app.manage(desktop);
             app.manage(HotkeyRuntime {
-                hotkey: Mutex::new(hotkey.ok()),
+                activation: Mutex::new(activation_hotkey.ok()),
+                groups: Mutex::new(group_hotkeys.ok()),
+                quick_paste: Mutex::new(quick_paste_hotkeys),
             });
             app.manage(ClipboardRuntime {
                 listener: std::sync::Mutex::new(Some(listener)),
@@ -645,6 +1932,17 @@ pub fn run() {
             Ok(())
         })
         .on_window_event(|window, event| {
+            if window.label() == "settings" {
+                if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                    let settings = window.state::<Arc<ApplicationSettings>>().view();
+                    let desktop = window.state::<Arc<DesktopRuntime>>();
+                    if settings.show_tray_icon && !desktop.exiting.load(Ordering::Acquire) {
+                        api.prevent_close();
+                        let _ = window.hide();
+                    }
+                }
+                return;
+            }
             if window.label() != "quick-panel" {
                 return;
             }
@@ -652,10 +1950,20 @@ pub fn run() {
             let coordinator = window.state::<Arc<WindowsQuickPanelCoordinator>>();
             match event {
                 tauri::WindowEvent::Focused(focused) => {
+                    if !focused
+                        && window
+                            .hwnd()
+                            .is_ok_and(platform::windows::is_window_in_move_or_size)
+                    {
+                        controller.begin_resizing();
+                    }
                     let result = controller.on_focus_changed(*focused);
                     if !focused && (result.is_err() || !controller.is_visible()) {
                         coordinator.clear_target();
                     }
+                }
+                tauri::WindowEvent::Resized(_) | tauri::WindowEvent::Moved(_) => {
+                    controller.note_native_bounds_change();
                 }
                 tauri::WindowEvent::ScaleFactorChanged { .. } => {
                     let _ = controller.reposition_if_visible();
@@ -672,12 +1980,40 @@ pub fn run() {
             show_quick_panel,
             hide_quick_panel,
             toggle_quick_panel,
+            begin_quick_panel_drag,
+            finish_quick_panel_drag,
             paste_selected,
             list_session_records,
+            get_record_image_preview,
             update_record_note,
+            delete_session_record,
+            undo_delete_session_record,
+            clear_clipboard_history,
+            list_clipboard_groups,
+            get_active_group,
+            set_active_group,
+            create_clipboard_group,
+            rename_clipboard_group,
+            move_clipboard_group,
+            delete_clipboard_group,
+            update_record_group,
             get_settings,
             update_language,
-            update_retention
+            update_retention,
+            update_start_at_sign_in,
+            update_start_minimized,
+            update_show_tray_icon,
+            update_accent_color,
+            update_sound_enabled,
+            update_capture_sound,
+            update_capture_paused,
+            update_excluded_applications,
+            choose_custom_sound,
+            preview_capture_sound,
+            export_backup,
+            restore_backup,
+            update_shortcuts,
+            exit_application
         ]);
     #[cfg(not(windows))]
     let builder = builder.invoke_handler(tauri::generate_handler![greet]);
@@ -689,6 +2025,10 @@ pub fn run() {
 
 #[cfg(all(test, windows))]
 mod desktop_configuration_tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use super::mark_application_exiting;
+
     #[test]
     fn dpi_awareness_is_manifest_owned_and_runtime_does_not_reset_it() {
         let manifest = include_str!("../windows-app-manifest.xml");
@@ -707,5 +2047,14 @@ mod desktop_configuration_tests {
 
         assert!(main.contains("cfg_attr(windows, windows_subsystem = \"windows\")"));
         assert!(!main.contains("not(debug_assertions)"));
+    }
+
+    #[test]
+    fn explicit_exit_marks_the_runtime_before_shutdown() {
+        let exiting = AtomicBool::new(false);
+
+        mark_application_exiting(&exiting);
+
+        assert!(exiting.load(Ordering::Acquire));
     }
 }

@@ -7,5 +7,6 @@ pub use clipboard::{CapturedClipboard, ClipboardRepresentation, ContentIdentity,
 pub use paste::{PasteFallbackReason, PasteOutcome, TargetToken};
 pub use record::{ClipboardRecord, GroupId, RecordId, RecordNote, RecordNoteError, RefreshError};
 pub use settings::{
-    AppSettings, ClipboardSettings, Language, PasteSettings, RetentionPeriod, UserSettings,
+    AccentColor, AppSettings, CaptureSound, ClipboardSettings, Language, PasteSettings,
+    RetentionPeriod, Shortcut, ShortcutKey, ShortcutModifiers, UserSettings,
 };

@@ -46,3 +46,7 @@ secrets.json
 *.njsproj
 *.sln
 *.sw?
+
+# Local implementation worktrees and portable acceptance builds
+.worktrees/
+artifacts/*.exe

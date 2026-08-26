@@ -6,8 +6,8 @@ use std::{
     path::Path,
     ptr,
     sync::{
-        Arc, Condvar, Mutex,
-        atomic::{AtomicU64, Ordering},
+        Arc, Condvar, Mutex, RwLock,
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{RecvTimeoutError, Sender, sync_channel},
     },
     thread::{self, JoinHandle},
@@ -225,10 +225,23 @@ fn begin_product_write_transaction_with_spawner(
 ) -> Result<ProductWriteGuard, ClipboardListenerError> {
     let events = events.into();
     let mut state = lock_unpoisoned(&product_write);
-    if !matches!(*state, ProductWriteState::Idle) {
-        return Err(ClipboardListenerError::ProductWriteAlreadyInProgress);
+    let previously_expected = match *state {
+        ProductWriteState::Expected { sequence } => Some(sequence),
+        ProductWriteState::Idle => None,
+        ProductWriteState::Armed { .. } => {
+            return Err(ClipboardListenerError::ProductWriteAlreadyInProgress);
+        }
+    };
+    let mut armed = ProductWriteState::armed(baseline);
+    if let (
+        Some(sequence),
+        ProductWriteState::Armed {
+            owned_sequences, ..
+        },
+    ) = (previously_expected, &mut armed)
+    {
+        owned_sequences.push(sequence);
     }
-    let armed = ProductWriteState::armed(baseline);
     let transaction_id = armed.transaction_id().expect("armed state has an id");
     *state = armed;
     let (cancel_timeout, timeout_cancelled) = sync_channel(1);
@@ -926,9 +939,7 @@ fn route_event(
                 let _ = events.send_batch(batch);
             }
         }
-        ProductWriteState::Expected { sequence } if *sequence == event.sequence_number => {
-            *state = ProductWriteState::Idle;
-        }
+        ProductWriteState::Expected { sequence } if *sequence == event.sequence_number => {}
         ProductWriteState::Expected { .. } => {
             *state = ProductWriteState::Idle;
             let _ = events.send_event(event);
@@ -1632,6 +1643,7 @@ enum EventSenderKind {
 
 struct ClipboardIngestionShared {
     records: Arc<SessionRecordStore>,
+    policy: Arc<CapturePolicy>,
     queue: Mutex<ClipboardIngestionQueue>,
     queue_changed: Condvar,
     revision: AtomicU64,
@@ -1639,6 +1651,67 @@ struct ClipboardIngestionShared {
     notification_changed: Condvar,
     total_bytes_limit: usize,
     record_count_limit: usize,
+}
+
+#[derive(Default)]
+pub struct CapturePolicy {
+    paused: AtomicBool,
+    excluded_applications: RwLock<Vec<String>>,
+}
+
+impl CapturePolicy {
+    pub fn new(excluded_applications: Vec<String>) -> Self {
+        Self {
+            paused: AtomicBool::new(false),
+            excluded_applications: RwLock::new(excluded_applications),
+        }
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.paused.load(Ordering::Acquire)
+    }
+
+    pub fn set_paused(&self, paused: bool) {
+        self.paused.store(paused, Ordering::Release);
+    }
+
+    pub fn excluded_applications(&self) -> Vec<String> {
+        self.excluded_applications
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    pub fn set_excluded_applications(&self, applications: Vec<String>) {
+        *self
+            .excluded_applications
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = applications;
+    }
+
+    fn allows(&self, capture: &CapturedClipboard) -> bool {
+        if self.is_paused() {
+            return false;
+        }
+        let excluded = self
+            .excluded_applications
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        !excluded.iter().any(|application| {
+            capture
+                .source
+                .application_name
+                .as_deref()
+                .is_some_and(|name| name.eq_ignore_ascii_case(application))
+                || capture
+                    .source
+                    .executable_path
+                    .as_deref()
+                    .and_then(|path| Path::new(path).file_name())
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.eq_ignore_ascii_case(application))
+        })
+    }
 }
 
 struct ClipboardIngestionQueue {
@@ -1728,13 +1801,40 @@ pub fn latest_clipboard_event_channel(
     clipboard_event_channel_with_limits(records, INGESTION_QUEUE_BYTES, INGESTION_QUEUE_EVENTS)
 }
 
+pub fn latest_clipboard_event_channel_with_policy(
+    records: Arc<SessionRecordStore>,
+    policy: Arc<CapturePolicy>,
+) -> (EventSender, LatestClipboardEventReceiver) {
+    clipboard_event_channel_with_policy_and_limits(
+        records,
+        policy,
+        INGESTION_QUEUE_BYTES,
+        INGESTION_QUEUE_EVENTS,
+    )
+}
+
 fn clipboard_event_channel_with_limits(
     records: Arc<SessionRecordStore>,
     total_bytes_limit: usize,
     record_count_limit: usize,
 ) -> (EventSender, LatestClipboardEventReceiver) {
+    clipboard_event_channel_with_policy_and_limits(
+        records,
+        Arc::new(CapturePolicy::default()),
+        total_bytes_limit,
+        record_count_limit,
+    )
+}
+
+fn clipboard_event_channel_with_policy_and_limits(
+    records: Arc<SessionRecordStore>,
+    policy: Arc<CapturePolicy>,
+    total_bytes_limit: usize,
+    record_count_limit: usize,
+) -> (EventSender, LatestClipboardEventReceiver) {
     let shared = Arc::new(ClipboardIngestionShared {
         records,
+        policy,
         queue: Mutex::new(ClipboardIngestionQueue {
             captures: VecDeque::new(),
             reserved_bytes: 0,
@@ -1878,14 +1978,17 @@ fn run_clipboard_ingestion(shared: Arc<ClipboardIngestionShared>) {
             }
         }
 
-        let status = shared.records.capture_one(queued.capture);
+        let status = shared
+            .policy
+            .allows(&queued.capture)
+            .then(|| shared.records.capture_one(queued.capture));
         {
             let mut state = lock_unpoisoned(&shared.queue);
             state.reserved_bytes = state.reserved_bytes.saturating_sub(queued.bytes);
             state.reserved_count = state.reserved_count.saturating_sub(1);
             state.processing = false;
         }
-        if !matches!(status, CaptureStatus::RejectedTooLarge) {
+        if status.is_some_and(|status| !matches!(status, CaptureStatus::RejectedTooLarge)) {
             let revision = shared.revision.fetch_add(1, Ordering::AcqRel) + 1;
             *lock_unpoisoned(&shared.notification) = Some(revision);
             shared.notification_changed.notify_one();
@@ -2052,14 +2155,15 @@ mod tests {
     use chrono::Utc;
 
     use super::{
-        CF_UNICODETEXT_FORMAT, ClipboardEvent, ClipboardListenerError, ClipboardMemoryReader,
-        ClipboardReadError, ClipboardWriteError, EventSender, LatestClipboardEventReceiver,
-        MAX_CAPTURE_PAYLOAD_BYTES, MAX_IMAGE_PAYLOAD_BYTES, ProductWriteGuard, ProductWriteState,
-        ReadyWait, ShutdownFailure, begin_product_write_transaction,
-        begin_product_write_transaction_with_spawner, capture_source, classify_format_read,
-        classify_global_unlock, classify_registered_format, clipboard_event_channel_with_limits,
-        combine_clipboard_operation_and_close, decode_unicode_text, finish_product_write,
-        latest_clipboard_event_channel, orchestrate_listener_initialization,
+        CF_UNICODETEXT_FORMAT, CapturePolicy, ClipboardEvent, ClipboardListenerError,
+        ClipboardMemoryReader, ClipboardReadError, ClipboardWriteError, EventSender,
+        LatestClipboardEventReceiver, MAX_CAPTURE_PAYLOAD_BYTES, MAX_IMAGE_PAYLOAD_BYTES,
+        ProductWriteGuard, ProductWriteState, ReadyWait, ShutdownFailure,
+        begin_product_write_transaction, begin_product_write_transaction_with_spawner,
+        capture_source, classify_format_read, classify_global_unlock, classify_registered_format,
+        clipboard_event_channel_with_limits, combine_clipboard_operation_and_close,
+        decode_unicode_text, finish_product_write, latest_clipboard_event_channel,
+        latest_clipboard_event_channel_with_policy, orchestrate_listener_initialization,
         read_bounded_representations, representation_bytes, route_event, validate_representations,
     };
     use crate::domain::{
@@ -2132,16 +2236,36 @@ mod tests {
     }
 
     #[test]
-    fn notification_after_finish_is_suppressed_once() {
+    fn repeated_notifications_after_finish_are_suppressed_until_sequence_changes() {
         let (events, receiver) = mpsc::channel();
         let state = Arc::new(Mutex::new(ProductWriteState::armed(50)));
 
         product_write_guard(Arc::clone(&state), events.clone()).finish(&[51]);
 
         route_event(&state, &events, event(51));
+        route_event(&state, &events, event(51));
         assert!(receiver.try_recv().is_err());
         route_event(&state, &events, event(52));
         assert_eq!(receiver.recv().unwrap().sequence_number, 52);
+    }
+
+    #[test]
+    fn next_product_write_accepts_and_suppresses_late_prior_notification() {
+        let (events, receiver) = mpsc::channel();
+        let state = Arc::new(Mutex::new(ProductWriteState::Expected { sequence: 51 }));
+
+        let guard = begin_product_write_transaction(
+            Arc::clone(&state),
+            events.clone(),
+            51,
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        route_event(&state, &events, event(51));
+        route_event(&state, &events, event(52));
+        guard.finish(&[52]);
+
+        assert!(receiver.try_recv().is_err());
     }
 
     #[test]
@@ -3143,6 +3267,32 @@ mod tests {
             combine_clipboard_operation_and_close::<(), &str, &str>(Err("read"), Err("close"))
                 .unwrap_err();
         assert_eq!(error, (Some("read"), Some("close")));
+    }
+
+    #[test]
+    fn capture_policy_blocks_paused_and_excluded_sources_before_history() {
+        let records = Arc::new(SessionRecordStore::default());
+        let policy = Arc::new(CapturePolicy::new(vec!["KeePass.exe".to_owned()]));
+        let (events, receiver) =
+            latest_clipboard_event_channel_with_policy(Arc::clone(&records), Arc::clone(&policy));
+        let mut excluded = text_event(1, "secret");
+        excluded.captured.source = SourceIdentity {
+            application_name: Some("KeePass".to_owned()),
+            executable_path: Some(r"C:\Tools\KeePass.exe".to_owned()),
+        };
+        events.send(excluded).unwrap();
+        receiver.wait_for_processed_generation(1, Duration::from_secs(1));
+        assert!(records.list().is_empty());
+
+        policy.set_paused(true);
+        events.send(text_event(2, "paused")).unwrap();
+        receiver.wait_for_processed_generation(2, Duration::from_secs(1));
+        assert!(records.list().is_empty());
+
+        policy.set_paused(false);
+        events.send(text_event(3, "allowed")).unwrap();
+        receiver.wait_for_processed_generation(3, Duration::from_secs(1));
+        assert_eq!(records.list()[0].text.as_deref(), Some("allowed"));
     }
 
     fn event(sequence_number: u32) -> ClipboardEvent {

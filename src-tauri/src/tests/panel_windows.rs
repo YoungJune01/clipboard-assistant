@@ -227,6 +227,66 @@ fn visible_panel_stays_on_owner_monitor_when_pointer_moves_elsewhere() {
 }
 
 #[test]
+fn manual_position_pauses_environment_reposition_until_the_next_show() {
+    let monitor = FakeMonitor::new(vec![
+        snapshot_on("A", point(1800, 900), rect(0, 0, 1920, 1040), 96),
+        snapshot_on("B", point(2500, 500), rect(1920, 0, 3840, 1040), 144),
+        snapshot_on("B", point(2500, 500), rect(1920, 0, 3840, 1040), 144),
+    ]);
+    let window = FakeWindow::default();
+    let service = PanelService::new(monitor.clone(), window.clone(), dip(400, 300));
+
+    service.show().unwrap();
+    let initial_bounds = window.last_bounds();
+    service.begin_dragging();
+    service.finish_dragging().unwrap();
+
+    assert!(!service.owner_environment_changed().unwrap());
+    service.reposition_if_visible().unwrap();
+    assert_eq!(window.last_bounds(), initial_bounds);
+    assert_eq!(monitor.query_count(), 1);
+
+    service.hide().unwrap();
+    service.show().unwrap();
+    assert_eq!(monitor.query_count(), 2);
+    assert_ne!(window.last_bounds(), initial_bounds);
+}
+
+#[test]
+fn native_drag_temporarily_suppresses_focus_loss_then_restores_normal_hiding() {
+    let monitor = FakeMonitor::new(vec![snapshot(point(100, 100), rect(0, 0, 1920, 1040), 96)]);
+    let window = FakeWindow::default();
+    let service = PanelService::new(monitor, window.clone(), dip(400, 300));
+
+    service.show().unwrap();
+    service.begin_dragging();
+    service.on_focus_changed(false).unwrap();
+    assert!(service.is_visible());
+
+    service.finish_dragging().unwrap();
+    assert!(service.is_visible());
+    service.on_focus_changed(false).unwrap();
+    assert!(!service.is_visible());
+}
+
+#[test]
+fn native_resize_temporarily_suppresses_focus_loss_then_restores_normal_hiding() {
+    let monitor = FakeMonitor::new(vec![snapshot(point(100, 100), rect(0, 0, 1920, 1040), 96)]);
+    let window = FakeWindow::default();
+    let service = PanelService::new(monitor, window.clone(), dip(400, 300));
+
+    service.show().unwrap();
+    service.begin_resizing();
+    service.on_focus_changed(false).unwrap();
+    assert!(service.is_visible());
+
+    service.finish_resizing().unwrap();
+    assert!(service.is_visible());
+    service.on_focus_changed(false).unwrap();
+    assert!(!service.is_visible());
+}
+
+#[test]
 fn owner_monitor_changes_reposition_with_original_anchor_and_removal_falls_back() {
     let monitor = OwnerAwareMonitor::new(
         snapshot_on("A", point(1800, 1000), rect(0, 0, 1920, 1040), 96),

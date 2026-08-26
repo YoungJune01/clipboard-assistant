@@ -6,10 +6,11 @@ use std::{
     },
 };
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use serde::Serialize;
 
 use crate::domain::{
-    CapturedClipboard, ClipboardRecord, ClipboardRepresentation, RecordId, RecordNote,
+    CapturedClipboard, ClipboardRecord, ClipboardRepresentation, GroupId, RecordId, RecordNote,
     RecordNoteError,
 };
 use crate::services::persistence::RecordPersistence;
@@ -23,6 +24,11 @@ pub(crate) const MAX_CAPTURE_RECORD_BYTES: usize = 16 * 1024 * 1024;
 pub(crate) const REPRESENTATION_OVERHEAD_BYTES: usize = 32;
 const DEFAULT_RECORD_BYTES: usize = MAX_CAPTURE_RECORD_BYTES;
 const DEFAULT_PREVIEW_BYTES: usize = 4 * 1024;
+const IMAGE_PREVIEW_MAX_DIMENSION: u32 = 8192;
+const IMAGE_PREVIEW_MAX_PIXELS: u64 = 24_000_000;
+const IMAGE_PREVIEW_MAX_BYTES: usize = 2 * 1024 * 1024;
+const BITMAP_FILE_HEADER_BYTES: usize = 14;
+const BITMAP_V5_HEADER_BYTES: usize = 124;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -33,10 +39,20 @@ pub struct SessionRecordView {
     pub text: Option<String>,
     pub has_image: bool,
     pub note: Option<RecordNote>,
+    pub group_id: Option<GroupId>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImagePreviewView {
+    pub data_url: String,
+    pub width: u32,
+    pub height: u32,
 }
 
 pub struct SessionRecordStore {
     state: Mutex<SessionRecordState>,
+    last_deleted: Mutex<Option<ClipboardRecord>>,
     limits: SessionRecordLimits,
     persistence: NotePersistence,
     storage_available: Arc<AtomicBool>,
@@ -84,6 +100,7 @@ impl SessionRecordStore {
                 records: VecDeque::new(),
                 total_bytes: 0,
             }),
+            last_deleted: Mutex::new(None),
             limits,
             persistence: NotePersistence::NotConfigured,
             storage_available: Arc::new(AtomicBool::new(false)),
@@ -100,6 +117,7 @@ impl SessionRecordStore {
                 records: VecDeque::new(),
                 total_bytes: 0,
             }),
+            last_deleted: Mutex::new(None),
             limits: SessionRecordLimits {
                 total_bytes: DEFAULT_STORE_BYTES,
                 record_bytes: DEFAULT_RECORD_BYTES,
@@ -127,6 +145,7 @@ impl SessionRecordStore {
                 records: VecDeque::new(),
                 total_bytes: 0,
             }),
+            last_deleted: Mutex::new(None),
             limits: SessionRecordLimits {
                 total_bytes: DEFAULT_STORE_BYTES,
                 record_bytes: DEFAULT_RECORD_BYTES,
@@ -231,6 +250,20 @@ impl SessionRecordStore {
         record.map(|record| record.representations.clone())
     }
 
+    pub fn image_preview(&self, id: RecordId) -> Result<ImagePreviewView, SessionRecordError> {
+        let representations = self
+            .representations(id)
+            .ok_or(SessionRecordError::NotFound)?;
+        representations
+            .iter()
+            .find_map(|representation| match representation {
+                ClipboardRepresentation::Png { bytes } => png_preview(bytes),
+                ClipboardRepresentation::DibV5 { bytes } => dib_preview(bytes),
+                ClipboardRepresentation::UnicodeText { .. } => None,
+            })
+            .ok_or(SessionRecordError::ImagePreviewUnavailable)
+    }
+
     pub fn update_note(
         &self,
         id: RecordId,
@@ -295,6 +328,113 @@ impl SessionRecordStore {
         Ok(view)
     }
 
+    pub fn update_group(
+        &self,
+        id: RecordId,
+        group_id: Option<GroupId>,
+    ) -> Result<SessionRecordView, SessionRecordError> {
+        let mut state = lock_unpoisoned(&self.state);
+        let record = state
+            .records
+            .iter_mut()
+            .find(|record| record.id == id)
+            .ok_or(SessionRecordError::NotFound)?;
+        Arc::make_mut(record).group_id = group_id;
+        let updated = Arc::clone(record);
+        let view = SessionRecordView::from_record(&updated, self.limits.preview_bytes);
+        drop(state);
+        match &self.persistence {
+            NotePersistence::NotConfigured => {}
+            NotePersistence::SessionOnly => return Err(SessionRecordError::PersistenceUnavailable),
+            NotePersistence::Durable(persistence) => {
+                if !self.storage_available.load(Ordering::Acquire)
+                    || persistence.save_record(&updated).is_err()
+                {
+                    self.storage_available.store(false, Ordering::Release);
+                    return Err(SessionRecordError::PersistenceUnavailable);
+                }
+            }
+        }
+        Ok(view)
+    }
+
+    pub fn clear_group(&self, group_id: GroupId) -> usize {
+        let mut state = lock_unpoisoned(&self.state);
+        let mut changed = 0;
+        for record in &mut state.records {
+            if record.group_id == Some(group_id) {
+                Arc::make_mut(record).group_id = None;
+                changed += 1;
+            }
+        }
+        changed
+    }
+
+    pub fn delete(&self, id: RecordId) -> Result<ClipboardRecord, SessionRecordError> {
+        self.require_durable_storage()?;
+        let mut state = lock_unpoisoned(&self.state);
+        let index = state
+            .records
+            .iter()
+            .position(|record| record.id == id)
+            .ok_or(SessionRecordError::NotFound)?;
+        let removed = state
+            .records
+            .remove(index)
+            .ok_or(SessionRecordError::NotFound)?;
+        state.total_bytes = state.total_bytes.saturating_sub(record_bytes(&removed));
+        drop(state);
+        if let NotePersistence::Durable(persistence) = &self.persistence
+            && persistence.delete_record(id).is_err()
+        {
+            self.restore_in_memory(removed.as_ref().clone());
+            self.storage_available.store(false, Ordering::Release);
+            return Err(SessionRecordError::PersistenceUnavailable);
+        }
+        let removed = removed.as_ref().clone();
+        *lock_unpoisoned(&self.last_deleted) = Some(removed.clone());
+        Ok(removed)
+    }
+
+    pub fn restore_last_deleted(
+        &self,
+        id: RecordId,
+    ) -> Result<SessionRecordView, SessionRecordError> {
+        self.require_durable_storage()?;
+        let mut deleted = lock_unpoisoned(&self.last_deleted);
+        if deleted.as_ref().is_none_or(|record| record.id != id) {
+            return Err(SessionRecordError::NotFound);
+        }
+        let record = deleted.take().ok_or(SessionRecordError::NotFound)?;
+        drop(deleted);
+        let view = SessionRecordView::from_record(&record, self.limits.preview_bytes);
+        if let NotePersistence::Durable(persistence) = &self.persistence
+            && persistence.save_record(&record).is_err()
+        {
+            *lock_unpoisoned(&self.last_deleted) = Some(record);
+            self.storage_available.store(false, Ordering::Release);
+            return Err(SessionRecordError::PersistenceUnavailable);
+        }
+        self.restore_in_memory(record);
+        Ok(view)
+    }
+
+    pub fn clear(&self) -> Result<usize, SessionRecordError> {
+        self.require_durable_storage()?;
+        if let NotePersistence::Durable(persistence) = &self.persistence
+            && persistence.clear_records().is_err()
+        {
+            self.storage_available.store(false, Ordering::Release);
+            return Err(SessionRecordError::PersistenceUnavailable);
+        }
+        let mut state = lock_unpoisoned(&self.state);
+        let removed = state.records.len();
+        state.records.clear();
+        state.total_bytes = 0;
+        *lock_unpoisoned(&self.last_deleted) = None;
+        Ok(removed)
+    }
+
     pub fn prune_before(&self, cutoff: chrono::DateTime<chrono::Utc>) -> usize {
         let mut state = lock_unpoisoned(&self.state);
         let before = state.records.len();
@@ -311,8 +451,11 @@ impl SessionRecordStore {
         Arc::clone(&self.storage_available)
     }
 
-    fn replace_loaded(&self, records: Vec<ClipboardRecord>) {
+    pub(crate) fn replace_all(&self, records: Vec<ClipboardRecord>) {
         let mut state = lock_unpoisoned(&self.state);
+        state.records.clear();
+        state.total_bytes = 0;
+        *lock_unpoisoned(&self.last_deleted) = None;
         for mut record in records {
             retain_preferred_image(&mut record.representations);
             let Some(bytes) = checked_record_bytes(&record) else {
@@ -327,6 +470,10 @@ impl SessionRecordStore {
         }
     }
 
+    fn replace_loaded(&self, records: Vec<ClipboardRecord>) {
+        self.replace_all(records);
+    }
+
     fn persist_record(&self, record: &ClipboardRecord) {
         if let NotePersistence::Durable(persistence) = &self.persistence
             && self.storage_available.load(Ordering::Acquire)
@@ -334,6 +481,35 @@ impl SessionRecordStore {
         {
             self.storage_available.store(false, Ordering::Release);
         }
+    }
+
+    fn require_durable_storage(&self) -> Result<(), SessionRecordError> {
+        if !matches!(self.persistence, NotePersistence::Durable(_))
+            || !self.storage_available.load(Ordering::Acquire)
+        {
+            return Err(SessionRecordError::PersistenceUnavailable);
+        }
+        Ok(())
+    }
+
+    fn restore_in_memory(&self, record: ClipboardRecord) {
+        let mut state = lock_unpoisoned(&self.state);
+        if state
+            .records
+            .iter()
+            .any(|existing| existing.id == record.id)
+        {
+            return;
+        }
+        let bytes = record_bytes(&record);
+        let position = state
+            .records
+            .iter()
+            .position(|existing| existing.captured_at < record.captured_at)
+            .unwrap_or(state.records.len());
+        state.total_bytes = state.total_bytes.saturating_add(bytes);
+        state.records.insert(position, Arc::new(record));
+        evict_to_limits(&mut state, self.limits);
     }
 
     #[cfg(test)]
@@ -367,6 +543,7 @@ impl SessionRecordView {
             text,
             has_image,
             note: record.note.clone(),
+            group_id: record.group_id,
         }
     }
 }
@@ -448,6 +625,7 @@ pub enum SessionRecordError {
     InvalidNote(RecordNoteError),
     RecordTooLarge,
     PersistenceUnavailable,
+    ImagePreviewUnavailable,
 }
 
 impl std::fmt::Display for SessionRecordError {
@@ -457,7 +635,10 @@ impl std::fmt::Display for SessionRecordError {
             Self::InvalidNote(_) => formatter.write_str("clipboard record note is invalid"),
             Self::RecordTooLarge => formatter.write_str("clipboard record exceeds memory limits"),
             Self::PersistenceUnavailable => {
-                formatter.write_str("clipboard record note was not saved to local storage")
+                formatter.write_str("clipboard record metadata was not saved to local storage")
+            }
+            Self::ImagePreviewUnavailable => {
+                formatter.write_str("clipboard image preview is unavailable")
             }
         }
     }
@@ -486,6 +667,29 @@ impl<'a> SessionRecordCommands<'a> {
         self.store.update_note(id, value)
     }
 
+    pub fn update_group(
+        &self,
+        id: RecordId,
+        group_id: Option<GroupId>,
+    ) -> Result<SessionRecordView, SessionRecordError> {
+        self.store.update_group(id, group_id)
+    }
+
+    pub fn delete(&self, id: RecordId) -> Result<ClipboardRecord, SessionRecordError> {
+        self.store.delete(id)
+    }
+
+    pub fn restore_last_deleted(
+        &self,
+        id: RecordId,
+    ) -> Result<SessionRecordView, SessionRecordError> {
+        self.store.restore_last_deleted(id)
+    }
+
+    pub fn clear(&self) -> Result<usize, SessionRecordError> {
+        self.store.clear()
+    }
+
     pub fn representations(
         &self,
         id: RecordId,
@@ -494,6 +698,104 @@ impl<'a> SessionRecordCommands<'a> {
             .representations(id)
             .ok_or(SessionRecordError::NotFound)
     }
+
+    pub fn image_preview(&self, id: RecordId) -> Result<ImagePreviewView, SessionRecordError> {
+        self.store.image_preview(id)
+    }
+}
+
+fn png_preview(bytes: &[u8]) -> Option<ImagePreviewView> {
+    const PNG_SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
+    if bytes.len() > IMAGE_PREVIEW_MAX_BYTES
+        || bytes.get(..8)? != PNG_SIGNATURE
+        || bytes.get(12..16)? != b"IHDR"
+    {
+        return None;
+    }
+    let width = u32::from_be_bytes(bytes.get(16..20)?.try_into().ok()?);
+    let height = u32::from_be_bytes(bytes.get(20..24)?.try_into().ok()?);
+    valid_image_dimensions(width, height)?;
+    Some(ImagePreviewView {
+        data_url: format!("data:image/png;base64,{}", BASE64_STANDARD.encode(bytes)),
+        width,
+        height,
+    })
+}
+
+fn dib_preview(dib: &[u8]) -> Option<ImagePreviewView> {
+    if dib.len() > IMAGE_PREVIEW_MAX_BYTES {
+        return None;
+    }
+    let width = read_i32(dib, 4)?.unsigned_abs();
+    let height = read_i32(dib, 8)?.unsigned_abs();
+    valid_image_dimensions(width, height)?;
+    let bmp = dib_to_bmp(dib)?;
+    Some(ImagePreviewView {
+        data_url: format!("data:image/bmp;base64,{}", BASE64_STANDARD.encode(bmp)),
+        width,
+        height,
+    })
+}
+
+fn valid_image_dimensions(width: u32, height: u32) -> Option<()> {
+    if width == 0
+        || height == 0
+        || width > IMAGE_PREVIEW_MAX_DIMENSION
+        || height > IMAGE_PREVIEW_MAX_DIMENSION
+        || u64::from(width) * u64::from(height) > IMAGE_PREVIEW_MAX_PIXELS
+    {
+        return None;
+    }
+    Some(())
+}
+
+fn dib_to_bmp(dib: &[u8]) -> Option<Vec<u8>> {
+    let header_size = usize::try_from(read_u32(dib, 0)?).ok()?;
+    if header_size < BITMAP_V5_HEADER_BYTES || header_size > dib.len() {
+        return None;
+    }
+    let bits_per_pixel = usize::from(read_u16(dib, 14)?);
+    let colors_used = usize::try_from(read_u32(dib, 32)?).ok()?;
+    let palette_entries = if colors_used > 0 {
+        colors_used
+    } else if bits_per_pixel <= 8 {
+        1_usize.checked_shl(u32::try_from(bits_per_pixel).ok()?)?
+    } else {
+        0
+    };
+    let palette_bytes = palette_entries.checked_mul(4)?;
+    let pixel_offset = BITMAP_FILE_HEADER_BYTES
+        .checked_add(header_size)?
+        .checked_add(palette_bytes)?;
+    let file_size = BITMAP_FILE_HEADER_BYTES.checked_add(dib.len())?;
+    if pixel_offset > file_size || file_size > u32::MAX as usize {
+        return None;
+    }
+    let mut bmp = Vec::with_capacity(file_size);
+    bmp.extend_from_slice(b"BM");
+    bmp.extend_from_slice(&(file_size as u32).to_le_bytes());
+    bmp.extend_from_slice(&[0; 4]);
+    bmp.extend_from_slice(&(pixel_offset as u32).to_le_bytes());
+    bmp.extend_from_slice(dib);
+    Some(bmp)
+}
+
+fn read_u16(bytes: &[u8], offset: usize) -> Option<u16> {
+    Some(u16::from_le_bytes(
+        bytes.get(offset..offset + 2)?.try_into().ok()?,
+    ))
+}
+
+fn read_u32(bytes: &[u8], offset: usize) -> Option<u32> {
+    Some(u32::from_le_bytes(
+        bytes.get(offset..offset + 4)?.try_into().ok()?,
+    ))
+}
+
+fn read_i32(bytes: &[u8], offset: usize) -> Option<i32> {
+    Some(i32::from_le_bytes(
+        bytes.get(offset..offset + 4)?.try_into().ok()?,
+    ))
 }
 
 fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -511,6 +813,17 @@ mod tests {
     use crate::domain::{ContentIdentity, SourceIdentity};
     use crate::services::persistence::{PersistenceError, RecordPersistence};
 
+    fn png_bytes(width: u32, height: u32) -> Vec<u8> {
+        let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+        bytes.extend_from_slice(&13_u32.to_be_bytes());
+        bytes.extend_from_slice(b"IHDR");
+        bytes.extend_from_slice(&width.to_be_bytes());
+        bytes.extend_from_slice(&height.to_be_bytes());
+        bytes.extend_from_slice(&[8, 6, 0, 0, 0]);
+        bytes.extend_from_slice(&[0; 4]);
+        bytes
+    }
+
     struct FailingPersistence;
 
     impl RecordPersistence for FailingPersistence {
@@ -523,6 +836,14 @@ mod tests {
             _id: RecordId,
             _note: Option<&RecordNote>,
         ) -> Result<(), PersistenceError> {
+            Err(PersistenceError::WorkerUnavailable)
+        }
+
+        fn delete_record(&self, _id: RecordId) -> Result<(), PersistenceError> {
+            Err(PersistenceError::WorkerUnavailable)
+        }
+
+        fn clear_records(&self) -> Result<(), PersistenceError> {
             Err(PersistenceError::WorkerUnavailable)
         }
     }
@@ -630,6 +951,22 @@ mod tests {
     }
 
     #[test]
+    fn clearing_a_group_moves_only_matching_records_to_ungrouped() {
+        let group = GroupId::new();
+        let other_group = GroupId::new();
+        let mut first = ClipboardRecord::from_capture(capture("first", "one"));
+        first.group_id = Some(group);
+        let mut second = ClipboardRecord::from_capture(capture("second", "two"));
+        second.group_id = Some(other_group);
+        let store = SessionRecordStore::with_loaded(vec![first, second]);
+
+        assert_eq!(store.clear_group(group), 1);
+        let listed = store.list();
+        assert_eq!(listed[0].group_id, None);
+        assert_eq!(listed[1].group_id, Some(other_group));
+    }
+
+    #[test]
     fn command_boundary_resolves_payload_only_from_a_real_session_record_id() {
         let store = SessionRecordStore::default();
         let commands = SessionRecordCommands::new(&store);
@@ -644,6 +981,40 @@ mod tests {
                 text: "trusted text".to_owned(),
             }]
         );
+    }
+
+    #[test]
+    fn image_preview_is_bounded_png_and_requires_a_real_image_record() {
+        let store = SessionRecordStore::default();
+        let mut captured = capture("preview-image", "caption");
+        captured.representations.push(ClipboardRepresentation::Png {
+            bytes: png_bytes(1200, 600),
+        });
+        store.capture(captured);
+        let record = store.list().remove(0);
+
+        let preview = store.image_preview(record.id).unwrap();
+
+        assert_eq!((preview.width, preview.height), (1200, 600));
+        assert!(preview.data_url.starts_with("data:image/png;base64,"));
+        assert!(store.image_preview(RecordId::new()).is_err());
+    }
+
+    #[test]
+    fn malformed_or_oversized_image_dimensions_do_not_escape_as_a_preview() {
+        let store = SessionRecordStore::default();
+        let mut malformed = capture("malformed-image", "caption");
+        malformed.representations = vec![ClipboardRepresentation::Png {
+            bytes: vec![1, 2, 3, 4],
+        }];
+        store.capture(malformed);
+        let id = store.list().remove(0).id;
+
+        assert!(matches!(
+            store.image_preview(id),
+            Err(SessionRecordError::ImagePreviewUnavailable)
+        ));
+        assert!(dib_to_bmp(&[0; BITMAP_V5_HEADER_BYTES]).is_none());
     }
 
     #[test]

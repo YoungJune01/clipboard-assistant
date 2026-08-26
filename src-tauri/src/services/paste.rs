@@ -23,6 +23,7 @@ pub struct TargetIdentity {
 pub struct TargetSnapshot<Window> {
     pub window: Window,
     pub focused_control: Option<Window>,
+    pub focused_control_thread_id: Option<u32>,
     pub identity: TargetIdentity,
     pub lifecycle_token: TargetToken,
     pub focused_control_instance_id: Option<u64>,
@@ -175,7 +176,10 @@ where
             let Some(target) = target.filter(|_| target_is_safe) else {
                 return Ok(copy_only());
             };
-            if self.target.restore(&target).is_err() || !self.target_is_safe(&target) {
+            if self.target.restore(&target).is_err() {
+                return Ok(copy_only());
+            }
+            if !self.target_is_safe(&target) {
                 return Ok(copy_only());
             }
             if self.target.foreground().ok() != Some(target.window) {
@@ -202,8 +206,13 @@ where
         if !matches!(self.target.input_allowed(&identity), Ok(true)) {
             return false;
         }
-        self.target.input_desktop().ok() == Some(identity.desktop_id)
-            && matches!(self.target.lifecycle_valid(target), Ok(true))
+        if self.target.input_desktop().ok() != Some(identity.desktop_id) {
+            return false;
+        }
+        if !matches!(self.target.lifecycle_valid(target), Ok(true)) {
+            return false;
+        }
+        true
     }
 
     fn hide_panel(&self) -> Result<(), SafePasteError> {
@@ -275,6 +284,14 @@ where
         &self,
         representations: &[ClipboardRepresentation],
     ) -> Result<PasteOutcome, SafePasteError> {
+        self.paste.paste(representations)
+    }
+
+    pub fn direct_paste(
+        &self,
+        representations: &[ClipboardRepresentation],
+    ) -> Result<PasteOutcome, SafePasteError> {
+        self.paste.prepare_target()?;
         self.paste.paste(representations)
     }
 }

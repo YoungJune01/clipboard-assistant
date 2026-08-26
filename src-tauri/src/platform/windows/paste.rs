@@ -42,10 +42,9 @@ use windows::Win32::{
         },
         WindowsAndMessaging::{
             CHILDID_SELF, DispatchMessageW, EVENT_OBJECT_DESTROY, GA_ROOT, GCW_ATOM, GUITHREADINFO,
-            GWLP_HINSTANCE, GWLP_USERDATA, GWLP_WNDPROC, GetAncestor, GetClassLongPtrW,
-            GetForegroundWindow, GetGUIThreadInfo, GetWindowLongPtrW, GetWindowThreadProcessId,
-            IsWindow, MSG, OBJID_WINDOW, PM_NOREMOVE, PM_REMOVE, PeekMessageW, PostThreadMessageW,
-            WINEVENT_OUTOFCONTEXT, WM_APP,
+            GetAncestor, GetClassLongPtrW, GetForegroundWindow, GetGUIThreadInfo,
+            GetWindowThreadProcessId, IsWindow, MSG, OBJID_WINDOW, PM_NOREMOVE, PM_REMOVE,
+            PeekMessageW, PostThreadMessageW, WINEVENT_OUTOFCONTEXT, WM_APP,
         },
     },
 };
@@ -141,10 +140,12 @@ impl PasteTarget for Win32PasteTarget {
         let identity = captured.identity;
         let thread_id = identity.thread_id;
         let focused = captured.focused;
+        let focused_control_thread_id = captured.focused_control_thread_id;
         let focused_control_instance_id = captured.focused_control_instance_id;
         let snapshot = TargetSnapshot {
             window: WindowsWindow::from_hwnd(window),
             focused_control: (focused != window).then(|| WindowsWindow::from_hwnd(focused)),
+            focused_control_thread_id: (focused != window).then_some(focused_control_thread_id),
             identity,
             lifecycle_token,
             focused_control_instance_id,
@@ -195,7 +196,9 @@ impl PasteTarget for Win32PasteTarget {
                 control,
                 target.focused_control_instance_id,
                 target.identity.process_id,
-                target.identity.thread_id,
+                target
+                    .focused_control_thread_id
+                    .ok_or(WindowsPasteError::LifecycleProof)?,
             )?;
         }
         if unsafe { GetForegroundWindow() } == target.window.hwnd() {
@@ -232,6 +235,7 @@ impl PasteTarget for Win32PasteTarget {
 struct CapturedTargetState {
     identity: TargetIdentity,
     focused: HWND,
+    focused_control_thread_id: u32,
     focused_control_instance_id: Option<u64>,
 }
 
@@ -239,10 +243,11 @@ fn capture_target_state() -> Result<ObservedCapture<HWND, CapturedTargetState>, 
     let window = foreground_root().ok_or(WindowsPasteError::NoForegroundWindow)?;
     let identity = inspect_window(window)?;
     let focused = focused_control(identity.thread_id)?.ok_or(WindowsPasteError::LifecycleProof)?;
+    let (focused_process_id, focused_control_thread_id) = window_process_thread(focused)?;
     let focused_control_instance_id = if focused == window {
         None
     } else {
-        if window_process_thread(focused)? != (identity.process_id, identity.thread_id) {
+        if focused_process_id != identity.process_id {
             return Err(WindowsPasteError::LifecycleProof);
         }
         Some(window_instance_id(focused)?)
@@ -259,6 +264,7 @@ fn capture_target_state() -> Result<ObservedCapture<HWND, CapturedTargetState>, 
         value: CapturedTargetState {
             identity,
             focused,
+            focused_control_thread_id,
             focused_control_instance_id,
         },
     })
@@ -491,10 +497,11 @@ impl Win32LifecycleObserver {
         capture_generation: u64,
     ) -> Result<TargetToken, WindowsPasteError> {
         let (process_id, thread_id) = window_process_thread(top)?;
-        if let Some(focus) = focus
-            && window_process_thread(focus)? != (process_id, thread_id)
-        {
-            return Err(WindowsPasteError::LifecycleProof);
+        if let Some(focus) = focus {
+            let (focus_process_id, _) = window_process_thread(focus)?;
+            if focus_process_id != process_id {
+                return Err(WindowsPasteError::LifecycleProof);
+            }
         }
         let confirmed_generation = self.capture_generation()?;
         if confirmed_generation != capture_generation {
@@ -999,14 +1006,6 @@ fn window_instance_id(window: HWND) -> Result<u64, WindowsPasteError> {
         return Err(WindowsPasteError::WindowIdentity);
     }
     class_atom.hash(&mut hasher);
-    for field in [GWLP_WNDPROC, GWLP_HINSTANCE, GWLP_USERDATA] {
-        unsafe { SetLastError(ERROR_SUCCESS) };
-        let value = unsafe { GetWindowLongPtrW(window, field) };
-        if value == 0 && unsafe { GetLastError() } != ERROR_SUCCESS {
-            return Err(WindowsPasteError::WindowIdentity);
-        }
-        value.hash(&mut hasher);
-    }
     Ok(hasher.finish())
 }
 
@@ -1366,9 +1365,12 @@ fn target_matches<A: InputApi>(
     target: &TargetSnapshot<A::Window>,
     expected: A::Window,
 ) -> bool {
+    let focus_thread_id = target
+        .focused_control_thread_id
+        .unwrap_or(target.identity.thread_id);
     api.foreground() == expected
         && api.target_valid(target)
-        && api.focused_window(target.identity.thread_id)
+        && api.focused_window(focus_thread_id)
             == Some(target.focused_control.unwrap_or(target.window))
 }
 
@@ -1932,6 +1934,15 @@ mod tests {
     }
 
     #[test]
+    fn input_validation_uses_the_focused_controls_ui_thread() {
+        let api = FakeInputApi::new([true, true, true, true]);
+
+        send_ctrl_v(&api, &fake_target()).unwrap();
+
+        assert_eq!(*api.focus_thread_ids.lock().unwrap(), vec![12; 9]);
+    }
+
+    #[test]
     fn partial_send_releases_only_keys_pressed_by_this_operation() {
         let api = FakeInputApi::new([true, false, true]);
 
@@ -2138,6 +2149,20 @@ mod tests {
     }
 
     #[test]
+    fn production_window_identity_avoids_cross_process_private_window_fields() {
+        let source = include_str!("paste.rs");
+
+        for forbidden in [
+            ["GetWindow", "LongPtrW"].concat(),
+            ["GWLP_", "WNDPROC"].concat(),
+            ["GWLP_", "HINSTANCE"].concat(),
+            ["GWLP_", "USERDATA"].concat(),
+        ] {
+            assert!(!source.contains(&forbidden));
+        }
+    }
+
+    #[test]
     fn non_destructive_windows_identity_harness_queries_current_desktop_and_token() {
         let mut token = HANDLE::default();
         unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) }
@@ -2166,6 +2191,7 @@ mod tests {
         results: Mutex<VecDeque<bool>>,
         validity: Mutex<VecDeque<bool>>,
         focuses: Mutex<VecDeque<Option<i32>>>,
+        focus_thread_ids: Mutex<Vec<u32>>,
         events: Mutex<Vec<(PasteKey, bool)>>,
     }
 
@@ -2177,6 +2203,7 @@ mod tests {
                 results: Mutex::new(results.into_iter().collect()),
                 validity: Mutex::new(VecDeque::from([true])),
                 focuses: Mutex::new(VecDeque::from([Some(8)])),
+                focus_thread_ids: Mutex::new(Vec::new()),
                 events: Mutex::new(Vec::new()),
             }
         }
@@ -2210,7 +2237,8 @@ mod tests {
             }
         }
 
-        fn focused_window(&self, _thread_id: u32) -> Option<Self::Window> {
+        fn focused_window(&self, thread_id: u32) -> Option<Self::Window> {
+            self.focus_thread_ids.lock().unwrap().push(thread_id);
             let mut values = self.focuses.lock().unwrap();
             if values.len() > 1 {
                 values.pop_front().unwrap()
@@ -2229,6 +2257,7 @@ mod tests {
         TargetSnapshot {
             window: 7,
             focused_control: Some(8),
+            focused_control_thread_id: Some(12),
             identity: TargetIdentity {
                 window_instance_id: 1,
                 process_id: 2,
@@ -2248,6 +2277,7 @@ mod tests {
     fn fake_top_level_focus_target() -> TargetSnapshot<i32> {
         TargetSnapshot {
             focused_control: None,
+            focused_control_thread_id: None,
             focused_control_instance_id: None,
             ..fake_target()
         }
