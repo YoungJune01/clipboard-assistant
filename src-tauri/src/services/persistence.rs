@@ -51,7 +51,8 @@ const MIGRATION_BACKUP_SUFFIX: &str = ".migrate-v1-backup";
 const DEFAULT_HISTORY_PAGE_LIMIT: usize = 50;
 const MAX_HISTORY_PAGE_LIMIT: usize = 100;
 const MAX_FILE_LIST_PATHS: usize = 4096;
-const MAX_FILE_LIST_BYTES: usize = 16 * 1024 * 1024;
+const MAX_FILE_LIST_LOGICAL_BYTES: usize = MAX_CAPTURE_RECORD_BYTES - REPRESENTATION_OVERHEAD_BYTES;
+const MAX_FILE_LIST_ENCODED_BYTES: usize = 24 * 1024 * 1024;
 const DATABASE_INCREMENTAL_VACUUM_PAGES: usize = 256;
 const WORK_QUEUE_CAPACITY: usize = 64;
 const WORKER_TIMEOUT: StdDuration = StdDuration::from_secs(2);
@@ -1277,6 +1278,7 @@ fn write_record(
     transaction: &Transaction<'_>,
     record: &ClipboardRecord,
 ) -> Result<(), PersistenceError> {
+    validate_record_file_lists(record)?;
     transaction.execute(
         "INSERT INTO clipboard_records (
                 id, content_identity, captured_at, source_application, source_path, note,
@@ -1325,7 +1327,6 @@ fn write_record(
                 ClipboardRepresentation::Rtf { bytes } => ("rtf", None, Some(bytes.as_slice())),
                 ClipboardRepresentation::Html { bytes } => ("html", None, Some(bytes.as_slice())),
                 ClipboardRepresentation::FileList { paths } => {
-                    validate_file_list(paths)?;
                     file_list_json =
                         serde_json::to_string(paths).map_err(|_| PersistenceError::InvalidData)?;
                     ("file_list", Some(file_list_json.as_str()), None)
@@ -1575,7 +1576,7 @@ fn validate_restore_connection(
             return Err(PersistenceError::InvalidData);
         }
     }
-    validate_restore_file_lists(connection)
+    Ok(())
 }
 
 fn load_settings_from_connection(
@@ -2571,18 +2572,19 @@ fn representation_metadata_bytes_for_id(
     record_id: &str,
 ) -> Result<Option<usize>, PersistenceError> {
     let mut statement = connection.prepare(
-        "SELECT kind, typeof(text_value), length(CAST(text_value AS BLOB)),
+        "SELECT position, kind, typeof(text_value), length(CAST(text_value AS BLOB)),
                 typeof(blob_value), length(blob_value)
          FROM clipboard_representations
          WHERE record_id = ?1 ORDER BY position",
     )?;
     let rows = statement.query_map([record_id], |row| {
         Ok(RepresentationMetadata {
-            kind: row.get(0)?,
-            text_storage_type: row.get(1)?,
-            text_length: row.get(2)?,
-            blob_storage_type: row.get(3)?,
-            blob_length: row.get(4)?,
+            position: row.get(0)?,
+            kind: row.get(1)?,
+            text_storage_type: row.get(2)?,
+            text_length: row.get(3)?,
+            blob_storage_type: row.get(4)?,
+            blob_length: row.get(5)?,
         })
     })?;
     let mut total = 0_usize;
@@ -2603,7 +2605,20 @@ fn representation_metadata_bytes_for_id(
             "file_list"
                 if metadata.text_storage_type == "text" && metadata.blob_storage_type == "null" =>
             {
-                metadata.text_length
+                let Some(encoded_bytes) = metadata
+                    .text_length
+                    .and_then(|value| usize::try_from(value).ok())
+                else {
+                    return Ok(None);
+                };
+                if encoded_bytes > MAX_FILE_LIST_ENCODED_BYTES {
+                    return Ok(None);
+                }
+                match file_list_metadata(connection, record_id, metadata.position) {
+                    Ok(metadata) => Some(metadata.logical_bytes as i64),
+                    Err(PersistenceError::InvalidData) => return Ok(None),
+                    Err(error) => return Err(error),
+                }
             }
             _ => return Ok(None),
         };
@@ -2707,7 +2722,7 @@ fn load_representation_details(
         let (position, kind, stored_byte_length, unicode_text, rich_bytes) = row?;
         let stored_byte_length =
             usize::try_from(stored_byte_length).map_err(|_| PersistenceError::InvalidData)?;
-        if stored_byte_length > MAX_CAPTURE_RECORD_BYTES {
+        if kind != "file_list" && stored_byte_length > MAX_CAPTURE_RECORD_BYTES {
             return Err(PersistenceError::InvalidData);
         }
         let (kind, byte_length, item_count, text, paths, truncated) = match kind.as_str() {
@@ -2795,21 +2810,35 @@ struct FileListDetailsProjection {
     truncated: bool,
 }
 
-fn load_file_list_details(
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FileListMetadata {
+    item_count: usize,
+    logical_bytes: usize,
+}
+
+fn file_list_metadata(
     connection: &Connection,
     record_id: &str,
     position: i64,
-) -> Result<FileListDetailsProjection, PersistenceError> {
-    let json_valid: i64 = connection.query_row(
-        "SELECT json_valid(text_value) FROM clipboard_representations
-         WHERE record_id = ?1 AND position = ?2 AND kind = 'file_list'",
+) -> Result<FileListMetadata, PersistenceError> {
+    let (encoded_bytes, json_valid, json_type): (i64, i64, Option<String>) = connection.query_row(
+        "SELECT length(CAST(text_value AS BLOB)), json_valid(text_value),
+                CASE WHEN json_valid(text_value) THEN json_type(text_value) ELSE NULL END
+         FROM clipboard_representations
+         WHERE record_id = ?1 AND position = ?2 AND kind = 'file_list'
+           AND typeof(text_value) = 'text' AND typeof(blob_value) = 'null'",
         params![record_id, position],
-        |row| row.get(0),
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
     )?;
-    if json_valid != 1 {
+    let encoded_bytes =
+        usize::try_from(encoded_bytes).map_err(|_| PersistenceError::InvalidData)?;
+    if json_valid != 1
+        || json_type.as_deref() != Some("array")
+        || encoded_bytes > MAX_FILE_LIST_ENCODED_BYTES
+    {
         return Err(PersistenceError::InvalidData);
     }
-    let (item_count, byte_length, invalid_items): (i64, i64, i64) = connection.query_row(
+    let (item_count, logical_bytes, invalid_items): (i64, i64, i64) = connection.query_row(
         "SELECT COUNT(*),
                 COALESCE(SUM(length(CAST(value AS BLOB))), 0),
                 COALESCE(SUM(CASE
@@ -2821,14 +2850,27 @@ fn load_file_list_details(
         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
     )?;
     let item_count = usize::try_from(item_count).map_err(|_| PersistenceError::InvalidData)?;
-    let byte_length = usize::try_from(byte_length).map_err(|_| PersistenceError::InvalidData)?;
+    let logical_bytes =
+        usize::try_from(logical_bytes).map_err(|_| PersistenceError::InvalidData)?;
     if item_count == 0
         || item_count > MAX_FILE_LIST_PATHS
-        || byte_length > MAX_FILE_LIST_BYTES
+        || logical_bytes > MAX_FILE_LIST_LOGICAL_BYTES
         || invalid_items != 0
     {
         return Err(PersistenceError::InvalidData);
     }
+    Ok(FileListMetadata {
+        item_count,
+        logical_bytes,
+    })
+}
+
+fn load_file_list_details(
+    connection: &Connection,
+    record_id: &str,
+    position: i64,
+) -> Result<FileListDetailsProjection, PersistenceError> {
+    let metadata = file_list_metadata(connection, record_id, position)?;
 
     let mut statement = connection.prepare(
         "SELECT substr(CAST(value AS BLOB), 1, ?3), length(CAST(value AS BLOB))
@@ -2863,9 +2905,9 @@ fn load_file_list_details(
         }
     }
     Ok(FileListDetailsProjection {
-        byte_length,
-        item_count,
-        truncated: path_was_truncated || paths.len() < item_count,
+        byte_length: metadata.logical_bytes,
+        item_count: metadata.item_count,
+        truncated: path_was_truncated || paths.len() < metadata.item_count,
         paths,
     })
 }
@@ -2917,22 +2959,22 @@ fn validate_file_list(paths: &[String]) -> Result<(), PersistenceError> {
         }
         total.checked_add(path.len())
     });
-    if total.is_none_or(|total| total > MAX_FILE_LIST_BYTES) {
+    if total.is_none_or(|total| total > MAX_FILE_LIST_LOGICAL_BYTES) {
         return Err(PersistenceError::InvalidData);
     }
     Ok(())
 }
 
-fn validate_restore_file_lists(connection: &Connection) -> Result<(), PersistenceError> {
-    let mut statement = connection.prepare(
-        "SELECT text_value FROM clipboard_representations
-         WHERE kind = 'file_list'",
-    )?;
-    let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
-    for row in rows {
-        let paths: Vec<String> =
-            serde_json::from_str(&row?).map_err(|_| PersistenceError::InvalidData)?;
-        validate_file_list(&paths)?;
+fn validate_record_file_lists(record: &ClipboardRecord) -> Result<(), PersistenceError> {
+    for representation in &record.representations {
+        let ClipboardRepresentation::FileList { paths } = representation else {
+            continue;
+        };
+        validate_file_list(paths)?;
+        let encoded = serde_json::to_vec(paths).map_err(|_| PersistenceError::InvalidData)?;
+        if encoded.len() > MAX_FILE_LIST_ENCODED_BYTES {
+            return Err(PersistenceError::InvalidData);
+        }
     }
     Ok(())
 }
@@ -3028,6 +3070,7 @@ impl DbRecord {
 }
 
 struct RepresentationMetadata {
+    position: i64,
     kind: String,
     text_storage_type: String,
     text_length: Option<i64>,
@@ -3327,6 +3370,27 @@ mod tests {
             representations: vec![ClipboardRepresentation::UnicodeText {
                 text: text.to_owned(),
             }],
+        })
+    }
+
+    fn escaped_file_paths(path_count: usize, minimum_logical_bytes: usize) -> Vec<String> {
+        let bytes_per_path = minimum_logical_bytes.div_ceil(path_count);
+        (0..path_count)
+            .map(|index| {
+                let prefix = format!(r#"C:\quoted\"folder\{index}\"#);
+                let escaped_segment =
+                    r#"\""#.repeat(bytes_per_path.saturating_sub(prefix.len()) / 2);
+                format!("{prefix}{escaped_segment}")
+            })
+            .collect()
+    }
+
+    fn file_list_record(identity: &str, paths: Vec<String>) -> ClipboardRecord {
+        ClipboardRecord::from_capture(crate::domain::CapturedClipboard {
+            content_identity: ContentIdentity::new(identity),
+            captured_at: Utc::now(),
+            source: SourceIdentity::default(),
+            representations: vec![ClipboardRepresentation::FileList { paths }],
         })
     }
 
@@ -3966,6 +4030,98 @@ mod tests {
             .unwrap();
         let reopened = SqliteRepository::open(path).unwrap();
         assert_eq!(reopened.full_record(expected.id).unwrap(), expected);
+    }
+
+    #[test]
+    fn escaped_file_list_uses_decoded_capacity_after_restart() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("history.sqlite3");
+        let paths = escaped_file_paths(MAX_FILE_LIST_PATHS, 9 * 1024 * 1024);
+        let logical_bytes = paths.iter().map(String::len).sum::<usize>();
+        let encoded_bytes = serde_json::to_vec(&paths).unwrap().len();
+        assert!(logical_bytes <= MAX_FILE_LIST_LOGICAL_BYTES);
+        assert!(encoded_bytes > MAX_CAPTURE_RECORD_BYTES);
+        assert!(encoded_bytes <= MAX_FILE_LIST_ENCODED_BYTES);
+        let expected = file_list_record("escaped-file-list", paths);
+        let id = expected.id;
+
+        SqliteRepository::open(path.clone())
+            .unwrap()
+            .save_record(&expected)
+            .unwrap();
+
+        let reopened = SqliteRepository::open(path).unwrap();
+        assert_eq!(reopened.full_record(id).unwrap(), expected);
+        let details = reopened.record_details(id).unwrap();
+        assert_eq!(details.representations.len(), 1);
+        let file_list = &details.representations[0];
+        assert_eq!(file_list.byte_length, logical_bytes);
+        assert_eq!(file_list.item_count, Some(MAX_FILE_LIST_PATHS));
+        assert!(file_list.truncated);
+        let projected_bytes = file_list
+            .paths
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(String::len)
+            .sum::<usize>();
+        assert!(projected_bytes <= MAX_DETAIL_FILE_LIST_BYTES);
+    }
+
+    #[test]
+    fn encoded_file_list_bound_is_rejected_before_write() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("history.sqlite3");
+        let repository = SqliteRepository::open(path.clone()).unwrap();
+        let paths = escaped_file_paths(MAX_FILE_LIST_PATHS, 13 * 1024 * 1024);
+        let logical_bytes = paths.iter().map(String::len).sum::<usize>();
+        let encoded_bytes = serde_json::to_vec(&paths).unwrap().len();
+        assert!(logical_bytes <= MAX_FILE_LIST_LOGICAL_BYTES);
+        assert!(encoded_bytes > MAX_FILE_LIST_ENCODED_BYTES);
+
+        assert!(matches!(
+            repository.save_record(&file_list_record("encoded-too-large", paths)),
+            Err(PersistenceError::InvalidData)
+        ));
+        assert_eq!(record_count_at(&path), 0);
+    }
+
+    #[test]
+    fn file_list_quota_counts_encoded_database_bytes() {
+        let directory = tempdir().unwrap();
+        let paths = escaped_file_paths(MAX_FILE_LIST_PATHS, 128 * 1024);
+        let encoded_bytes = serde_json::to_vec(&paths).unwrap().len();
+        let exact_quota = encoded_bytes + REPRESENTATION_OVERHEAD_BYTES;
+        let retained_path = directory.path().join("retained.sqlite3");
+        let retained = SqliteRepository::open_with_quota(
+            retained_path,
+            DiskQuota {
+                max_records: 1,
+                max_payload_bytes: exact_quota,
+                incremental_vacuum_pages: 1,
+            },
+        )
+        .unwrap();
+        retained
+            .save_record(&file_list_record("exact-quota", paths.clone()))
+            .unwrap();
+        assert_eq!(retained.load_recent(10).unwrap().len(), 1);
+
+        let rejected_path = directory.path().join("rejected.sqlite3");
+        let rejected = SqliteRepository::open_with_quota(
+            rejected_path.clone(),
+            DiskQuota {
+                max_records: 1,
+                max_payload_bytes: exact_quota - 1,
+                incremental_vacuum_pages: 1,
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            rejected.save_record(&file_list_record("over-quota", paths)),
+            Err(PersistenceError::InvalidData)
+        ));
+        assert_eq!(record_count_at(&rejected_path), 0);
     }
 
     #[test]
