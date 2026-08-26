@@ -116,6 +116,17 @@ pub enum StorageAvailability {
     Unavailable,
 }
 
+#[derive(Default)]
+pub(crate) struct PersistenceMutationCoordinator {
+    gate: Mutex<()>,
+}
+
+impl PersistenceMutationCoordinator {
+    pub(crate) fn lock(&self) -> std::sync::MutexGuard<'_, ()> {
+        lock_unpoisoned(&self.gate)
+    }
+}
+
 #[derive(Debug)]
 pub enum PersistenceError {
     CreateDirectory(std::io::Error),
@@ -470,6 +481,9 @@ impl RecordPersistence for PersistenceWorker {
     }
 
     fn load_page(&self, query: HistoryQuery) -> Result<HistoryPage, PersistenceError> {
+        if !self.storage_available.load(Ordering::Acquire) {
+            return Err(PersistenceError::WorkerUnavailable);
+        }
         self.reader
             .as_ref()
             .ok_or(PersistenceError::WorkerUnavailable)?
@@ -477,6 +491,9 @@ impl RecordPersistence for PersistenceWorker {
     }
 
     fn record_details(&self, id: RecordId) -> Result<ClipboardRecord, PersistenceError> {
+        if !self.storage_available.load(Ordering::Acquire) {
+            return Err(PersistenceError::WorkerUnavailable);
+        }
         self.reader
             .as_ref()
             .ok_or(PersistenceError::WorkerUnavailable)?
@@ -3073,6 +3090,8 @@ mod tests {
     fn restore_rollback_failure_makes_the_worker_terminally_unavailable() {
         let directory = tempdir().unwrap();
         let live = SqliteRepository::open(directory.path().join("live.sqlite3")).unwrap();
+        let existing = record("existing", Utc::now() - Duration::seconds(1));
+        live.save_record(&existing).unwrap();
         let source_path = directory.path().join("source.clipbackup");
         let source = SqliteRepository::open(source_path.clone()).unwrap();
         source.save_record(&record("restored", Utc::now())).unwrap();
@@ -3097,6 +3116,14 @@ mod tests {
         assert!(!available.load(Ordering::Acquire));
         assert!(matches!(
             worker.save_record(&record("after", Utc::now())),
+            Err(PersistenceError::WorkerUnavailable)
+        ));
+        assert!(matches!(
+            worker.load_page(HistoryQuery::default()),
+            Err(PersistenceError::WorkerUnavailable)
+        ));
+        assert!(matches!(
+            worker.record_details(existing.id),
             Err(PersistenceError::WorkerUnavailable)
         ));
     }

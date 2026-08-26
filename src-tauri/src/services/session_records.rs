@@ -13,7 +13,9 @@ use crate::domain::{
     CapturedClipboard, ClipboardRecord, ClipboardRepresentation, GroupId, HistoryCursor,
     HistoryQuery, RecordId, RecordNote, RecordNoteError,
 };
-use crate::services::persistence::{HistoryPage, HistoryRecordSummary, RecordPersistence};
+use crate::services::persistence::{
+    HistoryPage, HistoryRecordSummary, PersistenceMutationCoordinator, RecordPersistence,
+};
 
 pub(crate) const MAX_SESSION_RECORDS: usize = 500;
 pub(crate) const STARTUP_HISTORY_RECORDS: usize = 100;
@@ -57,7 +59,7 @@ pub struct SessionRecordStore {
     limits: SessionRecordLimits,
     persistence: NotePersistence,
     storage_available: Arc<AtomicBool>,
-    mutation_refresh: Mutex<()>,
+    mutation_coordinator: Arc<PersistenceMutationCoordinator>,
 }
 
 pub(crate) struct SessionRestoreGuard<'a> {
@@ -127,7 +129,7 @@ impl SessionRecordStore {
             limits,
             persistence: NotePersistence::NotConfigured,
             storage_available: Arc::new(AtomicBool::new(false)),
-            mutation_refresh: Mutex::new(()),
+            mutation_coordinator: Arc::new(PersistenceMutationCoordinator::default()),
         }
     }
 
@@ -135,6 +137,20 @@ impl SessionRecordStore {
         records: Vec<ClipboardRecord>,
         persistence: Arc<dyn RecordPersistence>,
         storage_available: Arc<AtomicBool>,
+    ) -> Self {
+        Self::with_persistence_and_coordinator(
+            records,
+            persistence,
+            storage_available,
+            Arc::new(PersistenceMutationCoordinator::default()),
+        )
+    }
+
+    pub(crate) fn with_persistence_and_coordinator(
+        records: Vec<ClipboardRecord>,
+        persistence: Arc<dyn RecordPersistence>,
+        storage_available: Arc<AtomicBool>,
+        mutation_coordinator: Arc<PersistenceMutationCoordinator>,
     ) -> Self {
         let store = Self {
             state: Mutex::new(SessionRecordState {
@@ -154,7 +170,7 @@ impl SessionRecordStore {
             },
             persistence: NotePersistence::Durable(persistence),
             storage_available,
-            mutation_refresh: Mutex::new(()),
+            mutation_coordinator,
         };
         store.replace_loaded(records);
         store
@@ -165,7 +181,21 @@ impl SessionRecordStore {
         persistence: Arc<dyn RecordPersistence>,
         storage_available: Arc<AtomicBool>,
     ) -> Self {
-        Self::with_persistence_query_page(
+        Self::with_persistence_page_and_coordinator(
+            page,
+            persistence,
+            storage_available,
+            Arc::new(PersistenceMutationCoordinator::default()),
+        )
+    }
+
+    pub(crate) fn with_persistence_page_and_coordinator(
+        page: HistoryPage,
+        persistence: Arc<dyn RecordPersistence>,
+        storage_available: Arc<AtomicBool>,
+        mutation_coordinator: Arc<PersistenceMutationCoordinator>,
+    ) -> Self {
+        Self::with_persistence_query_page_and_coordinator(
             HistoryQuery {
                 limit: STARTUP_HISTORY_RECORDS,
                 ..HistoryQuery::default()
@@ -173,6 +203,7 @@ impl SessionRecordStore {
             page,
             persistence,
             storage_available,
+            mutation_coordinator,
         )
     }
 
@@ -181,6 +212,22 @@ impl SessionRecordStore {
         page: HistoryPage,
         persistence: Arc<dyn RecordPersistence>,
         storage_available: Arc<AtomicBool>,
+    ) -> Self {
+        Self::with_persistence_query_page_and_coordinator(
+            query,
+            page,
+            persistence,
+            storage_available,
+            Arc::new(PersistenceMutationCoordinator::default()),
+        )
+    }
+
+    pub(crate) fn with_persistence_query_page_and_coordinator(
+        query: HistoryQuery,
+        page: HistoryPage,
+        persistence: Arc<dyn RecordPersistence>,
+        storage_available: Arc<AtomicBool>,
+        mutation_coordinator: Arc<PersistenceMutationCoordinator>,
     ) -> Self {
         let store = Self {
             state: Mutex::new(SessionRecordState {
@@ -200,7 +247,7 @@ impl SessionRecordStore {
             },
             persistence: NotePersistence::Durable(persistence),
             storage_available,
-            mutation_refresh: Mutex::new(()),
+            mutation_coordinator,
         };
         store.replace_page_for_query(query, page);
         store
@@ -234,7 +281,7 @@ impl SessionRecordStore {
             },
             persistence: NotePersistence::SessionOnly,
             storage_available,
-            mutation_refresh: Mutex::new(()),
+            mutation_coordinator: Arc::new(PersistenceMutationCoordinator::default()),
         };
         store.replace_loaded(records);
         store
@@ -266,7 +313,7 @@ impl SessionRecordStore {
         if capture_bytes > self.limits.record_bytes {
             return CaptureStatus::RejectedTooLarge;
         }
-        let _serial = lock_unpoisoned(&self.mutation_refresh);
+        let _serial = self.mutation_coordinator.lock();
         self.load_page_front_for_capture();
         let mut state = lock_unpoisoned(&self.state);
         if let Some(current) = state.records.front()
@@ -376,7 +423,7 @@ impl SessionRecordStore {
     }
 
     pub fn replace_page_for_query(&self, query: HistoryQuery, page: HistoryPage) {
-        let _serial = lock_unpoisoned(&self.mutation_refresh);
+        let _serial = self.mutation_coordinator.lock();
         let mut state = lock_unpoisoned(&self.state);
         state.paged = true;
         state.base_query = base_history_query(&query);
@@ -391,7 +438,7 @@ impl SessionRecordStore {
     }
 
     pub fn append_page(&self, page: HistoryPage) {
-        let _serial = lock_unpoisoned(&self.mutation_refresh);
+        let _serial = self.mutation_coordinator.lock();
         let mut state = lock_unpoisoned(&self.state);
         state.paged = true;
         state.next_cursor = page.next_cursor.clone();
@@ -445,7 +492,7 @@ impl SessionRecordStore {
         } else {
             Some(RecordNote::new(value).map_err(SessionRecordError::InvalidNote)?)
         };
-        let _serial = lock_unpoisoned(&self.mutation_refresh);
+        let _serial = self.mutation_coordinator.lock();
         self.load_record_for_mutation(id)?;
         let mut state = lock_unpoisoned(&self.state);
         let index = state
@@ -520,7 +567,7 @@ impl SessionRecordStore {
         id: RecordId,
         group_id: Option<GroupId>,
     ) -> Result<SessionRecordView, SessionRecordError> {
-        let _serial = lock_unpoisoned(&self.mutation_refresh);
+        let _serial = self.mutation_coordinator.lock();
         self.load_record_for_mutation(id)?;
         let mut state = lock_unpoisoned(&self.state);
         let record = state
@@ -569,7 +616,7 @@ impl SessionRecordStore {
     }
 
     pub fn delete(&self, id: RecordId) -> Result<ClipboardRecord, SessionRecordError> {
-        let _serial = lock_unpoisoned(&self.mutation_refresh);
+        let _serial = self.mutation_coordinator.lock();
         self.require_durable_storage()?;
         self.load_record_for_mutation(id)?;
         let mut state = lock_unpoisoned(&self.state);
@@ -604,7 +651,7 @@ impl SessionRecordStore {
         &self,
         id: RecordId,
     ) -> Result<SessionRecordView, SessionRecordError> {
-        let _serial = lock_unpoisoned(&self.mutation_refresh);
+        let _serial = self.mutation_coordinator.lock();
         self.require_durable_storage()?;
         let mut deleted = lock_unpoisoned(&self.last_deleted);
         if deleted.as_ref().is_none_or(|record| record.id != id) {
@@ -626,7 +673,7 @@ impl SessionRecordStore {
     }
 
     pub fn clear(&self) -> Result<usize, SessionRecordError> {
-        let _serial = lock_unpoisoned(&self.mutation_refresh);
+        let _serial = self.mutation_coordinator.lock();
         self.require_durable_storage()?;
         let removed = match &self.persistence {
             NotePersistence::Durable(persistence) => persistence.clear_records().map_err(|_| {
@@ -648,6 +695,11 @@ impl SessionRecordStore {
     }
 
     pub fn prune_before(&self, cutoff: chrono::DateTime<chrono::Utc>) -> usize {
+        let _serial = self.mutation_coordinator.lock();
+        self.prune_before_coordinated(cutoff)
+    }
+
+    pub(crate) fn prune_before_coordinated(&self, cutoff: chrono::DateTime<chrono::Utc>) -> usize {
         let mut state = lock_unpoisoned(&self.state);
         let before = state.records.len();
         state.records.retain(|record| record.captured_at >= cutoff);
@@ -657,7 +709,13 @@ impl SessionRecordStore {
             .iter()
             .map(|record| record_bytes(record))
             .sum();
-        before.saturating_sub(state.records.len())
+        let removed = before.saturating_sub(state.records.len());
+        let paged = state.paged;
+        drop(state);
+        if paged {
+            let _ = self.refresh_loaded_window();
+        }
+        removed
     }
 
     pub fn storage_available_flag(&self) -> Arc<AtomicBool> {
@@ -694,7 +752,7 @@ impl SessionRecordStore {
 
     #[cfg(test)]
     pub(crate) fn reload_first_page(&self) -> Result<(), SessionRecordError> {
-        let _serial = lock_unpoisoned(&self.mutation_refresh);
+        let _serial = self.mutation_coordinator.lock();
         let query = HistoryQuery {
             limit: STARTUP_HISTORY_RECORDS,
             ..HistoryQuery::default()
@@ -710,7 +768,7 @@ impl SessionRecordStore {
     ) -> T {
         let guard = SessionRestoreGuard {
             store: self,
-            _serial: lock_unpoisoned(&self.mutation_refresh),
+            _serial: self.mutation_coordinator.lock(),
         };
         operation(&guard)
     }

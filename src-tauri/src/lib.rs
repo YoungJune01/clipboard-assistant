@@ -13,7 +13,9 @@ use services::panel::PanelController;
 #[cfg(windows)]
 use services::paste::{QuickPanelPasteCoordinator, SafePasteService};
 #[cfg(windows)]
-use services::persistence::{PersistenceWorker, RestoreBudget, SqliteRepository};
+use services::persistence::{
+    PersistenceMutationCoordinator, PersistenceWorker, RestoreBudget, SqliteRepository,
+};
 #[cfg(windows)]
 use services::session_records::{
     ImagePreviewView, SessionRecordCommands, SessionRecordStore, SessionRecordView,
@@ -46,6 +48,7 @@ struct ClipboardGroupView {
 struct ClipboardGroups {
     groups: Mutex<Vec<ClipboardGroupView>>,
     repository: Option<Arc<SqliteRepository>>,
+    mutation_coordinator: Arc<PersistenceMutationCoordinator>,
 }
 
 #[cfg(windows)]
@@ -56,6 +59,7 @@ impl ClipboardGroups {
 
     fn create(&self, name: String) -> Result<ClipboardGroupView, String> {
         let name = validate_group_name(name)?;
+        let _coordinated = self.mutation_coordinator.lock();
         let mut groups = lock_unpoisoned(&self.groups);
         if groups
             .iter()
@@ -80,6 +84,7 @@ impl ClipboardGroups {
 
     fn rename(&self, id: domain::GroupId, name: String) -> Result<ClipboardGroupView, String> {
         let name = validate_group_name(name)?;
+        let _coordinated = self.mutation_coordinator.lock();
         let mut groups = lock_unpoisoned(&self.groups);
         if groups
             .iter()
@@ -107,6 +112,7 @@ impl ClipboardGroups {
         id: domain::GroupId,
         direction: i8,
     ) -> Result<Vec<ClipboardGroupView>, String> {
+        let _coordinated = self.mutation_coordinator.lock();
         let mut groups = lock_unpoisoned(&self.groups);
         let index = groups
             .iter()
@@ -137,6 +143,7 @@ impl ClipboardGroups {
     }
 
     fn delete(&self, id: domain::GroupId) -> Result<(), String> {
+        let _coordinated = self.mutation_coordinator.lock();
         let mut groups = lock_unpoisoned(&self.groups);
         let index = groups
             .iter()
@@ -159,7 +166,7 @@ impl ClipboardGroups {
             .any(|group| group.id == id)
     }
 
-    fn replace_all(&self, groups: Vec<(domain::GroupId, String)>) {
+    fn replace_all_coordinated(&self, groups: Vec<(domain::GroupId, String)>) {
         *lock_unpoisoned(&self.groups) = groups
             .into_iter()
             .map(|(id, name)| ClipboardGroupView { id, name })
@@ -362,6 +369,7 @@ struct ApplicationSettings {
     hotkey_status: Mutex<HotkeyStatus>,
     custom_sound_path: std::path::PathBuf,
     capture_policy: Arc<platform::windows::clipboard::CapturePolicy>,
+    mutation_coordinator: Arc<PersistenceMutationCoordinator>,
 }
 
 #[cfg(windows)]
@@ -390,56 +398,64 @@ impl ApplicationSettings {
     }
 
     fn update_language(&self, language: Language) -> SettingsView {
+        let _coordinated = self.mutation_coordinator.lock();
         lock_unpoisoned(&self.current).language = language;
-        self.persist_settings();
+        self.persist_settings_coordinated();
         self.view()
     }
 
     fn update_retention(&self, retention: RetentionPeriod) -> SettingsView {
+        let _coordinated = self.mutation_coordinator.lock();
         lock_unpoisoned(&self.current).retention = retention;
-        self.persist_settings();
-        self.prune_expired();
+        self.persist_settings_coordinated();
+        self.prune_expired_coordinated();
         self.view()
     }
 
     fn update_start_at_sign_in(&self, enabled: bool) -> SettingsView {
+        let _coordinated = self.mutation_coordinator.lock();
         lock_unpoisoned(&self.current).start_at_sign_in = enabled;
-        self.persist_settings();
+        self.persist_settings_coordinated();
         self.view()
     }
 
     fn update_start_minimized(&self, enabled: bool) -> SettingsView {
+        let _coordinated = self.mutation_coordinator.lock();
         lock_unpoisoned(&self.current).start_minimized = enabled;
-        self.persist_settings();
+        self.persist_settings_coordinated();
         self.view()
     }
 
     fn update_show_tray_icon(&self, enabled: bool) -> SettingsView {
+        let _coordinated = self.mutation_coordinator.lock();
         let mut current = lock_unpoisoned(&self.current);
         current.show_tray_icon = enabled;
         if !enabled {
             current.start_minimized = false;
         }
         drop(current);
-        self.persist_settings();
+        self.persist_settings_coordinated();
         self.view()
     }
 
     fn update_accent_color(&self, accent_color: AccentColor) -> SettingsView {
+        let _coordinated = self.mutation_coordinator.lock();
         lock_unpoisoned(&self.current).accent_color = accent_color;
-        self.persist_settings();
+        self.persist_settings_coordinated();
         self.view()
     }
 
     fn update_sound_enabled(&self, enabled: bool) -> SettingsView {
+        let _coordinated = self.mutation_coordinator.lock();
         lock_unpoisoned(&self.current).sound_enabled = enabled;
-        self.persist_settings();
+        self.persist_settings_coordinated();
         self.view()
     }
 
     fn update_capture_sound(&self, capture_sound: CaptureSound) -> SettingsView {
+        let _coordinated = self.mutation_coordinator.lock();
         lock_unpoisoned(&self.current).capture_sound = capture_sound;
-        self.persist_settings();
+        self.persist_settings_coordinated();
         self.view()
     }
 
@@ -450,13 +466,14 @@ impl ApplicationSettings {
         quick_paste_enabled: bool,
         quick_paste_modifiers: ShortcutModifiers,
     ) -> SettingsView {
+        let _coordinated = self.mutation_coordinator.lock();
         let mut current = lock_unpoisoned(&self.current);
         current.activation_shortcut = activation;
         current.group_shortcut_modifiers = group_modifiers;
         current.quick_paste_enabled = quick_paste_enabled;
         current.quick_paste_modifiers = quick_paste_modifiers;
         drop(current);
-        self.persist_settings();
+        self.persist_settings_coordinated();
         self.view()
     }
 
@@ -485,6 +502,11 @@ impl ApplicationSettings {
     }
 
     fn prune_expired(&self) -> usize {
+        let _coordinated = self.mutation_coordinator.lock();
+        self.prune_expired_coordinated()
+    }
+
+    fn prune_expired_coordinated(&self) -> usize {
         let retention = lock_unpoisoned(&self.current).retention;
         let now = chrono::Utc::now();
         if let Some(persistence) = &self.persistence
@@ -494,11 +516,11 @@ impl ApplicationSettings {
         }
         retention.days().map_or(0, |days| {
             self.records
-                .prune_before(now - chrono::Duration::days(days))
+                .prune_before_coordinated(now - chrono::Duration::days(days))
         })
     }
 
-    fn persist_settings(&self) {
+    fn persist_settings_coordinated(&self) {
         let settings = *lock_unpoisoned(&self.current);
         if let Some(persistence) = &self.persistence
             && persistence.save_settings(settings).is_err()
@@ -517,6 +539,7 @@ impl ApplicationSettings {
         applications: Vec<String>,
     ) -> Result<SettingsView, String> {
         let applications = normalize_excluded_applications(applications)?;
+        let _coordinated = self.mutation_coordinator.lock();
         if let Some(persistence) = &self.persistence {
             persistence
                 .save_excluded_applications(&applications)
@@ -653,8 +676,8 @@ fn spawn_clipboard_event_drain(
 #[cfg(all(test, windows))]
 mod runtime_tests {
     use super::{
-        ActiveGroup, ActiveGroupState, ApplicationSettings, ClipboardGroupView, HotkeyStatus,
-        spawn_clipboard_event_drain, spawn_periodic_retention,
+        ActiveGroup, ActiveGroupState, ApplicationSettings, ClipboardGroupView, ClipboardGroups,
+        HotkeyStatus, spawn_clipboard_event_drain, spawn_periodic_retention,
     };
     use crate::{
         domain::{
@@ -662,8 +685,13 @@ mod runtime_tests {
             SourceIdentity, UserSettings,
         },
         platform::windows::clipboard::{ClipboardEvent, latest_clipboard_event_channel},
-        services::persistence::{PersistenceWorker, RecordPersistence, SqliteRepository},
-        services::session_records::SessionRecordStore,
+        services::persistence::{
+            PersistenceMutationCoordinator, PersistenceWorker, RecordPersistence, RestoreBudget,
+            SqliteRepository,
+        },
+        services::session_records::{
+            DEFAULT_STORE_BYTES, MAX_CAPTURE_RECORD_BYTES, MAX_SESSION_RECORDS, SessionRecordStore,
+        },
     };
     use chrono::{Duration, Utc};
     use std::sync::{
@@ -789,6 +817,7 @@ mod runtime_tests {
             hotkey_status: Mutex::new(HotkeyStatus::Unavailable),
             custom_sound_path: std::path::PathBuf::new(),
             capture_policy: Arc::new(crate::platform::windows::clipboard::CapturePolicy::default()),
+            mutation_coordinator: Arc::new(PersistenceMutationCoordinator::default()),
         };
 
         settings.update_retention(RetentionPeriod::SevenDays);
@@ -796,6 +825,197 @@ mod runtime_tests {
         assert_eq!(records.list().len(), 1);
         assert_eq!(repository.load_recent(10).unwrap().len(), 1);
         assert!(storage_available.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn restore_serializes_retention_and_prunes_using_the_restored_policy() {
+        let directory = tempdir().unwrap();
+        let live = SqliteRepository::open(directory.path().join("live.sqlite3")).unwrap();
+        let source_path = directory.path().join("source.clipbackup");
+        let source = SqliteRepository::open(source_path.clone()).unwrap();
+        let restored_record = crate::domain::ClipboardRecord::from_capture(CapturedClipboard {
+            content_identity: ContentIdentity::new("restored-old-record"),
+            captured_at: Utc::now() - Duration::days(30),
+            source: SourceIdentity::default(),
+            representations: vec![ClipboardRepresentation::UnicodeText {
+                text: "keep forever".to_owned(),
+            }],
+        });
+        source.save_record(&restored_record).unwrap();
+        source
+            .save_settings(UserSettings {
+                retention: RetentionPeriod::Forever,
+                ..UserSettings::default()
+            })
+            .unwrap();
+        drop(source);
+
+        let storage_available = Arc::new(AtomicBool::new(true));
+        let persistence =
+            PersistenceWorker::start(Arc::clone(&live), Arc::clone(&storage_available)).unwrap();
+        let mutation_coordinator = Arc::new(PersistenceMutationCoordinator::default());
+        let records = Arc::new(SessionRecordStore::with_persistence_page_and_coordinator(
+            live.load_page(crate::domain::HistoryQuery::default())
+                .unwrap(),
+            Arc::clone(&persistence) as Arc<dyn RecordPersistence>,
+            Arc::clone(&storage_available),
+            Arc::clone(&mutation_coordinator),
+        ));
+        let settings = Arc::new(ApplicationSettings {
+            current: Mutex::new(UserSettings {
+                retention: RetentionPeriod::OneDay,
+                ..UserSettings::default()
+            }),
+            persistence: Some(Arc::clone(&persistence)),
+            records: Arc::clone(&records),
+            storage_available,
+            hotkey_status: Mutex::new(HotkeyStatus::Unavailable),
+            custom_sound_path: std::path::PathBuf::new(),
+            capture_policy: Arc::new(crate::platform::windows::clipboard::CapturePolicy::default()),
+            mutation_coordinator,
+        });
+        let (restored_tx, restored_rx) = std::sync::mpsc::sync_channel(1);
+        let (publish_tx, publish_rx) = std::sync::mpsc::sync_channel(1);
+        let restoring = {
+            let records = Arc::clone(&records);
+            let settings = Arc::clone(&settings);
+            let persistence = Arc::clone(&persistence);
+            std::thread::spawn(move || {
+                records.with_restore_guard(|guard| {
+                    let restored = persistence
+                        .restore(
+                            source_path,
+                            RestoreBudget {
+                                max_records: MAX_SESSION_RECORDS,
+                                max_total_bytes: DEFAULT_STORE_BYTES,
+                                max_record_bytes: MAX_CAPTURE_RECORD_BYTES,
+                            },
+                        )
+                        .unwrap();
+                    restored_tx.send(()).unwrap();
+                    publish_rx.recv().unwrap();
+                    guard.apply_page(crate::domain::HistoryQuery::default(), restored.page);
+                    settings.replace_current(restored.settings);
+                });
+            })
+        };
+        restored_rx.recv().unwrap();
+        let (pruned_tx, pruned_rx) = std::sync::mpsc::sync_channel(1);
+        let pruning = {
+            let settings = Arc::clone(&settings);
+            std::thread::spawn(move || pruned_tx.send(settings.prune_expired()).unwrap())
+        };
+
+        assert!(
+            pruned_rx
+                .recv_timeout(std::time::Duration::from_millis(50))
+                .is_err()
+        );
+        publish_tx.send(()).unwrap();
+        restoring.join().unwrap();
+        assert_eq!(pruned_rx.recv().unwrap(), 0);
+        pruning.join().unwrap();
+
+        assert_eq!(settings.current().retention, RetentionPeriod::Forever);
+        assert_eq!(
+            live.record_details(restored_record.id).unwrap(),
+            restored_record
+        );
+        assert!(
+            records
+                .list()
+                .iter()
+                .any(|view| view.id == restored_record.id)
+        );
+    }
+
+    #[test]
+    fn restore_serializes_group_mutations_against_database_and_runtime_publication() {
+        let directory = tempdir().unwrap();
+        let live = SqliteRepository::open(directory.path().join("live.sqlite3")).unwrap();
+        let source_path = directory.path().join("source.clipbackup");
+        let source = SqliteRepository::open(source_path.clone()).unwrap();
+        let restored_group = crate::domain::GroupId::new();
+        source.save_group(restored_group, "Restored").unwrap();
+        drop(source);
+
+        let storage_available = Arc::new(AtomicBool::new(true));
+        let persistence =
+            PersistenceWorker::start(Arc::clone(&live), Arc::clone(&storage_available)).unwrap();
+        let mutation_coordinator = Arc::new(PersistenceMutationCoordinator::default());
+        let records = Arc::new(SessionRecordStore::with_persistence_page_and_coordinator(
+            live.load_page(crate::domain::HistoryQuery::default())
+                .unwrap(),
+            Arc::clone(&persistence) as Arc<dyn RecordPersistence>,
+            storage_available,
+            Arc::clone(&mutation_coordinator),
+        ));
+        let groups = Arc::new(ClipboardGroups {
+            groups: Mutex::new(Vec::new()),
+            repository: Some(Arc::clone(&live)),
+            mutation_coordinator,
+        });
+        let (restored_tx, restored_rx) = std::sync::mpsc::sync_channel(1);
+        let (publish_tx, publish_rx) = std::sync::mpsc::sync_channel(1);
+        let restoring = {
+            let records = Arc::clone(&records);
+            let groups = Arc::clone(&groups);
+            let persistence = Arc::clone(&persistence);
+            std::thread::spawn(move || {
+                records.with_restore_guard(|guard| {
+                    let restored = persistence
+                        .restore(
+                            source_path,
+                            RestoreBudget {
+                                max_records: MAX_SESSION_RECORDS,
+                                max_total_bytes: DEFAULT_STORE_BYTES,
+                                max_record_bytes: MAX_CAPTURE_RECORD_BYTES,
+                            },
+                        )
+                        .unwrap();
+                    restored_tx.send(()).unwrap();
+                    publish_rx.recv().unwrap();
+                    guard.apply_page(crate::domain::HistoryQuery::default(), restored.page);
+                    groups.replace_all_coordinated(restored.groups);
+                });
+            })
+        };
+        restored_rx.recv().unwrap();
+        let (created_tx, created_rx) = std::sync::mpsc::sync_channel(1);
+        let creating = {
+            let groups = Arc::clone(&groups);
+            std::thread::spawn(move || {
+                created_tx
+                    .send(groups.create("Concurrent".to_owned()))
+                    .unwrap()
+            })
+        };
+
+        assert!(
+            created_rx
+                .recv_timeout(std::time::Duration::from_millis(50))
+                .is_err()
+        );
+        publish_tx.send(()).unwrap();
+        restoring.join().unwrap();
+        let created = created_rx.recv().unwrap().unwrap();
+        creating.join().unwrap();
+
+        let runtime_groups = groups.list();
+        let persisted_groups = live.load_groups().unwrap();
+        assert!(
+            runtime_groups
+                .iter()
+                .any(|group| group.id == restored_group)
+        );
+        assert!(runtime_groups.iter().any(|group| group.id == created.id));
+        assert_eq!(
+            runtime_groups
+                .iter()
+                .map(|group| (group.id, group.name.clone()))
+                .collect::<Vec<_>>(),
+            persisted_groups
+        );
     }
 
     #[test]
@@ -828,6 +1048,7 @@ mod runtime_tests {
             hotkey_status: Mutex::new(HotkeyStatus::Unavailable),
             custom_sound_path: std::path::PathBuf::new(),
             capture_policy: Arc::new(crate::platform::windows::clipboard::CapturePolicy::default()),
+            mutation_coordinator: Arc::new(PersistenceMutationCoordinator::default()),
         };
 
         let view = settings.update_show_tray_icon(false);
@@ -858,6 +1079,7 @@ mod runtime_tests {
             hotkey_status: Mutex::new(HotkeyStatus::Unavailable),
             custom_sound_path: std::path::PathBuf::new(),
             capture_policy: Arc::new(crate::platform::windows::clipboard::CapturePolicy::default()),
+            mutation_coordinator: Arc::new(PersistenceMutationCoordinator::default()),
         });
         let (pruned, observed) = std::sync::mpsc::channel();
         let settings_for_tick = Arc::clone(&settings);
@@ -1391,7 +1613,7 @@ fn restore_backup(
             },
             restored.page,
         );
-        groups.replace_all(restored.groups);
+        groups.replace_all_coordinated(restored.groups);
         active.set(ActiveGroup::All);
         let startup_updated = std::env::current_exe()
             .ok()
@@ -1417,7 +1639,7 @@ fn restore_backup(
                 restored.excluded_applications,
             )?);
         let view = settings.replace_current(effective);
-        settings.persist_settings();
+        settings.persist_settings_coordinated();
         Ok::<_, String>(view)
     })?;
     let _ = app.emit("clipboard-records-changed", ());
@@ -1738,6 +1960,7 @@ pub fn run() {
             platform::windows::configure_quick_panel_style(panel.hwnd()?)?;
             let panel_controller = Arc::new(PanelController::new(panel));
             let storage_available = Arc::new(AtomicBool::new(false));
+            let mutation_coordinator = Arc::new(PersistenceMutationCoordinator::default());
             let app_data_dir = app.path().app_data_dir().ok();
             let custom_sound_path = app_data_dir
                 .as_ref()
@@ -1787,6 +2010,7 @@ pub fn run() {
             let groups = Arc::new(ClipboardGroups {
                 groups: Mutex::new(loaded_groups),
                 repository: repository.clone(),
+                mutation_coordinator: Arc::clone(&mutation_coordinator),
             });
             let persistence = repository.and_then(|repository| {
                 PersistenceWorker::start(repository, Arc::clone(&storage_available)).ok()
@@ -1795,11 +2019,15 @@ pub fn run() {
                 storage_available.store(false, Ordering::Release);
             }
             let session_records = match &persistence {
-                Some(persistence) => Arc::new(SessionRecordStore::with_persistence_page(
-                    loaded_records,
-                    Arc::clone(persistence) as Arc<dyn services::persistence::RecordPersistence>,
-                    Arc::clone(&storage_available),
-                )),
+                Some(persistence) => {
+                    Arc::new(SessionRecordStore::with_persistence_page_and_coordinator(
+                        loaded_records,
+                        Arc::clone(persistence)
+                            as Arc<dyn services::persistence::RecordPersistence>,
+                        Arc::clone(&storage_available),
+                        Arc::clone(&mutation_coordinator),
+                    ))
+                }
                 None => Arc::new(SessionRecordStore::with_session_only(
                     Vec::new(),
                     Arc::clone(&storage_available),
@@ -1823,6 +2051,7 @@ pub fn run() {
                 hotkey_status: Mutex::new(HotkeyStatus::Unavailable),
                 custom_sound_path,
                 capture_policy,
+                mutation_coordinator,
             });
             let settings_window = app
                 .get_webview_window("settings")
