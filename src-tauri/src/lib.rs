@@ -1452,6 +1452,17 @@ fn list_history_page(
 
 #[cfg(windows)]
 #[tauri::command]
+fn search_history(
+    query: services::search::SearchQuery,
+    records: tauri::State<'_, Arc<SessionRecordStore>>,
+) -> Result<services::search::SearchPage, String> {
+    SessionRecordCommands::new(records.inner())
+        .search_history(query)
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(windows)]
+#[tauri::command]
 fn get_record_details(
     record_id: domain::RecordId,
     records: tauri::State<'_, Arc<SessionRecordStore>>,
@@ -2670,6 +2681,7 @@ pub fn run() {
             paste_selected,
             list_session_records,
             list_history_page,
+            search_history,
             get_record_details,
             set_record_pinned,
             set_record_favorite,

@@ -4,6 +4,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   ClipboardAssistantApp,
   type AppCommands,
+  type SearchPage,
   type SessionRecord,
   type SettingsState,
 } from "./App";
@@ -48,6 +49,7 @@ function commands(records = [record]): AppCommands {
   return {
     listSessionRecords: vi.fn().mockResolvedValue(records),
     listHistoryPage: vi.fn().mockResolvedValue({ items: records, nextCursor: null }),
+    searchHistory: vi.fn().mockResolvedValue({ items: records, nextCursor: null }),
     setRecordPinned: vi.fn().mockImplementation(async (_id, pinned) => ({ ...record, pinned })),
     setRecordFavorite: vi.fn().mockImplementation(async (_id, favorite) => ({ ...record, favorite })),
     updateRecordContent: vi.fn().mockImplementation(async (_id, text) => ({ ...record, text })),
@@ -414,7 +416,35 @@ describe("quick panel", () => {
 
     fireEvent.change(screen.getByLabelText("搜索剪贴板"), { target: { value: "工作账号" } });
 
+    await waitFor(() => expect(api.searchHistory).toHaveBeenCalledWith({
+      query: "工作账号",
+      cursor: null,
+      limit: 50,
+      contentKind: null,
+      groupId: null,
+      ungroupedOnly: false,
+      favoritesOnly: false,
+    }));
     expect(screen.getByText("real clipboard text")).toBeInTheDocument();
+  });
+
+  it("ignores stale global search responses", async () => {
+    const api = commands([]);
+    const stale = deferred<SearchPage>();
+    const current = { ...record, text: "current result" };
+    vi.mocked(api.searchHistory)
+      .mockImplementationOnce(() => stale.promise)
+      .mockResolvedValueOnce({ items: [current], nextCursor: null });
+    render(<ClipboardAssistantApp windowLabel="quick-panel" commands={api} />);
+    const search = screen.getByLabelText("搜索剪贴板");
+
+    fireEvent.change(search, { target: { value: "old" } });
+    await waitFor(() => expect(api.searchHistory).toHaveBeenCalledTimes(1));
+    fireEvent.change(search, { target: { value: "new" } });
+    expect(await screen.findByText("current result")).toBeInTheDocument();
+    stale.resolve({ items: [{ ...record, text: "stale result" }], nextCursor: null });
+
+    await waitFor(() => expect(screen.queryByText("stale result")).not.toBeInTheDocument());
   });
 
   it("uses ArrowDown in search to focus the selected result", async () => {

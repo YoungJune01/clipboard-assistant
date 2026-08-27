@@ -57,11 +57,14 @@ export type ContentKind = "text" | "rich_text" | "image" | "files";
 export type ContentCategory = "all" | ContentKind | "favorites";
 export interface HistoryCursor { capturedAt: string; id: string; }
 export interface HistoryPage { items: SessionRecord[]; nextCursor: HistoryCursor | null; }
+export interface SearchCursor { score: number; capturedAt: string; id: string; }
+export interface SearchPage { items: SessionRecord[]; nextCursor: SearchCursor | null; }
 export interface SessionRecord { id: string; capturedAt: string; sourceApplication: string | null; text: string | null; hasImage: boolean; note: string | null; groupId: string | null; contentKind: ContentKind; pinned: boolean; favorite: boolean; sensitive: boolean; }
 export interface ImagePreview { dataUrl: string; width: number; height: number; }
 export interface AppCommands {
   listSessionRecords(): Promise<SessionRecord[]>; pasteSelected(recordId: string): Promise<string>;
   listHistoryPage(query: { cursor: HistoryCursor | null; limit: number; contentKind: ContentKind | null; groupId: string | null; ungroupedOnly: boolean; favoritesOnly: boolean }): Promise<HistoryPage>;
+  searchHistory(query: { query: string; cursor: SearchCursor | null; limit: number; contentKind: ContentKind | null; groupId: string | null; ungroupedOnly: boolean; favoritesOnly: boolean }): Promise<SearchPage>;
   setRecordPinned(recordId: string, pinned: boolean): Promise<SessionRecord>;
   setRecordFavorite(recordId: string, favorite: boolean): Promise<SessionRecord>;
   updateRecordContent(recordId: string, text: string): Promise<SessionRecord>;
@@ -106,6 +109,7 @@ const defaults: SettingsState = { language: "zh_cn", retention: "thirty_days", s
 const tauriCommands: AppCommands = {
   listSessionRecords: () => invoke("list_session_records"), pasteSelected: (recordId) => invoke("paste_selected", { recordId }),
   listHistoryPage: (query) => invoke("list_history_page", { query }),
+  searchHistory: (query) => invoke("search_history", { query }),
   setRecordPinned: (recordId, pinned) => invoke("set_record_pinned", { recordId, pinned }),
   setRecordFavorite: (recordId, favorite) => invoke("set_record_favorite", { recordId, favorite }),
   updateRecordContent: (recordId, text) => invoke("update_record_content", { recordId, text }),
@@ -191,12 +195,12 @@ function useSettings(commands: AppCommands) {
 
 function QuickPanel({ commands, text, language }: { commands: AppCommands; text: Dictionary; language: Language }) {
   const [records, setRecords] = useState<SessionRecord[]>([]); const [selectedId, setSelectedId] = useState<string | null>(null);
-  const [nextCursor, setNextCursor] = useState<HistoryCursor | null>(null); const [loadingMore, setLoadingMore] = useState(false);
+  const [nextCursor, setNextCursor] = useState<HistoryCursor | SearchCursor | null>(null); const [loadingMore, setLoadingMore] = useState(false);
   const [category, setCategory] = useState<ContentCategory>("all"); const [groupsExpanded, setGroupsExpanded] = useState(true);
   const [groups, setGroups] = useState<ClipboardGroup[]>([]); const [activeGroup, setActiveGroupValue] = useState("all");
   const [editingGroup, setEditingGroup] = useState<"new" | string | null>(null); const [groupName, setGroupName] = useState("");
   const [confirmDeleteGroup, setConfirmDeleteGroup] = useState(false);
-  const [query, setQuery] = useState(""); const [status, setStatus] = useState<keyof Pick<Dictionary, "pasteSent" | "copyOnly" | "pasteFailed" | "noteSaveFailed" | "groupSaveFailed" | "deleteFailed"> | null>(null);
+  const [query, setQuery] = useState(""); const [debouncedQuery, setDebouncedQuery] = useState(""); const [loadedSearchQuery, setLoadedSearchQuery] = useState(""); const [status, setStatus] = useState<keyof Pick<Dictionary, "pasteSent" | "copyOnly" | "pasteFailed" | "noteSaveFailed" | "groupSaveFailed" | "deleteFailed"> | null>(null);
   const [deletedId, setDeletedId] = useState<string | null>(null);
   const [recordDialog, setRecordDialog] = useState<{ mode: "create" | "edit"; recordId: string | null; text: string; note: string; groupId: string } | null>(null);
   const [recordSaveError, setRecordSaveError] = useState(false); const [recordSaveBusy, setRecordSaveBusy] = useState(false);
@@ -205,12 +209,14 @@ function QuickPanel({ commands, text, language }: { commands: AppCommands; text:
   const mounted = useRef(true); const generation = useRef(0); const loadingMoreRequest = useRef(false); const noteRevisions = useRef(new Map<string, number>());
   const searchRef = useRef<HTMLInputElement>(null); const itemRefs = useRef(new Map<string, HTMLElement>()); const loadMoreRef = useRef<HTMLDivElement>(null);
   const historyQuery = useCallback((cursor: HistoryCursor | null) => ({ cursor, limit: 50, contentKind: category === "all" || category === "favorites" ? null : category, groupId: activeGroup !== "all" && activeGroup !== "ungrouped" ? activeGroup : null, ungroupedOnly: activeGroup === "ungrouped", favoritesOnly: category === "favorites" }), [activeGroup, category]);
+  const searchQuery = useCallback((cursor: SearchCursor | null) => ({ query: debouncedQuery, cursor, limit: 50, contentKind: category === "all" || category === "favorites" ? null : category, groupId: activeGroup !== "all" && activeGroup !== "ungrouped" ? activeGroup : null, ungroupedOnly: activeGroup === "ungrouped", favoritesOnly: category === "favorites" }), [activeGroup, category, debouncedQuery]);
+  useEffect(() => { const timeout = window.setTimeout(() => setDebouncedQuery(query.trim()), 150); return () => window.clearTimeout(timeout); }, [query]);
   const refresh = useCallback(async () => {
     const current = ++generation.current;
-    try { const page = await commands.listHistoryPage(historyQuery(null)); if (!mounted.current || current !== generation.current) return; setRecords(page.items); setNextCursor(page.nextCursor); setSelectedId((id) => id && page.items.some((item) => item.id === id) ? id : (page.items[0]?.id ?? null)); setHistoryError(false); }
+    try { const page = debouncedQuery ? await commands.searchHistory(searchQuery(null)) : await commands.listHistoryPage(historyQuery(null)); if (!mounted.current || current !== generation.current) return; setRecords(page.items); setLoadedSearchQuery(debouncedQuery); setNextCursor(page.nextCursor); setSelectedId((id) => id && page.items.some((item) => item.id === id) ? id : (page.items[0]?.id ?? null)); setHistoryError(false); }
     catch { if (mounted.current && current === generation.current) setHistoryError(true); }
     finally { if (mounted.current && current === generation.current) setLoading(false); }
-  }, [commands, historyQuery]);
+  }, [commands, debouncedQuery, historyQuery, searchQuery]);
   useEffect(() => { mounted.current = true; void refresh(); let disposed = false; let stop: (() => void) | undefined; void commands.subscribeRecordsChanged(() => void refresh()).then((value) => disposed ? value() : stop = value).catch(() => !disposed && setHistoryError(true)); return () => { disposed = true; mounted.current = false; generation.current += 1; stop?.(); }; }, [commands, refresh]);
   useEffect(() => {
     const target = loadMoreRef.current;
@@ -220,7 +226,8 @@ function QuickPanel({ commands, text, language }: { commands: AppCommands; text:
       const current = generation.current;
       loadingMoreRequest.current = true;
       setLoadingMore(true);
-      void commands.listHistoryPage(historyQuery(nextCursor)).then((page) => {
+      const request = debouncedQuery ? commands.searchHistory(searchQuery(nextCursor as SearchCursor)) : commands.listHistoryPage(historyQuery(nextCursor as HistoryCursor));
+      void request.then((page) => {
         if (!mounted.current || current !== generation.current) return;
         setRecords((items) => { const known = new Set(items.map((item) => item.id)); return [...items, ...page.items.filter((item) => !known.has(item.id))]; });
         setNextCursor(page.nextCursor);
@@ -231,9 +238,9 @@ function QuickPanel({ commands, text, language }: { commands: AppCommands; text:
     });
     observer.observe(target);
     return () => observer.disconnect();
-  }, [commands, historyQuery, nextCursor]);
+  }, [commands, debouncedQuery, historyQuery, nextCursor, searchQuery]);
   const refreshGroups = useCallback(async () => { try { setGroups(await commands.listClipboardGroups()); } catch { setStatus("groupSaveFailed"); } }, [commands]);
-  useEffect(() => { void refreshGroups(); let disposed = false; let stop: (() => void) | undefined; void commands.subscribeGroupsChanged(() => void refreshGroups()).then((value) => disposed ? value() : stop = value).catch(() => !disposed && setStatus("groupSaveFailed")); return () => { disposed = true; stop?.(); }; }, [commands, refreshGroups]);
+  useEffect(() => { void refreshGroups(); let disposed = false; let stop: (() => void) | undefined; void commands.subscribeGroupsChanged(() => { void refreshGroups(); void refresh(); }).then((value) => disposed ? value() : stop = value).catch(() => !disposed && setStatus("groupSaveFailed")); return () => { disposed = true; stop?.(); }; }, [commands, refresh, refreshGroups]);
   useEffect(() => {
     let disposed = false; let stop: (() => void) | undefined;
     const apply = (active: ActiveGroupState) => setActiveGroupValue(active.kind === "group" && active.groupId ? active.groupId : active.kind);
@@ -249,20 +256,21 @@ function QuickPanel({ commands, text, language }: { commands: AppCommands; text:
     const locale = language === "zh_cn" ? "zh-CN" : "en-US";
     const value = query.trim().toLocaleLowerCase(locale);
     const groupNames = new Map(groups.map((group) => [group.id, group.name]));
+    const applyTransitionalTextFilter = value.length > 0 && query.trim() !== loadedSearchQuery;
     const matches = records.filter((item) => {
       const inActiveGroup = activeGroup === "all" || (activeGroup === "ungrouped" ? item.groupId === null : item.groupId === activeGroup);
       const inCategory = category === "all" || (category === "favorites" ? item.favorite : item.contentKind === category);
-      if (!inActiveGroup || !inCategory || !value) return inActiveGroup && inCategory;
+      if (!inActiveGroup || !inCategory || !applyTransitionalTextFilter) return inActiveGroup && inCategory;
       const url = detectWebUrl(item.text);
       return [item.text, item.note, item.sourceApplication, item.groupId ? groupNames.get(item.groupId) : null, url?.hostname]
         .filter(Boolean)
         .some((field) => field!.toLocaleLowerCase(locale).includes(value));
     });
-    if (category === "all" && activeGroup === "all" && !value) {
+    if (category === "all" && activeGroup === "all" && !debouncedQuery) {
       return [...matches].sort((left, right) => Number(right.pinned) - Number(left.pinned) || right.capturedAt.localeCompare(left.capturedAt));
     }
-    return [...matches].sort((left, right) => right.capturedAt.localeCompare(left.capturedAt));
-  }, [activeGroup, category, groups, language, query, records]);
+    return debouncedQuery ? matches : [...matches].sort((left, right) => right.capturedAt.localeCompare(left.capturedAt));
+  }, [activeGroup, category, debouncedQuery, groups, language, loadedSearchQuery, query, records]);
   useEffect(() => { if (!loading) setSelectedId((id) => id && filtered.some((item) => item.id === id) ? id : (filtered[0]?.id ?? null)); }, [filtered, loading]);
   useEffect(() => {
     if (loading) return;

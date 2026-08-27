@@ -18,6 +18,7 @@ use crate::services::persistence::{
     HistoryPage, HistoryRecordSummary, PersistedRecordDetails, PersistenceMutationCoordinator,
     RecordPersistence,
 };
+use crate::services::search::{SearchPage, SearchQuery};
 
 pub(crate) const MAX_SESSION_RECORDS: usize = 500;
 pub(crate) const STARTUP_HISTORY_RECORDS: usize = 100;
@@ -452,6 +453,18 @@ impl SessionRecordStore {
                 .collect(),
             next_cursor: page.next_cursor,
         })
+    }
+
+    pub fn search_history(&self, query: SearchQuery) -> Result<SearchPage, SessionRecordError> {
+        let page = match &self.persistence {
+            NotePersistence::Durable(persistence) => persistence
+                .search_history(query)
+                .map_err(|_| SessionRecordError::PersistenceUnavailable)?,
+            NotePersistence::NotConfigured | NotePersistence::SessionOnly => {
+                return Err(SessionRecordError::PersistenceUnavailable);
+            }
+        };
+        Ok(page)
     }
 
     pub fn record_details_view(
@@ -1566,6 +1579,10 @@ impl<'a> SessionRecordCommands<'a> {
 
     pub fn history_page(&self, query: HistoryQuery) -> Result<HistoryPageView, SessionRecordError> {
         self.store.history_page(query)
+    }
+
+    pub fn search_history(&self, query: SearchQuery) -> Result<SearchPage, SessionRecordError> {
+        self.store.search_history(query)
     }
 
     pub fn record_details(&self, id: RecordId) -> Result<RecordDetailsView, SessionRecordError> {

@@ -44,7 +44,7 @@ use crate::services::session_records::{
     MAX_DETAIL_TEXT_BYTES, REPRESENTATION_OVERHEAD_BYTES,
 };
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 const DATABASE_FILE: &str = "clipboard-history.sqlite3";
 const MIGRATION_TEMP_SUFFIX: &str = ".migrate-v2";
 const MIGRATION_BACKUP_SUFFIX: &str = ".migrate-v1-backup";
@@ -227,6 +227,12 @@ pub trait RecordPersistence: Send + Sync {
     fn delete_record(&self, id: RecordId) -> Result<(), PersistenceError>;
     fn clear_records(&self) -> Result<usize, PersistenceError>;
     fn load_page(&self, _query: HistoryQuery) -> Result<HistoryPage, PersistenceError> {
+        Err(PersistenceError::WorkerUnavailable)
+    }
+    fn search_history(
+        &self,
+        _query: crate::services::search::SearchQuery,
+    ) -> Result<crate::services::search::SearchPage, PersistenceError> {
         Err(PersistenceError::WorkerUnavailable)
     }
     fn record_details(&self, _id: RecordId) -> Result<PersistedRecordDetails, PersistenceError> {
@@ -545,6 +551,19 @@ impl RecordPersistence for PersistenceWorker {
             .as_ref()
             .ok_or(PersistenceError::WorkerUnavailable)?
             .load_page(query)
+    }
+
+    fn search_history(
+        &self,
+        query: crate::services::search::SearchQuery,
+    ) -> Result<crate::services::search::SearchPage, PersistenceError> {
+        if !self.storage_available.load(Ordering::Acquire) {
+            return Err(PersistenceError::WorkerUnavailable);
+        }
+        self.reader
+            .as_ref()
+            .ok_or(PersistenceError::WorkerUnavailable)?
+            .search_history(query)
     }
 
     fn record_details(&self, id: RecordId) -> Result<PersistedRecordDetails, PersistenceError> {
@@ -987,13 +1006,16 @@ impl SqliteRepository {
         let _migration_guard = self
             .migration_locks
             .acquire(&self.path, MIGRATION_LOCK_TIMEOUT)?;
-        let connection = lock_unpoisoned(&self.connection);
-        connection.execute(
+        let mut connection = lock_unpoisoned(&self.connection);
+        let transaction = connection.transaction()?;
+        transaction.execute(
             "INSERT INTO clipboard_groups(id, name, position) \
              VALUES (?1, ?2, COALESCE((SELECT MAX(position) + 1 FROM clipboard_groups), 0)) \
              ON CONFLICT(id) DO UPDATE SET name = excluded.name",
             params![id.as_uuid().to_string(), name],
         )?;
+        refresh_group_search_records(&transaction, id)?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -1022,6 +1044,7 @@ impl SqliteRepository {
             .acquire(&self.path, MIGRATION_LOCK_TIMEOUT)?;
         let mut connection = lock_unpoisoned(&self.connection);
         let transaction = connection.transaction()?;
+        let record_ids = record_ids_in_group(&transaction, id)?;
         let moved = transaction.execute(
             "UPDATE clipboard_records SET group_id = NULL WHERE group_id = ?1",
             [id.as_uuid().to_string()],
@@ -1032,6 +1055,9 @@ impl SqliteRepository {
         )?;
         if deleted != 1 {
             return Err(PersistenceError::InvalidData);
+        }
+        for record_id in record_ids {
+            crate::services::search::refresh_search_record(&transaction, &record_id)?;
         }
         transaction.commit()?;
         Ok(moved)
@@ -1197,6 +1223,14 @@ impl SqliteRepository {
     pub fn load_page(&self, query: HistoryQuery) -> Result<HistoryPage, PersistenceError> {
         let connection = lock_unpoisoned(&self.connection);
         load_page_from_connection(&connection, query)
+    }
+
+    pub fn search_history(
+        &self,
+        query: crate::services::search::SearchQuery,
+    ) -> Result<crate::services::search::SearchPage, PersistenceError> {
+        let connection = lock_unpoisoned(&self.connection);
+        crate::services::search::search_connection(&connection, query)
     }
 
     pub fn full_record(&self, id: RecordId) -> Result<ClipboardRecord, PersistenceError> {
@@ -1415,6 +1449,7 @@ fn write_record(
             ],
         )?;
     }
+    crate::services::search::refresh_search_record(transaction, &record.id.as_uuid().to_string())?;
     Ok(())
 }
 
@@ -1436,6 +1471,7 @@ impl RecordPersistence for SqliteRepository {
         if changed == 0 {
             return Err(PersistenceError::InvalidData);
         }
+        crate::services::search::refresh_search_record(&transaction, &id.as_uuid().to_string())?;
         let removed = enforce_disk_quota(&transaction, self.quota)?;
         if !record_exists(&transaction, id)? {
             return Err(PersistenceError::InvalidData);
@@ -1476,6 +1512,13 @@ impl RecordPersistence for SqliteRepository {
 
     fn load_page(&self, query: HistoryQuery) -> Result<HistoryPage, PersistenceError> {
         SqliteRepository::load_page(self, query)
+    }
+
+    fn search_history(
+        &self,
+        query: crate::services::search::SearchQuery,
+    ) -> Result<crate::services::search::SearchPage, PersistenceError> {
+        SqliteRepository::search_history(self, query)
     }
 
     fn record_details(&self, id: RecordId) -> Result<PersistedRecordDetails, PersistenceError> {
@@ -2124,6 +2167,7 @@ fn build_migrated_database(
         .map_err(|(_, error)| PersistenceError::Database(error))?;
 
     let connection = Connection::open(temp_path)?;
+    crate::services::search::rebuild_search_index(&connection)?;
     connection.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
     let integrity: String = connection.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
     if integrity != "ok" || database_version_from_connection(&connection)? != SCHEMA_VERSION {
@@ -2288,6 +2332,14 @@ fn migrate(connection: &mut Connection) -> Result<(), PersistenceError> {
              COMMIT;",
         )?;
     }
+    let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version == 4 {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        crate::services::search::create_search_schema(&transaction)?;
+        crate::services::search::rebuild_search_index(&transaction)?;
+        transaction.pragma_update(None, "user_version", 5)?;
+        transaction.commit()?;
+    }
     Ok(())
 }
 
@@ -2335,9 +2387,10 @@ fn create_schema(connection: &mut Connection) -> Result<(), PersistenceError> {
                 name TEXT NOT NULL,
                 position INTEGER NOT NULL
          );
-         PRAGMA user_version = 4;
+         PRAGMA user_version = 5;
          COMMIT;",
     )?;
+    crate::services::search::create_search_schema(connection)?;
     Ok(())
 }
 
@@ -2465,6 +2518,28 @@ fn record_exists(transaction: &Transaction<'_>, id: RecordId) -> Result<bool, Pe
         .optional()
         .map(|row| row.is_some())
         .map_err(Into::into)
+}
+
+fn record_ids_in_group(
+    transaction: &Transaction<'_>,
+    group_id: GroupId,
+) -> Result<Vec<String>, PersistenceError> {
+    let mut statement =
+        transaction.prepare("SELECT id FROM clipboard_records WHERE group_id = ?1 ORDER BY id")?;
+    let ids = statement
+        .query_map([group_id.as_uuid().to_string()], |row| row.get(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(ids)
+}
+
+fn refresh_group_search_records(
+    transaction: &Transaction<'_>,
+    group_id: GroupId,
+) -> Result<(), PersistenceError> {
+    for record_id in record_ids_in_group(transaction, group_id)? {
+        crate::services::search::refresh_search_record(transaction, &record_id)?;
+    }
+    Ok(())
 }
 
 // The quota covers replayable payload bytes, per-representation allocation overhead, and notes.
@@ -4028,7 +4103,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_three_migrates_to_four_and_backfills_content_kind_without_losing_records() {
+    fn schema_three_migrates_to_current_and_backfills_content_kind_without_losing_records() {
         let directory = tempdir().unwrap();
         let path = directory.path().join("history.sqlite3");
         {
@@ -4072,7 +4147,7 @@ mod tests {
         }
 
         let repository = SqliteRepository::open(path).unwrap();
-        assert_eq!(repository.schema_version().unwrap(), 4);
+        assert_eq!(repository.schema_version().unwrap(), SCHEMA_VERSION);
         let page = repository.load_page(HistoryQuery::default()).unwrap();
         assert_eq!(page.records.len(), 1);
         assert_eq!(page.records[0].content_kind, ContentKind::RichText);
