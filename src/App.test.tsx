@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import {
@@ -16,6 +16,10 @@ const record: SessionRecord = {
   hasImage: false,
   note: null,
   groupId: null,
+  contentKind: "text",
+  pinned: false,
+  favorite: false,
+  sensitive: false,
 };
 
 function commands(records = [record]): AppCommands {
@@ -43,6 +47,11 @@ function commands(records = [record]): AppCommands {
   let activeGroupListener: ((active: { kind: "all" | "ungrouped" | "group"; groupId: string | null }) => void) | undefined;
   return {
     listSessionRecords: vi.fn().mockResolvedValue(records),
+    listHistoryPage: vi.fn().mockResolvedValue({ items: records, nextCursor: null }),
+    setRecordPinned: vi.fn().mockImplementation(async (_id, pinned) => ({ ...record, pinned })),
+    setRecordFavorite: vi.fn().mockImplementation(async (_id, favorite) => ({ ...record, favorite })),
+    updateRecordContent: vi.fn().mockImplementation(async (_id, text) => ({ ...record, text })),
+    createTextRecord: vi.fn().mockImplementation(async (text, note, groupId) => ({ ...record, id: "55555555-5555-4555-8555-555555555555", text, note, groupId })),
     pasteSelected: vi.fn().mockResolvedValue("Paste command sent"),
     getRecordImagePreview: vi.fn().mockResolvedValue({ dataUrl: "data:image/png;base64,iVBORw0KGgo=", width: 120, height: 80 }),
     hideQuickPanel: vi.fn().mockResolvedValue(undefined),
@@ -142,6 +151,117 @@ function deferred<T>() {
 }
 
 describe("quick panel", () => {
+  it("filters the durable page by content category", async () => {
+    const imageRecord = { ...record, id: "44444444-4444-4444-8444-444444444444", text: null, hasImage: true, contentKind: "image" as const };
+    render(<ClipboardAssistantApp windowLabel="quick-panel" commands={commands([record, imageRecord])} />);
+    await screen.findByText("real clipboard text");
+
+    fireEvent.click(screen.getByRole("tab", { name: "图片" }));
+
+    expect(screen.queryByText("real clipboard text")).not.toBeInTheDocument();
+    expect(await screen.findByLabelText("图片预览")).toBeInTheDocument();
+  });
+
+  it("collapses and expands the second-level group row", async () => {
+    const api = commands();
+    vi.mocked(api.listClipboardGroups).mockResolvedValue([{ id: "22222222-2222-4222-8222-222222222222", name: "工作" }]);
+    render(<ClipboardAssistantApp windowLabel="quick-panel" commands={api} />);
+    expect(await screen.findByRole("button", { name: "工作" })).toBeVisible();
+
+    fireEvent.click(screen.getByRole("button", { name: "收起分组" }));
+    expect(screen.queryByRole("button", { name: "工作" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "展开分组" }));
+    expect(screen.getByRole("button", { name: "工作" })).toBeVisible();
+  });
+
+  it("keeps pin ordering only in the default all view", async () => {
+    const pinned = { ...record, id: "11111111-1111-4111-8111-111111111111", text: "pinned text", pinned: true, capturedAt: "2026-08-20T01:00:00Z" };
+    const newest = { ...record, id: "22222222-2222-4222-8222-222222222222", text: "newest text", capturedAt: "2026-08-23T01:00:00Z" };
+    render(<ClipboardAssistantApp windowLabel="quick-panel" commands={commands([newest, pinned])} />);
+
+    const options = await screen.findAllByRole("option");
+    expect(options[0]).toHaveTextContent("pinned text");
+    fireEvent.click(screen.getByRole("tab", { name: "文本" }));
+    const textOptions = screen.getAllByRole("option");
+    expect(textOptions[0]).toHaveTextContent("newest text");
+  });
+
+  it("toggles favorite and pin without triggering paste", async () => {
+    const api = commands();
+    render(<ClipboardAssistantApp windowLabel="quick-panel" commands={api} />);
+    await screen.findByText("real clipboard text");
+
+    fireEvent.click(screen.getByRole("button", { name: "固定此条记录" }));
+    fireEvent.click(screen.getByRole("button", { name: "收藏此条记录" }));
+
+    await waitFor(() => expect(api.setRecordPinned).toHaveBeenCalledWith(record.id, true));
+    expect(api.setRecordFavorite).toHaveBeenCalledWith(record.id, true);
+    expect(api.pasteSelected).not.toHaveBeenCalled();
+  });
+
+  it("creates and edits text records from compact dialogs", async () => {
+    const api = commands();
+    render(<ClipboardAssistantApp windowLabel="quick-panel" commands={api} />);
+    await screen.findByText("real clipboard text");
+
+    fireEvent.click(screen.getByRole("button", { name: "新增内容" }));
+    fireEvent.change(screen.getByLabelText("内容"), { target: { value: "manual text" } });
+    fireEvent.click(screen.getByRole("button", { name: "创建" }));
+    await waitFor(() => expect(api.createTextRecord).toHaveBeenCalledWith("manual text", null, null));
+
+    const original = screen.getByText("real clipboard text").closest("article");
+    expect(original).not.toBeNull();
+    fireEvent.click(within(original!).getByRole("button", { name: "编辑此条记录" }));
+    fireEvent.change(screen.getByLabelText("内容"), { target: { value: "edited text" } });
+    fireEvent.click(screen.getByRole("button", { name: "保存" }));
+    await waitFor(() => expect(api.updateRecordContent).toHaveBeenCalledWith(record.id, "edited text"));
+  });
+
+  it("loads and deduplicates the next durable history page", async () => {
+    const cursor = { capturedAt: record.capturedAt, id: record.id };
+    const older = { ...record, id: "66666666-6666-4666-8666-666666666666", text: "older text", capturedAt: "2026-08-21T01:02:03Z" };
+    const api = commands();
+    vi.mocked(api.listHistoryPage)
+      .mockResolvedValueOnce({ items: [record], nextCursor: cursor })
+      .mockResolvedValueOnce({ items: [record, older], nextCursor: null });
+    let intersect: ((entries: IntersectionObserverEntry[]) => void) | undefined;
+    const OriginalObserver = globalThis.IntersectionObserver;
+    class TestIntersectionObserver {
+      constructor(callback: IntersectionObserverCallback) {
+        intersect = (entries) => callback(entries, this as unknown as IntersectionObserver);
+      }
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+      takeRecords() { return []; }
+      readonly root = null;
+      readonly rootMargin = "0px";
+      readonly thresholds = [0];
+    }
+    globalThis.IntersectionObserver = TestIntersectionObserver as unknown as typeof IntersectionObserver;
+
+    try {
+      render(<ClipboardAssistantApp windowLabel="quick-panel" commands={api} />);
+      await screen.findByText("继续向下滚动加载更多");
+      expect(intersect).toBeDefined();
+
+      intersect!([{ isIntersecting: true } as IntersectionObserverEntry]);
+
+      expect(await screen.findByText("older text")).toBeInTheDocument();
+      expect(screen.getAllByText("real clipboard text")).toHaveLength(1);
+      expect(api.listHistoryPage).toHaveBeenLastCalledWith({
+        cursor,
+        limit: 50,
+        contentKind: null,
+        groupId: null,
+        ungroupedOnly: false,
+        favoritesOnly: false,
+      });
+    } finally {
+      globalThis.IntersectionObserver = OriginalObserver;
+    }
+  });
+
   it("disables the WebView context menu", () => {
     render(<ClipboardAssistantApp windowLabel="quick-panel" commands={commands()} />);
     const event = new MouseEvent("contextmenu", { bubbles: true, cancelable: true });
@@ -476,11 +596,11 @@ describe("quick panel", () => {
   });
 
   it("keeps the newest refresh when list responses arrive out of order", async () => {
-    const first = deferred<typeof record[]>();
-    const second = deferred<typeof record[]>();
+    const first = deferred<{ items: typeof record[]; nextCursor: null }>();
+    const second = deferred<{ items: typeof record[]; nextCursor: null }>();
     let notify: (() => void) | undefined;
     const api = commands([]);
-    vi.mocked(api.listSessionRecords)
+    vi.mocked(api.listHistoryPage)
       .mockReturnValueOnce(first.promise)
       .mockReturnValueOnce(second.promise);
     vi.mocked(api.subscribeRecordsChanged).mockImplementation(async (refresh) => {
@@ -491,9 +611,9 @@ describe("quick panel", () => {
     await waitFor(() => expect(notify).toBeDefined());
     notify!();
 
-    second.resolve([{ ...record, text: "newest" }]);
+    second.resolve({ items: [{ ...record, text: "newest" }], nextCursor: null });
     expect(await screen.findByText("newest")).toBeInTheDocument();
-    first.resolve([{ ...record, text: "stale" }]);
+    first.resolve({ items: [{ ...record, text: "stale" }], nextCursor: null });
     await Promise.resolve();
 
     expect(screen.queryByText("stale")).not.toBeInTheDocument();
@@ -501,11 +621,11 @@ describe("quick panel", () => {
   });
 
   it("clears loading on refresh failure and avoids state updates after unmount", async () => {
-    const pending = deferred<typeof record[]>();
+    const pending = deferred<{ items: typeof record[]; nextCursor: null }>();
     const lateSubscribe = deferred<() => void>();
     const unlisten = vi.fn();
     const api = commands([]);
-    vi.mocked(api.listSessionRecords).mockReturnValueOnce(pending.promise);
+    vi.mocked(api.listHistoryPage).mockReturnValueOnce(pending.promise);
     vi.mocked(api.subscribeRecordsChanged).mockReturnValueOnce(lateSubscribe.promise);
     const view = render(
       <ClipboardAssistantApp windowLabel="quick-panel" commands={api} />,

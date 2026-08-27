@@ -4,11 +4,14 @@ import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
   Clipboard,
+  ChevronDown,
   ChevronLeft,
   ChevronRight,
+  ChevronUp,
   Database,
   Download,
   GripHorizontal,
+  Heart,
   Image,
   Keyboard,
   Languages,
@@ -17,6 +20,7 @@ import {
   Palette,
   Pause,
   Pencil,
+  Pin,
   Power,
   Plus,
   Search,
@@ -49,10 +53,19 @@ export interface Shortcut { modifiers: ShortcutModifiers; key: ShortcutKey; }
 export interface SettingsState { language: Language; retention: RetentionPeriod; storageLimit: StorageLimit; evictFavoritesWhenFull: boolean; startAtSignIn: boolean; startMinimized: boolean; showTrayIcon: boolean; accentColor: AccentColor; soundEnabled: boolean; captureSound: CaptureSound; customSoundAvailable: boolean; activationShortcut: Shortcut; groupShortcutModifiers: ShortcutModifiers; quickPasteEnabled: boolean; quickPasteModifiers: ShortcutModifiers; storageAvailable: boolean; hotkeyStatus: HotkeyStatus; capturePaused: boolean; excludedApplications: string[]; }
 export interface ClipboardGroup { id: string; name: string; }
 export interface ActiveGroupState { kind: "all" | "ungrouped" | "group"; groupId: string | null; }
-export interface SessionRecord { id: string; capturedAt: string; sourceApplication: string | null; text: string | null; hasImage: boolean; note: string | null; groupId: string | null; }
+export type ContentKind = "text" | "rich_text" | "image" | "files";
+export type ContentCategory = "all" | ContentKind | "favorites";
+export interface HistoryCursor { capturedAt: string; id: string; }
+export interface HistoryPage { items: SessionRecord[]; nextCursor: HistoryCursor | null; }
+export interface SessionRecord { id: string; capturedAt: string; sourceApplication: string | null; text: string | null; hasImage: boolean; note: string | null; groupId: string | null; contentKind: ContentKind; pinned: boolean; favorite: boolean; sensitive: boolean; }
 export interface ImagePreview { dataUrl: string; width: number; height: number; }
 export interface AppCommands {
   listSessionRecords(): Promise<SessionRecord[]>; pasteSelected(recordId: string): Promise<string>;
+  listHistoryPage(query: { cursor: HistoryCursor | null; limit: number; contentKind: ContentKind | null; groupId: string | null; ungroupedOnly: boolean; favoritesOnly: boolean }): Promise<HistoryPage>;
+  setRecordPinned(recordId: string, pinned: boolean): Promise<SessionRecord>;
+  setRecordFavorite(recordId: string, favorite: boolean): Promise<SessionRecord>;
+  updateRecordContent(recordId: string, text: string): Promise<SessionRecord>;
+  createTextRecord(text: string, note: string | null, groupId: string | null): Promise<SessionRecord>;
   getRecordImagePreview(recordId: string): Promise<ImagePreview>;
   hideQuickPanel(): Promise<void>; updateRecordNote(recordId: string, note: string): Promise<SessionRecord>;
   deleteSessionRecord(recordId: string): Promise<void>; undoDeleteSessionRecord(recordId: string): Promise<SessionRecord>;
@@ -92,6 +105,11 @@ const CTRL_SHIFT: ShortcutModifiers = { ctrl: true, alt: false, shift: true, win
 const defaults: SettingsState = { language: "zh_cn", retention: "thirty_days", storageLimit: "oneGb", evictFavoritesWhenFull: false, startAtSignIn: false, startMinimized: false, showTrayIcon: true, accentColor: "blue", soundEnabled: true, captureSound: "default", customSoundAvailable: false, activationShortcut: { modifiers: CTRL_SHIFT, key: "v" }, groupShortcutModifiers: CTRL_ALT, quickPasteEnabled: false, quickPasteModifiers: CTRL_ALT, storageAvailable: false, hotkeyStatus: "unavailable", capturePaused: false, excludedApplications: [] };
 const tauriCommands: AppCommands = {
   listSessionRecords: () => invoke("list_session_records"), pasteSelected: (recordId) => invoke("paste_selected", { recordId }),
+  listHistoryPage: (query) => invoke("list_history_page", { query }),
+  setRecordPinned: (recordId, pinned) => invoke("set_record_pinned", { recordId, pinned }),
+  setRecordFavorite: (recordId, favorite) => invoke("set_record_favorite", { recordId, favorite }),
+  updateRecordContent: (recordId, text) => invoke("update_record_content", { recordId, text }),
+  createTextRecord: (text, note, groupId) => invoke("create_text_record", { text, note, groupId }),
   getRecordImagePreview: (recordId) => invoke("get_record_image_preview", { recordId }),
   hideQuickPanel: () => invoke("hide_quick_panel"), updateRecordNote: (recordId, note) => invoke("update_record_note", { recordId, note }),
   deleteSessionRecord: (recordId) => invoke("delete_session_record", { recordId }),
@@ -173,22 +191,47 @@ function useSettings(commands: AppCommands) {
 
 function QuickPanel({ commands, text, language }: { commands: AppCommands; text: Dictionary; language: Language }) {
   const [records, setRecords] = useState<SessionRecord[]>([]); const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [nextCursor, setNextCursor] = useState<HistoryCursor | null>(null); const [loadingMore, setLoadingMore] = useState(false);
+  const [category, setCategory] = useState<ContentCategory>("all"); const [groupsExpanded, setGroupsExpanded] = useState(true);
   const [groups, setGroups] = useState<ClipboardGroup[]>([]); const [activeGroup, setActiveGroupValue] = useState("all");
   const [editingGroup, setEditingGroup] = useState<"new" | string | null>(null); const [groupName, setGroupName] = useState("");
   const [confirmDeleteGroup, setConfirmDeleteGroup] = useState(false);
   const [query, setQuery] = useState(""); const [status, setStatus] = useState<keyof Pick<Dictionary, "pasteSent" | "copyOnly" | "pasteFailed" | "noteSaveFailed" | "groupSaveFailed" | "deleteFailed"> | null>(null);
   const [deletedId, setDeletedId] = useState<string | null>(null);
+  const [recordDialog, setRecordDialog] = useState<{ mode: "create" | "edit"; recordId: string | null; text: string; note: string; groupId: string } | null>(null);
+  const [recordSaveError, setRecordSaveError] = useState(false); const [recordSaveBusy, setRecordSaveBusy] = useState(false);
   const [announcement, setAnnouncement] = useState("");
   const [historyError, setHistoryError] = useState(false); const [loading, setLoading] = useState(true);
-  const mounted = useRef(true); const generation = useRef(0); const noteRevisions = useRef(new Map<string, number>());
-  const searchRef = useRef<HTMLInputElement>(null); const itemRefs = useRef(new Map<string, HTMLElement>());
+  const mounted = useRef(true); const generation = useRef(0); const loadingMoreRequest = useRef(false); const noteRevisions = useRef(new Map<string, number>());
+  const searchRef = useRef<HTMLInputElement>(null); const itemRefs = useRef(new Map<string, HTMLElement>()); const loadMoreRef = useRef<HTMLDivElement>(null);
+  const historyQuery = useCallback((cursor: HistoryCursor | null) => ({ cursor, limit: 50, contentKind: category === "all" || category === "favorites" ? null : category, groupId: activeGroup !== "all" && activeGroup !== "ungrouped" ? activeGroup : null, ungroupedOnly: activeGroup === "ungrouped", favoritesOnly: category === "favorites" }), [activeGroup, category]);
   const refresh = useCallback(async () => {
     const current = ++generation.current;
-    try { const next = await commands.listSessionRecords(); if (!mounted.current || current !== generation.current) return; setRecords(next); setSelectedId((id) => id && next.some((item) => item.id === id) ? id : (next[0]?.id ?? null)); setHistoryError(false); }
+    try { const page = await commands.listHistoryPage(historyQuery(null)); if (!mounted.current || current !== generation.current) return; setRecords(page.items); setNextCursor(page.nextCursor); setSelectedId((id) => id && page.items.some((item) => item.id === id) ? id : (page.items[0]?.id ?? null)); setHistoryError(false); }
     catch { if (mounted.current && current === generation.current) setHistoryError(true); }
     finally { if (mounted.current && current === generation.current) setLoading(false); }
-  }, [commands]);
+  }, [commands, historyQuery]);
   useEffect(() => { mounted.current = true; void refresh(); let disposed = false; let stop: (() => void) | undefined; void commands.subscribeRecordsChanged(() => void refresh()).then((value) => disposed ? value() : stop = value).catch(() => !disposed && setHistoryError(true)); return () => { disposed = true; mounted.current = false; generation.current += 1; stop?.(); }; }, [commands, refresh]);
+  useEffect(() => {
+    const target = loadMoreRef.current;
+    if (!target || !nextCursor || typeof IntersectionObserver === "undefined") return;
+    const observer = new IntersectionObserver((entries) => {
+      if (!entries.some((entry) => entry.isIntersecting) || loadingMoreRequest.current) return;
+      const current = generation.current;
+      loadingMoreRequest.current = true;
+      setLoadingMore(true);
+      void commands.listHistoryPage(historyQuery(nextCursor)).then((page) => {
+        if (!mounted.current || current !== generation.current) return;
+        setRecords((items) => { const known = new Set(items.map((item) => item.id)); return [...items, ...page.items.filter((item) => !known.has(item.id))]; });
+        setNextCursor(page.nextCursor);
+      }).catch(() => { if (mounted.current && current === generation.current) setHistoryError(true); }).finally(() => {
+        loadingMoreRequest.current = false;
+        if (mounted.current && current === generation.current) setLoadingMore(false);
+      });
+    });
+    observer.observe(target);
+    return () => observer.disconnect();
+  }, [commands, historyQuery, nextCursor]);
   const refreshGroups = useCallback(async () => { try { setGroups(await commands.listClipboardGroups()); } catch { setStatus("groupSaveFailed"); } }, [commands]);
   useEffect(() => { void refreshGroups(); let disposed = false; let stop: (() => void) | undefined; void commands.subscribeGroupsChanged(() => void refreshGroups()).then((value) => disposed ? value() : stop = value).catch(() => !disposed && setStatus("groupSaveFailed")); return () => { disposed = true; stop?.(); }; }, [commands, refreshGroups]);
   useEffect(() => {
@@ -206,15 +249,20 @@ function QuickPanel({ commands, text, language }: { commands: AppCommands; text:
     const locale = language === "zh_cn" ? "zh-CN" : "en-US";
     const value = query.trim().toLocaleLowerCase(locale);
     const groupNames = new Map(groups.map((group) => [group.id, group.name]));
-    return records.filter((item) => {
+    const matches = records.filter((item) => {
       const inActiveGroup = activeGroup === "all" || (activeGroup === "ungrouped" ? item.groupId === null : item.groupId === activeGroup);
-      if (!inActiveGroup || !value) return inActiveGroup;
+      const inCategory = category === "all" || (category === "favorites" ? item.favorite : item.contentKind === category);
+      if (!inActiveGroup || !inCategory || !value) return inActiveGroup && inCategory;
       const url = detectWebUrl(item.text);
       return [item.text, item.note, item.sourceApplication, item.groupId ? groupNames.get(item.groupId) : null, url?.hostname]
         .filter(Boolean)
         .some((field) => field!.toLocaleLowerCase(locale).includes(value));
     });
-  }, [activeGroup, groups, language, query, records]);
+    if (category === "all" && activeGroup === "all" && !value) {
+      return [...matches].sort((left, right) => Number(right.pinned) - Number(left.pinned) || right.capturedAt.localeCompare(left.capturedAt));
+    }
+    return [...matches].sort((left, right) => right.capturedAt.localeCompare(left.capturedAt));
+  }, [activeGroup, category, groups, language, query, records]);
   useEffect(() => { if (!loading) setSelectedId((id) => id && filtered.some((item) => item.id === id) ? id : (filtered[0]?.id ?? null)); }, [filtered, loading]);
   useEffect(() => {
     if (loading) return;
@@ -234,6 +282,23 @@ function QuickPanel({ commands, text, language }: { commands: AppCommands; text:
   const moveGroup = async (direction: -1 | 1) => { if (activeGroup === "all" || activeGroup === "ungrouped") return; try { setGroups(await commands.moveClipboardGroup(activeGroup, direction)); } catch { setStatus("groupSaveFailed"); } };
   const deleteGroup = async () => { if (activeGroup === "all" || activeGroup === "ungrouped") return; try { const removed = activeGroup; await commands.deleteClipboardGroup(removed); setRecords((items) => items.map((item) => item.groupId === removed ? { ...item, groupId: null } : item)); setGroups((items) => items.filter((item) => item.id !== removed)); setActiveGroupValue("ungrouped"); setConfirmDeleteGroup(false); setAnnouncement(text.groupDeleted); } catch { setStatus("groupSaveFailed"); } };
   const deleteRecord = async (id: string) => { setStatus(null); try { await commands.deleteSessionRecord(id); setRecords((items) => items.filter((item) => item.id !== id)); setSelectedId((selected) => selected === id ? null : selected); setDeletedId(id); } catch { setStatus("deleteFailed"); } };
+  const updateRecord = (updated: SessionRecord) => setRecords((items) => items.map((item) => item.id === updated.id ? { ...item, ...updated } : item));
+  const togglePinned = async (record: SessionRecord) => { try { updateRecord(await commands.setRecordPinned(record.id, !record.pinned)); } catch { setRecordSaveError(true); } };
+  const toggleFavorite = async (record: SessionRecord) => { try { updateRecord(await commands.setRecordFavorite(record.id, !record.favorite)); } catch { setRecordSaveError(true); } };
+  const saveRecordDialog = async () => {
+    if (!recordDialog || !recordDialog.text.trim()) return;
+    setRecordSaveBusy(true); setRecordSaveError(false);
+    try {
+      if (recordDialog.mode === "create") {
+        const created = await commands.createTextRecord(recordDialog.text, recordDialog.note.trim() || null, recordDialog.groupId || null);
+        setRecords((items) => [created, ...items.filter((item) => item.id !== created.id)]); setSelectedId(created.id);
+      } else if (recordDialog.recordId) {
+        updateRecord(await commands.updateRecordContent(recordDialog.recordId, recordDialog.text));
+      }
+      setRecordDialog(null);
+    } catch { setRecordSaveError(true); }
+    finally { setRecordSaveBusy(false); }
+  };
   const undoDelete = async () => { if (!deletedId) return; const id = deletedId; try { const restored = await commands.undoDeleteSessionRecord(id); setRecords((items) => items.some((item) => item.id === restored.id) ? items : [...items, restored].sort((a, b) => b.capturedAt.localeCompare(a.capturedAt))); setSelectedId(restored.id); setDeletedId(null); } catch { setDeletedId(null); setStatus("deleteFailed"); } };
   useEffect(() => {
     const focusRecord = (id: string) => window.requestAnimationFrame(() => { const item = itemRefs.current.get(id); item?.focus(); item?.scrollIntoView?.({ block: "nearest" }); });
@@ -279,9 +344,11 @@ function QuickPanel({ commands, text, language }: { commands: AppCommands; text:
         void commands.startWindowDrag().catch(() => undefined);
       }}
     ><GripHorizontal size={18} /></div>
-    <header className="quick-header"><div className="brand-mark"><Clipboard size={17} /></div><div><h1>{text.quickPanel}</h1><p>{text.savedHistory}</p></div><span className="record-count">{records.length}</span></header>
+    <header className="quick-header"><div className="brand-mark"><Clipboard size={17} /></div><div><h1>{text.quickPanel}</h1><p>{text.savedHistory}</p></div><button className="header-action" type="button" aria-label={text.createContent} title={text.createContent} onClick={() => { setRecordSaveError(false); setRecordDialog({ mode: "create", recordId: null, text: "", note: "", groupId: activeGroup !== "all" && activeGroup !== "ungrouped" ? activeGroup : "" }); }}><Plus size={15} /></button><span className="record-count">{records.length}</span></header>
     <label className="search-field"><Search size={16} /><input ref={searchRef} value={query} onChange={(event) => setQuery(event.currentTarget.value)} placeholder={text.searchPlaceholder} aria-label={text.searchAria} /></label>
-    <section className="group-bar" aria-label={text.groups}>
+    <div className="category-tabs" role="tablist" aria-label={text.contentCategories}>{(["all", "text", "rich_text", "image", "files", "favorites"] as ContentCategory[]).map((value) => <button key={value} type="button" role="tab" aria-selected={category === value} className={category === value ? "active" : ""} onClick={() => setCategory(value)}>{text.categoryLabel(value)}</button>)}</div>
+    <div className="group-heading"><button type="button" aria-label={groupsExpanded ? text.collapseGroups : text.expandGroups} title={groupsExpanded ? text.collapseGroups : text.expandGroups} onClick={() => setGroupsExpanded((value) => !value)}>{groupsExpanded ? <ChevronUp size={14} /> : <ChevronDown size={14} />}<span>{text.groups}</span></button>{!groupsExpanded && <span>{activeGroup === "all" ? text.allGroups : activeGroup === "ungrouped" ? text.ungrouped : groups.find((group) => group.id === activeGroup)?.name}</span>}</div>
+    {groupsExpanded && <section className="group-bar" aria-label={text.groups}>
       <button className={activeGroup === "all" ? "active" : ""} type="button" onClick={() => void selectGroup("all")}>{text.allGroups}</button>
       <button className={activeGroup === "ungrouped" ? "active" : ""} type="button" onClick={() => void selectGroup("ungrouped")}>{text.ungrouped}</button>
       {groups.map((group) => <button key={group.id} className={activeGroup === group.id ? "active" : ""} type="button" onClick={() => void selectGroup(group.id)} onDoubleClick={() => { setEditingGroup(group.id); setGroupName(group.name); }}>{group.name}</button>)}
@@ -290,10 +357,11 @@ function QuickPanel({ commands, text, language }: { commands: AppCommands; text:
       {activeGroup !== "all" && activeGroup !== "ungrouped" && <button className="group-icon-button" type="button" aria-label={text.moveGroupLeft} title={text.moveGroupLeft} disabled={groups.findIndex((item) => item.id === activeGroup) <= 0} onClick={() => void moveGroup(-1)}><ChevronLeft size={14} /></button>}
       {activeGroup !== "all" && activeGroup !== "ungrouped" && <button className="group-icon-button" type="button" aria-label={text.moveGroupRight} title={text.moveGroupRight} disabled={groups.findIndex((item) => item.id === activeGroup) === groups.length - 1} onClick={() => void moveGroup(1)}><ChevronRight size={14} /></button>}
       {activeGroup !== "all" && activeGroup !== "ungrouped" && <button className="group-icon-button group-delete-button" type="button" aria-label={text.deleteGroup} title={text.deleteGroup} onClick={() => setConfirmDeleteGroup(true)}><Trash2 size={13} /></button>}
-    </section>
+    </section>}
     {editingGroup && <form className="group-editor" onSubmit={(event) => { event.preventDefault(); void saveGroup(); }}><input autoFocus value={groupName} maxLength={30} onChange={(event) => setGroupName(event.currentTarget.value)} placeholder={text.groupName} aria-label={text.groupName} onKeyDown={(event) => { if (event.key === "Escape") { event.stopPropagation(); setEditingGroup(null); } }} /><button type="submit">{text.save}</button><button type="button" onClick={() => setEditingGroup(null)}>{text.cancel}</button></form>}
     {confirmDeleteGroup && <div className="group-delete-confirm" role="alertdialog" aria-labelledby="group-delete-title" aria-describedby="group-delete-detail"><div><strong id="group-delete-title">{text.deleteGroupConfirm}</strong><span id="group-delete-detail">{text.deleteGroupDetail}</span></div><button type="button" className="danger" onClick={() => void deleteGroup()}>{text.deleteGroup}</button><button type="button" onClick={() => setConfirmDeleteGroup(false)}>{text.cancel}</button></div>}
-    <section className="record-list" role="listbox" aria-label={text.savedHistory} aria-activedescendant={selectedId ? `clipboard-record-${selectedId}` : undefined}>{!loading && filtered.length === 0 ? <div className="empty-state"><div className="empty-icon"><Sparkles size={22} /></div><h2>{records.length === 0 ? text.emptyHistory : text.noMatches}</h2><p>{records.length === 0 ? text.emptyHistoryDetail : text.noMatchesDetail}</p></div> : filtered.map((record, index) => <ClipboardItem key={record.id} record={record} index={index} selected={record.id === selectedId} groups={groups} itemRef={(node) => { if (node) itemRefs.current.set(record.id, node); else itemRefs.current.delete(record.id); }} onSelect={() => setSelectedId(record.id)} onPaste={() => void paste(record.id)} onDelete={() => void deleteRecord(record.id)} onSaveNote={(note) => saveNote(record.id, note)} onChangeGroup={(groupId) => changeRecordGroup(record.id, groupId)} loadImagePreview={() => commands.getRecordImagePreview(record.id)} text={text} language={language} />)}</section>
+    <section className="record-list" role="listbox" aria-label={text.savedHistory} aria-activedescendant={selectedId ? `clipboard-record-${selectedId}` : undefined}>{!loading && filtered.length === 0 ? <div className="empty-state"><div className="empty-icon"><Sparkles size={22} /></div><h2>{records.length === 0 ? text.emptyHistory : text.noMatches}</h2><p>{records.length === 0 ? text.emptyHistoryDetail : text.noMatchesDetail}</p></div> : filtered.map((record, index) => <ClipboardItem key={record.id} record={record} index={index} selected={record.id === selectedId} groups={groups} itemRef={(node) => { if (node) itemRefs.current.set(record.id, node); else itemRefs.current.delete(record.id); }} onSelect={() => setSelectedId(record.id)} onPaste={() => void paste(record.id)} onDelete={() => void deleteRecord(record.id)} onTogglePinned={() => void togglePinned(record)} onToggleFavorite={() => void toggleFavorite(record)} onEdit={() => { setRecordSaveError(false); setRecordDialog({ mode: "edit", recordId: record.id, text: record.text ?? "", note: record.note ?? "", groupId: record.groupId ?? "" }); }} onSaveNote={(note) => saveNote(record.id, note)} onChangeGroup={(groupId) => changeRecordGroup(record.id, groupId)} loadImagePreview={() => commands.getRecordImagePreview(record.id)} text={text} language={language} />)}{nextCursor && <div ref={loadMoreRef} className="load-more-sentinel" role="status">{loadingMore ? text.loadingMore : text.moreHistory}</div>}</section>
+    {recordDialog && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !recordSaveBusy) setRecordDialog(null); }}><form className="record-dialog" role="dialog" aria-modal="true" aria-labelledby="record-dialog-title" onSubmit={(event) => { event.preventDefault(); void saveRecordDialog(); }}><div className="record-dialog-heading"><strong id="record-dialog-title">{recordDialog.mode === "create" ? text.createContent : text.editContent}</strong><button type="button" aria-label={text.cancel} title={text.cancel} onClick={() => setRecordDialog(null)}><X size={15} /></button></div><label><span>{text.content}</span><textarea autoFocus value={recordDialog.text} aria-label={text.content} onChange={(event) => setRecordDialog({ ...recordDialog, text: event.currentTarget.value })} /></label>{recordDialog.mode === "create" && <><label><span>{text.note}</span><input value={recordDialog.note} maxLength={200} aria-label={text.note} onChange={(event) => setRecordDialog({ ...recordDialog, note: event.currentTarget.value })} /></label><label><span>{text.groups}</span><select value={recordDialog.groupId} onChange={(event) => setRecordDialog({ ...recordDialog, groupId: event.currentTarget.value })}><option value="">{text.ungrouped}</option>{groups.map((group) => <option key={group.id} value={group.id}>{group.name}</option>)}</select></label></>}{recordSaveError && <p className="dialog-error" role="alert">{text.recordSaveFailed}</p>}<div className="record-dialog-actions"><button type="button" onClick={() => setRecordDialog(null)}>{text.cancel}</button><button className="primary" type="submit" disabled={recordSaveBusy || !recordDialog.text.trim()}>{recordDialog.mode === "create" ? text.create : text.save}</button></div></form></div>}
     <div className="sr-only" role="status" aria-live="polite" aria-atomic="true">{announcement}</div>
     {deletedId && <div className="undo-outcome" role="status"><span>{text.recordDeleted}</span><button type="button" onClick={() => void undoDelete()}>{text.undo}</button></div>}
     {(status || historyError) && <div className={`outcome${isError ? " error" : ""}`} role={isError ? "alert" : "status"}>{historyError ? text.historyUnavailable : status ? text[status] : null}</div>}
@@ -301,7 +369,7 @@ function QuickPanel({ commands, text, language }: { commands: AppCommands; text:
   </main>;
 }
 
-function ClipboardItem({ record, index, selected, groups, itemRef, onSelect, onPaste, onDelete, onSaveNote, onChangeGroup, loadImagePreview, text, language }: { record: SessionRecord; index: number; selected: boolean; groups: ClipboardGroup[]; itemRef(node: HTMLElement | null): void; onSelect(): void; onPaste(): void; onDelete(): void; onSaveNote(note: string): Promise<boolean>; onChangeGroup(groupId: string): Promise<void>; loadImagePreview(): Promise<ImagePreview>; text: Dictionary; language: Language }) {
+function ClipboardItem({ record, index, selected, groups, itemRef, onSelect, onPaste, onDelete, onTogglePinned, onToggleFavorite, onEdit, onSaveNote, onChangeGroup, loadImagePreview, text, language }: { record: SessionRecord; index: number; selected: boolean; groups: ClipboardGroup[]; itemRef(node: HTMLElement | null): void; onSelect(): void; onPaste(): void; onDelete(): void; onTogglePinned(): void; onToggleFavorite(): void; onEdit(): void; onSaveNote(note: string): Promise<boolean>; onChangeGroup(groupId: string): Promise<void>; loadImagePreview(): Promise<ImagePreview>; text: Dictionary; language: Language }) {
   const [note, setNote] = useState(record.note ?? ""); const skipBlur = useRef(false); const noteRef = useRef(note); const dirty = useRef(false);
   const [imagePreview, setImagePreview] = useState<ImagePreview | null>(null);
   const [imagePreviewFailed, setImagePreviewFailed] = useState(false);
@@ -317,7 +385,8 @@ function ClipboardItem({ record, index, selected, groups, itemRef, onSelect, onP
   const save = async (value: string) => { const saved = await onSaveNote(value); if (saved && noteRef.current === value) dirty.current = false; };
   const description = record.text ?? (record.hasImage ? text.imageItem : text.clipboardItem);
   const webUrl = detectWebUrl(record.text);
-  return <article ref={itemRef} id={`clipboard-record-${record.id}`} className={`clipboard-item${selected ? " selected" : ""}`} role="option" tabIndex={0} aria-selected={selected} onClick={onSelect} onDoubleClick={onPaste} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); onPaste(); } }}><div className="item-index">{index + 1}</div><div className="item-content"><div className="item-meta"><span>{record.sourceApplication ?? text.unknownApp}</span>{webUrl && <span className="content-type" aria-label={`${text.webLink}: ${webUrl.hostname}`}><Link2 size={11} aria-hidden="true" />{webUrl.hostname}</span>}<time>{formatTime(record.capturedAt, language, text.now)}</time>{record.hasImage && <Image size={13} aria-label={text.containsImage} />}<button className="record-delete" type="button" aria-label={text.deleteRecord} title={text.deleteRecord} onClick={(event) => { event.stopPropagation(); onDelete(); }} onDoubleClick={(event) => event.stopPropagation()}><Trash2 size={13} /></button></div>{record.hasImage && <div className={`image-preview${imagePreviewFailed ? " failed" : ""}`} aria-label={imagePreview ? text.imagePreview : imagePreviewFailed ? text.imagePreviewUnavailable : text.imagePreviewLoading}>{imagePreview ? <img src={imagePreview.dataUrl} width={imagePreview.width} height={imagePreview.height} alt={text.imagePreview} /> : <Image size={22} aria-hidden="true" />}</div>}<p className={`item-text${webUrl ? " web-url" : ""}`}>{description}</p><div className="item-editors"><input className="note-input" value={note} placeholder={text.addNote} aria-label={text.noteFor(description)} onClick={(event) => event.stopPropagation()} onDoubleClick={(event) => event.stopPropagation()} onChange={(event) => update(event.currentTarget.value)} onKeyDown={(event) => { event.stopPropagation(); if (event.key === "Enter") { event.preventDefault(); skipBlur.current = true; void save(note); event.currentTarget.blur(); } if (event.key === "Escape") { skipBlur.current = true; update(record.note ?? ""); event.currentTarget.blur(); } }} onBlur={() => { if (skipBlur.current) { skipBlur.current = false; return; } if (note !== (record.note ?? "")) void save(note); }} /><select className="group-select" value={record.groupId ?? ""} aria-label={text.groupFor(description)} onClick={(event) => event.stopPropagation()} onDoubleClick={(event) => event.stopPropagation()} onKeyDown={(event) => event.stopPropagation()} onChange={(event) => void onChangeGroup(event.currentTarget.value)}><option value="">{text.ungrouped}</option>{groups.map((group) => <option key={group.id} value={group.id}>{group.name}</option>)}</select></div></div></article>;
+  const action = (callback: () => void) => (event: React.MouseEvent<HTMLButtonElement>) => { event.stopPropagation(); callback(); };
+  return <article ref={itemRef} id={`clipboard-record-${record.id}`} className={`clipboard-item${selected ? " selected" : ""}${record.pinned ? " pinned" : ""}`} role="option" tabIndex={0} aria-selected={selected} onClick={onSelect} onDoubleClick={onPaste} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); onPaste(); } }}><div className="item-index">{index + 1}</div><div className="item-content"><div className="item-meta"><span>{record.sourceApplication ?? text.unknownApp}</span>{webUrl && <span className="content-type" aria-label={`${text.webLink}: ${webUrl.hostname}`}><Link2 size={11} aria-hidden="true" />{webUrl.hostname}</span>}<time>{formatTime(record.capturedAt, language, text.now)}</time>{record.hasImage && <Image size={13} aria-label={text.containsImage} />}<div className="record-actions"><button className={record.pinned ? "active" : ""} type="button" aria-label={record.pinned ? text.unpinRecord : text.pinRecord} title={record.pinned ? text.unpinRecord : text.pinRecord} onClick={action(onTogglePinned)} onDoubleClick={(event) => event.stopPropagation()}><Pin size={12} /></button><button className={record.favorite ? "active favorite" : ""} type="button" aria-label={record.favorite ? text.unfavoriteRecord : text.favoriteRecord} title={record.favorite ? text.unfavoriteRecord : text.favoriteRecord} onClick={action(onToggleFavorite)} onDoubleClick={(event) => event.stopPropagation()}><Heart size={12} fill={record.favorite ? "currentColor" : "none"} /></button>{record.contentKind === "text" && <button type="button" aria-label={text.editRecord} title={text.editRecord} onClick={action(onEdit)} onDoubleClick={(event) => event.stopPropagation()}><Pencil size={12} /></button>}<button className="danger" type="button" aria-label={text.deleteRecord} title={text.deleteRecord} onClick={action(onDelete)} onDoubleClick={(event) => event.stopPropagation()}><Trash2 size={12} /></button></div></div>{record.hasImage && <div className={`image-preview${imagePreviewFailed ? " failed" : ""}`} aria-label={imagePreview ? text.imagePreview : imagePreviewFailed ? text.imagePreviewUnavailable : text.imagePreviewLoading}>{imagePreview ? <img src={imagePreview.dataUrl} width={imagePreview.width} height={imagePreview.height} alt={text.imagePreview} /> : <Image size={22} aria-hidden="true" />}</div>}<p className={`item-text${webUrl ? " web-url" : ""}`}>{description}</p><div className="item-editors"><input className="note-input" value={note} placeholder={text.addNote} aria-label={text.noteFor(description)} onClick={(event) => event.stopPropagation()} onDoubleClick={(event) => event.stopPropagation()} onChange={(event) => update(event.currentTarget.value)} onKeyDown={(event) => { event.stopPropagation(); if (event.key === "Enter") { event.preventDefault(); skipBlur.current = true; void save(note); event.currentTarget.blur(); } if (event.key === "Escape") { skipBlur.current = true; update(record.note ?? ""); event.currentTarget.blur(); } }} onBlur={() => { if (skipBlur.current) { skipBlur.current = false; return; } if (note !== (record.note ?? "")) void save(note); }} /><select className="group-select" value={record.groupId ?? ""} aria-label={text.groupFor(description)} onClick={(event) => event.stopPropagation()} onDoubleClick={(event) => event.stopPropagation()} onKeyDown={(event) => event.stopPropagation()} onChange={(event) => void onChangeGroup(event.currentTarget.value)}><option value="">{text.ungrouped}</option>{groups.map((group) => <option key={group.id} value={group.id}>{group.name}</option>)}</select></div></div></article>;
 }
 
 function SettingsShell({ commands, settings, setSettings, text }: { commands: AppCommands; settings: SettingsState; setSettings(value: SettingsState): void; text: Dictionary }) {
