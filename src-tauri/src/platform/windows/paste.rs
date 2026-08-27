@@ -38,7 +38,8 @@ use windows::Win32::{
         Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent},
         Input::KeyboardAndMouse::{
             GetAsyncKeyState, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP,
-            SendInput, SetFocus, VIRTUAL_KEY, VK_CONTROL, VK_V,
+            SendInput, SetFocus, VIRTUAL_KEY, VK_CONTROL, VK_LBUTTON, VK_MBUTTON, VK_RBUTTON, VK_V,
+            VK_XBUTTON1, VK_XBUTTON2,
         },
         WindowsAndMessaging::{
             CHILDID_SELF, DispatchMessageW, EVENT_OBJECT_DESTROY, GA_ROOT, GCW_ATOM, GUITHREADINFO,
@@ -79,6 +80,7 @@ pub enum WindowsPasteError {
     ForegroundRejected,
     FocusRestore,
     PhysicalPasteKeyDown,
+    PhysicalPointerDown,
     ForegroundChanged,
     InputDispatch,
     InputCleanup,
@@ -100,6 +102,7 @@ impl fmt::Display for WindowsPasteError {
             Self::ForegroundRejected => "Windows rejected foreground restoration",
             Self::FocusRestore => "the focused control could not be restored",
             Self::PhysicalPasteKeyDown => "a physical paste key is already held down",
+            Self::PhysicalPointerDown => "a physical pointer button is still held down",
             Self::ForegroundChanged => "the foreground window changed during paste dispatch",
             Self::InputDispatch => "the paste shortcut could not be dispatched completely",
             Self::InputCleanup => "paste shortcut cleanup could not release injected keys",
@@ -1318,6 +1321,8 @@ trait InputApi {
     fn target_valid(&self, target: &TargetSnapshot<Self::Window>) -> bool;
     fn focused_window(&self, thread_id: u32) -> Option<Self::Window>;
     fn key_down(&self, key: PasteKey) -> bool;
+    fn pointer_down(&self) -> bool;
+    fn wait(&self, duration: Duration);
     fn send(&self, key: PasteKey, key_up: bool) -> bool;
 }
 
@@ -1326,12 +1331,7 @@ fn send_ctrl_v<A: InputApi>(
     target: &TargetSnapshot<A::Window>,
 ) -> Result<(), WindowsPasteError> {
     let expected = target.window;
-    if !target_matches(api, target, expected) {
-        return Err(WindowsPasteError::ForegroundChanged);
-    }
-    if api.key_down(PasteKey::Control) || api.key_down(PasteKey::V) {
-        return Err(WindowsPasteError::PhysicalPasteKeyDown);
-    }
+    wait_for_input_ready(api, target, expected)?;
     let mut pressed = Vec::with_capacity(2);
     for key in [PasteKey::Control, PasteKey::V] {
         if !target_matches(api, target, expected) {
@@ -1358,6 +1358,34 @@ fn send_ctrl_v<A: InputApi>(
         }
     }
     Ok(())
+}
+
+fn wait_for_input_ready<A: InputApi>(
+    api: &A,
+    target: &TargetSnapshot<A::Window>,
+    expected: A::Window,
+) -> Result<(), WindowsPasteError> {
+    const ATTEMPTS: usize = 51;
+    const RETRY_DELAY: Duration = Duration::from_millis(5);
+    let mut paste_key_down = false;
+    let mut pointer_down = false;
+    for attempt in 0..ATTEMPTS {
+        paste_key_down = api.key_down(PasteKey::Control) || api.key_down(PasteKey::V);
+        pointer_down = api.pointer_down();
+        if !paste_key_down && !pointer_down && target_matches(api, target, expected) {
+            return Ok(());
+        }
+        if attempt + 1 < ATTEMPTS {
+            api.wait(RETRY_DELAY);
+        }
+    }
+    if paste_key_down {
+        Err(WindowsPasteError::PhysicalPasteKeyDown)
+    } else if pointer_down {
+        Err(WindowsPasteError::PhysicalPointerDown)
+    } else {
+        Err(WindowsPasteError::ForegroundChanged)
+    }
 }
 
 fn target_matches<A: InputApi>(
@@ -1403,6 +1431,16 @@ impl InputApi for Win32InputApi {
 
     fn key_down(&self, key: PasteKey) -> bool {
         (unsafe { GetAsyncKeyState(virtual_key(key).0.into()) }) < 0
+    }
+
+    fn pointer_down(&self) -> bool {
+        [VK_LBUTTON, VK_RBUTTON, VK_MBUTTON, VK_XBUTTON1, VK_XBUTTON2]
+            .into_iter()
+            .any(|key| (unsafe { GetAsyncKeyState(key.0.into()) }) < 0)
+    }
+
+    fn wait(&self, duration: Duration) {
+        thread::sleep(duration);
     }
 
     fn target_valid(&self, target: &TargetSnapshot<Self::Window>) -> bool {
@@ -1985,6 +2023,34 @@ mod tests {
     }
 
     #[test]
+    fn double_click_waits_for_pointer_release_before_injection() {
+        let api = FakeInputApi::new([true, true, true, true]);
+        *api.pointer_held.lock().unwrap() = VecDeque::from([true, true, false]);
+
+        send_ctrl_v(&api, &fake_target()).unwrap();
+
+        assert_eq!(
+            *api.events.lock().unwrap(),
+            [
+                (PasteKey::Control, false),
+                (PasteKey::V, false),
+                (PasteKey::V, true),
+                (PasteKey::Control, true),
+            ]
+        );
+    }
+
+    #[test]
+    fn restored_target_may_settle_before_injection() {
+        let api = FakeInputApi::new([true, true, true, true]);
+        *api.foregrounds.lock().unwrap() = VecDeque::from([8, 7]);
+
+        send_ctrl_v(&api, &fake_target()).unwrap();
+
+        assert_eq!(api.events.lock().unwrap().len(), 4);
+    }
+
+    #[test]
     fn foreground_change_stops_new_key_down_and_releases_owned_key() {
         let api = FakeInputApi::new([true, true]);
         *api.foregrounds.lock().unwrap() = VecDeque::from([7, 7, 8]);
@@ -2188,6 +2254,7 @@ mod tests {
     struct FakeInputApi {
         foregrounds: Mutex<VecDeque<i32>>,
         held: Mutex<[bool; 2]>,
+        pointer_held: Mutex<VecDeque<bool>>,
         results: Mutex<VecDeque<bool>>,
         validity: Mutex<VecDeque<bool>>,
         focuses: Mutex<VecDeque<Option<i32>>>,
@@ -2200,6 +2267,7 @@ mod tests {
             Self {
                 foregrounds: Mutex::new(VecDeque::from([7])),
                 held: Mutex::new([false, false]),
+                pointer_held: Mutex::new(VecDeque::from([false])),
                 results: Mutex::new(results.into_iter().collect()),
                 validity: Mutex::new(VecDeque::from([true])),
                 focuses: Mutex::new(VecDeque::from([Some(8)])),
@@ -2227,6 +2295,17 @@ mod tests {
                 PasteKey::V => 1,
             }]
         }
+
+        fn pointer_down(&self) -> bool {
+            let mut values = self.pointer_held.lock().unwrap();
+            if values.len() > 1 {
+                values.pop_front().unwrap()
+            } else {
+                *values.front().unwrap()
+            }
+        }
+
+        fn wait(&self, _duration: Duration) {}
 
         fn target_valid(&self, _target: &TargetSnapshot<Self::Window>) -> bool {
             let mut values = self.validity.lock().unwrap();

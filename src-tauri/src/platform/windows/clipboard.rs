@@ -497,6 +497,9 @@ fn write_representations(
             .expect("a successful write changed the clipboard")
     });
     let close = clipboard.close();
+    if !owned_sequences.is_empty() {
+        ownership.observe_owned_sequence(&mut owned_sequences);
+    }
     let result = match (operation, close) {
         (Ok(sequence), Ok(())) => Ok(sequence),
         (Err(operation), Ok(())) => Err(operation),
@@ -1438,6 +1441,23 @@ impl ProductWriteGuard {
             owned_sequences.push(sequence);
         }
         Ok(())
+    }
+
+    fn observe_owned_sequence(&mut self, sequences: &mut Vec<u32>) {
+        record_owned_sequence(sequences);
+        if let Some(sequence) = sequences.last().copied() {
+            let mut state = lock_unpoisoned(&self.state);
+            if let ProductWriteState::Armed {
+                transaction_id,
+                owned_sequences,
+                ..
+            } = &mut *state
+                && *transaction_id == self.transaction_id
+                && !owned_sequences.contains(&sequence)
+            {
+                owned_sequences.push(sequence);
+            }
+        }
     }
 
     pub fn finish(mut self, owned_sequences: &[u32]) {
@@ -2952,6 +2972,21 @@ mod tests {
         assert!(receiver.try_recv().is_err());
         route_event(&state, &events, event(52));
         assert_eq!(receiver.recv().unwrap().sequence_number, 52);
+    }
+
+    #[test]
+    fn final_sequence_observed_after_close_is_suppressed() {
+        let (events, receiver) = mpsc::channel();
+        let state = Arc::new(Mutex::new(ProductWriteState::armed(50)));
+        let mut guard = product_write_guard(Arc::clone(&state), events.clone());
+        let mut sequences = vec![51];
+
+        guard.note_owned_sequences(&[52]);
+        sequences.push(52);
+        guard.finish(&sequences);
+        route_event(&state, &events, event(52));
+
+        assert!(receiver.try_recv().is_err());
     }
 
     #[test]
