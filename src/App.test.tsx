@@ -22,6 +22,8 @@ function commands(records = [record]): AppCommands {
   let settings: SettingsState = {
     language: "zh_cn",
     retention: "thirty_days",
+    storageLimit: "oneGb",
+    evictFavoritesWhenFull: false,
     startAtSignIn: false,
     startMinimized: false,
     showTrayIcon: true,
@@ -73,6 +75,10 @@ function commands(records = [record]): AppCommands {
     }),
     updateRetention: vi.fn().mockImplementation(async (retention) => {
       settings = { ...settings, retention };
+      return settings;
+    }),
+    updateStoragePolicy: vi.fn().mockImplementation(async (storageLimit, evictFavoritesWhenFull) => {
+      settings = { ...settings, storageLimit, evictFavoritesWhenFull };
       return settings;
     }),
     updateStartAtSignIn: vi.fn().mockImplementation(async (startAtSignIn) => {
@@ -612,6 +618,35 @@ describe("window routing", () => {
     expect(await screen.findByRole("option", { name: "Forever (no time limit; local capacity limits still apply)" })).toBeInTheDocument();
   });
 
+  it("updates storage quota and favorite eviction in both languages", async () => {
+    const api = commands([]);
+    const user = userEvent.setup();
+    render(<ClipboardAssistantApp windowLabel="settings" commands={api} />);
+
+    await user.selectOptions(await screen.findByLabelText("存储空间上限"), "fiveGb");
+    expect(api.updateStoragePolicy).toHaveBeenCalledWith("fiveGb", false);
+    await user.click(screen.getByRole("checkbox", { name: "空间不足时允许淘汰收藏" }));
+    expect(api.updateStoragePolicy).toHaveBeenLastCalledWith("fiveGb", true);
+
+    await user.selectOptions(screen.getByLabelText("语言"), "en");
+    expect(await screen.findByLabelText("Storage limit")).toHaveValue("fiveGb");
+    expect(screen.getByRole("checkbox", { name: "Allow favorite eviction when full" })).toBeChecked();
+    expect(screen.getByRole("option", { name: "Unlimited" })).toBeInTheDocument();
+  });
+
+  it("keeps the persisted storage policy visible when an update fails", async () => {
+    const api = commands([]);
+    vi.mocked(api.updateStoragePolicy).mockRejectedValueOnce(new Error("storage unavailable"));
+    const user = userEvent.setup();
+    render(<ClipboardAssistantApp windowLabel="settings" commands={api} />);
+
+    const storageLimit = await screen.findByLabelText("存储空间上限");
+    await user.selectOptions(storageLimit, "fiveGb");
+
+    await waitFor(() => expect(storageLimit).toHaveValue("oneGb"));
+    expect(screen.getAllByText("存储策略保存失败，设置未更改")).toHaveLength(2);
+  });
+
   it("synchronizes a language change event into the quick panel", async () => {
     const api = commands([]);
     let update: ((settings: SettingsState) => void) | undefined;
@@ -623,7 +658,7 @@ describe("window routing", () => {
     expect(await screen.findByLabelText("快速剪贴板")).toBeInTheDocument();
     expect(document.documentElement.lang).toBe("zh-CN");
 
-    update!({ language: "en", retention: "thirty_days", startAtSignIn: false, startMinimized: false, showTrayIcon: true, accentColor: "rose", soundEnabled: true, captureSound: "default", customSoundAvailable: false, activationShortcut: { modifiers: { ctrl: true, alt: false, shift: true, win: false }, key: "v" }, groupShortcutModifiers: { ctrl: true, alt: true, shift: false, win: false }, quickPasteEnabled: false, quickPasteModifiers: { ctrl: true, alt: true, shift: false, win: false }, storageAvailable: true, hotkeyStatus: "available", capturePaused: false, excludedApplications: [] });
+    update!({ language: "en", retention: "thirty_days", storageLimit: "oneGb", evictFavoritesWhenFull: false, startAtSignIn: false, startMinimized: false, showTrayIcon: true, accentColor: "rose", soundEnabled: true, captureSound: "default", customSoundAvailable: false, activationShortcut: { modifiers: { ctrl: true, alt: false, shift: true, win: false }, key: "v" }, groupShortcutModifiers: { ctrl: true, alt: true, shift: false, win: false }, quickPasteEnabled: false, quickPasteModifiers: { ctrl: true, alt: true, shift: false, win: false }, storageAvailable: true, hotkeyStatus: "available", capturePaused: false, excludedApplications: [] });
 
     expect(await screen.findByLabelText("Quick clipboard")).toBeInTheDocument();
     await waitFor(() => expect(document.documentElement.lang).toBe("en"));

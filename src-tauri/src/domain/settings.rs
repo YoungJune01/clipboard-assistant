@@ -20,11 +20,14 @@ pub enum RetentionPeriod {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "camelCase")]
 pub enum StorageLimit {
     #[default]
+    #[serde(alias = "one_gb")]
     OneGb,
+    #[serde(alias = "five_gb")]
     FiveGb,
+    #[serde(alias = "ten_gb")]
     TenGb,
     Unlimited,
 }
@@ -328,6 +331,18 @@ mod tests {
 
         assert_eq!(settings.storage_limit, StorageLimit::OneGb);
         assert!(!settings.evict_favorites_when_full);
+    }
+
+    #[test]
+    fn storage_limit_accepts_legacy_snake_case_and_emits_camel_case() {
+        assert_eq!(
+            serde_json::from_str::<StorageLimit>(r#""five_gb""#).unwrap(),
+            StorageLimit::FiveGb
+        );
+        assert_eq!(
+            serde_json::to_string(&StorageLimit::FiveGb).unwrap(),
+            r#""fiveGb""#
+        );
     }
 
     #[test]

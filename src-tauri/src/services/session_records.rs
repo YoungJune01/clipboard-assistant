@@ -1049,6 +1049,10 @@ impl SessionRecordStore {
         }
     }
 
+    pub(crate) fn refresh_after_storage_maintenance_coordinated(&self) {
+        self.refresh_after_committed_mutation();
+    }
+
     fn load_window(
         &self,
         base_query: HistoryQuery,

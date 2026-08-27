@@ -250,6 +250,11 @@ enum PersistenceCommand {
     DeleteRecord(RecordId, mpsc::SyncSender<Result<(), PersistenceError>>),
     ClearRecords(mpsc::SyncSender<Result<usize, PersistenceError>>),
     SaveSettings(UserSettings, mpsc::SyncSender<Result<(), PersistenceError>>),
+    UpdateStoragePolicy(
+        StorageLimit,
+        bool,
+        mpsc::SyncSender<Result<usize, PersistenceError>>,
+    ),
     SaveExcludedApplications(Vec<String>, mpsc::SyncSender<Result<(), PersistenceError>>),
     Prune(
         RetentionPeriod,
@@ -288,6 +293,11 @@ trait PersistenceBackend: Send + Sync {
     fn delete_record(&self, id: RecordId) -> Result<(), PersistenceError>;
     fn clear_records(&self) -> Result<usize, PersistenceError>;
     fn persist_settings(&self, settings: UserSettings) -> Result<(), PersistenceError>;
+    fn update_storage_policy(
+        &self,
+        storage_limit: StorageLimit,
+        evict_favorites_when_full: bool,
+    ) -> Result<usize, PersistenceError>;
     fn persist_excluded_applications(
         &self,
         applications: &[String],
@@ -369,6 +379,23 @@ impl PersistenceWorker {
     pub fn save_settings(&self, settings: UserSettings) -> Result<(), PersistenceError> {
         let (reply, response) = mpsc::sync_channel(1);
         self.enqueue(PersistenceCommand::SaveSettings(settings, reply))?;
+        let result = response
+            .recv_timeout(self.response_timeout)
+            .map_err(|_| self.degrade())?;
+        result.map_err(|error| self.degrade_with(error))
+    }
+
+    pub fn update_storage_policy(
+        &self,
+        storage_limit: StorageLimit,
+        evict_favorites_when_full: bool,
+    ) -> Result<usize, PersistenceError> {
+        let (reply, response) = mpsc::sync_channel(1);
+        self.enqueue(PersistenceCommand::UpdateStoragePolicy(
+            storage_limit,
+            evict_favorites_when_full,
+            reply,
+        ))?;
         let result = response
             .recv_timeout(self.response_timeout)
             .map_err(|_| self.degrade())?;
@@ -633,6 +660,20 @@ fn run_persistence_worker(
                     repository_healthy = false;
                 }
             }
+            PersistenceCommand::UpdateStoragePolicy(
+                storage_limit,
+                evict_favorites_when_full,
+                reply,
+            ) => {
+                let result =
+                    repository.update_storage_policy(storage_limit, evict_favorites_when_full);
+                let failed = result.is_err();
+                let _ = reply.send(result);
+                if failed {
+                    storage_available.store(false, Ordering::Release);
+                    repository_healthy = false;
+                }
+            }
             PersistenceCommand::SaveExcludedApplications(applications, reply) => {
                 let result = repository.persist_excluded_applications(&applications);
                 let failed = result.is_err();
@@ -675,6 +716,9 @@ fn reply_unavailable(command: PersistenceCommand) {
         | PersistenceCommand::DeleteRecord(_, reply)
         | PersistenceCommand::SaveSettings(_, reply)
         | PersistenceCommand::SaveExcludedApplications(_, reply) => {
+            let _ = reply.send(Err(PersistenceError::WorkerUnavailable));
+        }
+        PersistenceCommand::UpdateStoragePolicy(_, _, reply) => {
             let _ = reply.send(Err(PersistenceError::WorkerUnavailable));
         }
         PersistenceCommand::ClearRecords(reply) => {
@@ -1071,6 +1115,32 @@ impl SqliteRepository {
         Ok(())
     }
 
+    pub fn update_storage_policy(
+        &self,
+        storage_limit: StorageLimit,
+        evict_favorites_when_full: bool,
+    ) -> Result<usize, PersistenceError> {
+        let _migration_guard = self
+            .migration_locks
+            .acquire(&self.path, MIGRATION_LOCK_TIMEOUT)?;
+        let mut connection = lock_unpoisoned(&self.connection);
+        let transaction = connection.transaction()?;
+        save_setting(
+            &transaction,
+            "storage_limit",
+            storage_limit_value(storage_limit),
+        )?;
+        save_setting(
+            &transaction,
+            "evict_favorites_when_full",
+            bool_value(evict_favorites_when_full),
+        )?;
+        let removed = enforce_disk_quota(&transaction, self.quota)?;
+        transaction.commit()?;
+        incremental_vacuum(&connection, self.quota)?;
+        Ok(removed)
+    }
+
     pub fn load_excluded_applications(&self) -> Result<Vec<String>, PersistenceError> {
         load_excluded_applications_from_connection(&lock_unpoisoned(&self.connection))
     }
@@ -1440,6 +1510,14 @@ impl PersistenceBackend for SqliteRepository {
 
     fn persist_settings(&self, settings: UserSettings) -> Result<(), PersistenceError> {
         SqliteRepository::save_settings(self, settings)
+    }
+
+    fn update_storage_policy(
+        &self,
+        storage_limit: StorageLimit,
+        evict_favorites_when_full: bool,
+    ) -> Result<usize, PersistenceError> {
+        SqliteRepository::update_storage_policy(self, storage_limit, evict_favorites_when_full)
     }
 
     fn persist_excluded_applications(
@@ -3272,6 +3350,14 @@ mod tests {
             Ok(())
         }
 
+        fn update_storage_policy(
+            &self,
+            _storage_limit: StorageLimit,
+            _evict_favorites_when_full: bool,
+        ) -> Result<usize, PersistenceError> {
+            Ok(0)
+        }
+
         fn persist_excluded_applications(
             &self,
             _applications: &[String],
@@ -4360,6 +4446,110 @@ mod tests {
         assert_eq!(
             effective_quota_limits(&connection, repository.quota).unwrap(),
             (None, None)
+        );
+    }
+
+    #[test]
+    fn storage_policy_update_persists_and_applies_the_new_quota_atomically() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("history.sqlite3");
+        let quota = DiskQuota {
+            max_records: 2,
+            max_payload_bytes: usize::MAX,
+            incremental_vacuum_pages: 1,
+        };
+        let repository = SqliteRepository::open_with_quota(path.clone(), quota).unwrap();
+        let now = Utc::now();
+        let mut favorite = text_record("favorite", now, "favorite");
+        favorite.favorite = true;
+        repository.save_record(&favorite).unwrap();
+        repository
+            .save_record(&text_record(
+                "ordinary",
+                now + Duration::seconds(1),
+                "ordinary",
+            ))
+            .unwrap();
+        {
+            let mut connection = lock_unpoisoned(&repository.connection);
+            let transaction = connection.transaction().unwrap();
+            write_record(
+                &transaction,
+                &text_record("newest", now + Duration::seconds(2), "newest"),
+            )
+            .unwrap();
+            transaction.commit().unwrap();
+        }
+
+        assert_eq!(
+            repository
+                .update_storage_policy(StorageLimit::FiveGb, false)
+                .unwrap(),
+            1
+        );
+        assert_eq!(repository.load_recent(10).unwrap().len(), 2);
+        assert!(repository.full_record(favorite.id).is_ok());
+        drop(repository);
+
+        let reopened = SqliteRepository::open_with_quota(path, quota).unwrap();
+        let settings = reopened.load_settings().unwrap();
+        assert_eq!(settings.storage_limit, StorageLimit::FiveGb);
+        assert!(!settings.evict_favorites_when_full);
+    }
+
+    #[test]
+    fn storage_policy_can_evict_favorites_only_after_explicit_opt_in() {
+        let directory = tempdir().unwrap();
+        let quota = DiskQuota {
+            max_records: 1,
+            max_payload_bytes: usize::MAX,
+            incremental_vacuum_pages: 1,
+        };
+        let repository =
+            SqliteRepository::open_with_quota(directory.path().join("history.sqlite3"), quota)
+                .unwrap();
+        let now = Utc::now();
+        let mut favorite = text_record("favorite", now, "favorite");
+        favorite.favorite = true;
+        {
+            let mut connection = lock_unpoisoned(&repository.connection);
+            let transaction = connection.transaction().unwrap();
+            write_record(&transaction, &favorite).unwrap();
+            write_record(
+                &transaction,
+                &text_record("newest", now + Duration::seconds(1), "newest"),
+            )
+            .unwrap();
+            transaction.commit().unwrap();
+        }
+
+        assert_eq!(
+            repository
+                .update_storage_policy(StorageLimit::OneGb, false)
+                .unwrap(),
+            1
+        );
+        assert!(repository.full_record(favorite.id).is_ok());
+        {
+            let mut latest = text_record("latest", now + Duration::seconds(2), "latest");
+            latest.favorite = true;
+            let mut connection = lock_unpoisoned(&repository.connection);
+            let transaction = connection.transaction().unwrap();
+            write_record(&transaction, &latest).unwrap();
+            transaction.commit().unwrap();
+        }
+        assert_eq!(
+            repository
+                .update_storage_policy(StorageLimit::OneGb, true)
+                .unwrap(),
+            1
+        );
+        assert!(
+            repository
+                .load_recent(10)
+                .unwrap()
+                .iter()
+                .all(|record| record.id != favorite.id)
         );
     }
 

@@ -39,13 +39,14 @@ const PASTE_HINT_DURATION_MS = import.meta.env.MODE === "test" ? 20 : 1600;
 const ERROR_HINT_DURATION_MS = import.meta.env.MODE === "test" ? 40 : 3200;
 const UNDO_HINT_DURATION_MS = import.meta.env.MODE === "test" ? 500 : 6000;
 export type RetentionPeriod = "one_day" | "seven_days" | "thirty_days" | "ninety_days" | "forever";
+export type StorageLimit = "oneGb" | "fiveGb" | "tenGb" | "unlimited";
 export type HotkeyStatus = "available" | "conflict" | "unavailable";
 export type AccentColor = "blue" | "teal" | "rose" | "violet" | "amber";
 export type CaptureSound = "default" | "custom";
 export type ShortcutKey = "a" | "b" | "c" | "d" | "e" | "f" | "g" | "h" | "i" | "j" | "k" | "l" | "m" | "n" | "o" | "p" | "q" | "r" | "s" | "t" | "u" | "v" | "w" | "x" | "y" | "z" | "digit0" | "digit1" | "digit2" | "digit3" | "digit4" | "digit5" | "digit6" | "digit7" | "digit8" | "digit9" | "f1" | "f2" | "f3" | "f4" | "f5" | "f6" | "f7" | "f8" | "f9" | "f10" | "f11" | "f12" | "left" | "right" | "up" | "down" | "space";
 export interface ShortcutModifiers { ctrl: boolean; alt: boolean; shift: boolean; win: boolean; }
 export interface Shortcut { modifiers: ShortcutModifiers; key: ShortcutKey; }
-export interface SettingsState { language: Language; retention: RetentionPeriod; startAtSignIn: boolean; startMinimized: boolean; showTrayIcon: boolean; accentColor: AccentColor; soundEnabled: boolean; captureSound: CaptureSound; customSoundAvailable: boolean; activationShortcut: Shortcut; groupShortcutModifiers: ShortcutModifiers; quickPasteEnabled: boolean; quickPasteModifiers: ShortcutModifiers; storageAvailable: boolean; hotkeyStatus: HotkeyStatus; capturePaused: boolean; excludedApplications: string[]; }
+export interface SettingsState { language: Language; retention: RetentionPeriod; storageLimit: StorageLimit; evictFavoritesWhenFull: boolean; startAtSignIn: boolean; startMinimized: boolean; showTrayIcon: boolean; accentColor: AccentColor; soundEnabled: boolean; captureSound: CaptureSound; customSoundAvailable: boolean; activationShortcut: Shortcut; groupShortcutModifiers: ShortcutModifiers; quickPasteEnabled: boolean; quickPasteModifiers: ShortcutModifiers; storageAvailable: boolean; hotkeyStatus: HotkeyStatus; capturePaused: boolean; excludedApplications: string[]; }
 export interface ClipboardGroup { id: string; name: string; }
 export interface ActiveGroupState { kind: "all" | "ungrouped" | "group"; groupId: string | null; }
 export interface SessionRecord { id: string; capturedAt: string; sourceApplication: string | null; text: string | null; hasImage: boolean; note: string | null; groupId: string | null; }
@@ -67,6 +68,7 @@ export interface AppCommands {
   updateRecordGroup(recordId: string, groupId: string | null): Promise<SessionRecord>;
   getSettings(): Promise<SettingsState>; updateLanguage(language: Language): Promise<SettingsState>;
   updateRetention(retention: RetentionPeriod): Promise<SettingsState>;
+  updateStoragePolicy(storageLimit: StorageLimit, evictFavoritesWhenFull: boolean): Promise<SettingsState>;
   updateStartAtSignIn(enabled: boolean): Promise<SettingsState>;
   updateStartMinimized(enabled: boolean): Promise<SettingsState>;
   updateShowTrayIcon(enabled: boolean): Promise<SettingsState>;
@@ -87,7 +89,7 @@ export interface AppCommands {
 }
 const CTRL_ALT: ShortcutModifiers = { ctrl: true, alt: true, shift: false, win: false };
 const CTRL_SHIFT: ShortcutModifiers = { ctrl: true, alt: false, shift: true, win: false };
-const defaults: SettingsState = { language: "zh_cn", retention: "thirty_days", startAtSignIn: false, startMinimized: false, showTrayIcon: true, accentColor: "blue", soundEnabled: true, captureSound: "default", customSoundAvailable: false, activationShortcut: { modifiers: CTRL_SHIFT, key: "v" }, groupShortcutModifiers: CTRL_ALT, quickPasteEnabled: false, quickPasteModifiers: CTRL_ALT, storageAvailable: false, hotkeyStatus: "unavailable", capturePaused: false, excludedApplications: [] };
+const defaults: SettingsState = { language: "zh_cn", retention: "thirty_days", storageLimit: "oneGb", evictFavoritesWhenFull: false, startAtSignIn: false, startMinimized: false, showTrayIcon: true, accentColor: "blue", soundEnabled: true, captureSound: "default", customSoundAvailable: false, activationShortcut: { modifiers: CTRL_SHIFT, key: "v" }, groupShortcutModifiers: CTRL_ALT, quickPasteEnabled: false, quickPasteModifiers: CTRL_ALT, storageAvailable: false, hotkeyStatus: "unavailable", capturePaused: false, excludedApplications: [] };
 const tauriCommands: AppCommands = {
   listSessionRecords: () => invoke("list_session_records"), pasteSelected: (recordId) => invoke("paste_selected", { recordId }),
   getRecordImagePreview: (recordId) => invoke("get_record_image_preview", { recordId }),
@@ -108,6 +110,7 @@ const tauriCommands: AppCommands = {
   updateRecordGroup: (recordId, groupId) => invoke("update_record_group", { recordId, groupId }),
   getSettings: () => invoke("get_settings"), updateLanguage: (language) => invoke("update_language", { language }),
   updateRetention: (retention) => invoke("update_retention", { retention }),
+  updateStoragePolicy: (storageLimit, evictFavoritesWhenFull) => invoke("update_storage_policy", { storageLimit, evictFavoritesWhenFull }),
   updateStartAtSignIn: (enabled) => invoke("update_start_at_sign_in", { enabled }),
   updateStartMinimized: (enabled) => invoke("update_start_minimized", { enabled }),
   updateShowTrayIcon: (enabled) => invoke("update_show_tray_icon", { enabled }),
@@ -326,6 +329,8 @@ function SettingsShell({ commands, settings, setSettings, text }: { commands: Ap
   const [confirmExit, setConfirmExit] = useState(false);
   const [excludedApplication, setExcludedApplication] = useState("");
   const [monitoringError, setMonitoringError] = useState(false);
+  const [storagePolicyBusy, setStoragePolicyBusy] = useState(false);
+  const [storagePolicyError, setStoragePolicyError] = useState(false);
   const saveExcludedApplications = async (applications: string[]) => {
     setMonitoringError(false);
     try { setSettings(await commands.updateExcludedApplications(applications)); return true; }
@@ -340,6 +345,13 @@ function SettingsShell({ commands, settings, setSettings, text }: { commands: Ap
     setShortcutError(null);
     try { setSettings(await commands.updateShortcuts(activation, groupModifiers, quickPasteEnabled, quickPasteModifiers)); }
     catch (error) { setShortcutError(shortcutErrorText(error, text)); }
+  };
+  const updateStoragePolicy = async (storageLimit: StorageLimit, evictFavoritesWhenFull: boolean) => {
+    setStoragePolicyBusy(true);
+    setStoragePolicyError(false);
+    try { setSettings(await commands.updateStoragePolicy(storageLimit, evictFavoritesWhenFull)); }
+    catch { setStoragePolicyError(true); }
+    finally { setStoragePolicyBusy(false); }
   };
   return <main className="settings-shell">
     <aside className="settings-nav">
@@ -378,6 +390,8 @@ function SettingsShell({ commands, settings, setSettings, text }: { commands: Ap
       </SettingsSection>
       <SettingsSection id="storage" icon={<Database size={18} />} title={text.storage}>
         <SelectRow title={text.retention} detail={text.retentionDetail} value={settings.retention} onChange={(value) => void commands.updateRetention(value as RetentionPeriod).then(setSettings)} options={[{ value: "one_day", label: text.oneDay }, { value: "seven_days", label: text.sevenDays }, { value: "thirty_days", label: text.thirtyDays }, { value: "ninety_days", label: text.ninetyDays }, { value: "forever", label: text.forever }]} />
+        <SelectRow title={text.storageLimit} detail={storagePolicyError ? text.storagePolicySaveFailed : text.storageLimitDetail} value={settings.storageLimit} disabled={storagePolicyBusy} onChange={(value) => void updateStoragePolicy(value as StorageLimit, settings.evictFavoritesWhenFull)} options={[{ value: "oneGb", label: text.oneGb }, { value: "fiveGb", label: text.fiveGb }, { value: "tenGb", label: text.tenGb }, { value: "unlimited", label: text.unlimitedStorage }]} />
+        <ToggleRow title={text.evictFavoritesWhenFull} detail={storagePolicyError ? text.storagePolicySaveFailed : text.evictFavoritesWhenFullDetail} checked={settings.evictFavoritesWhenFull} disabled={storagePolicyBusy} onChange={(enabled) => updateStoragePolicy(settings.storageLimit, enabled)} />
         <StatusRow title={text.storageStatus} detail={settings.storageAvailable ? text.storageAvailable : text.storageUnavailable} state={settings.storageAvailable ? "available" : "unavailable"} />
         <div className="setting-row"><div><Download size={16} /><span><strong>{text.backupHistory}</strong><span>{backupStatus === "exported" ? text.backupExported : text.backupHistoryDetail}</span></span></div><button className="secondary-button" type="button" disabled={!settings.storageAvailable || backupBusy} onClick={() => { setBackupBusy(true); setBackupStatus(null); void commands.exportBackup().then((exported) => { if (exported) setBackupStatus("exported"); }).catch(() => setBackupStatus("failed")).finally(() => setBackupBusy(false)); }}><Download size={14} />{text.backupHistory}</button></div>
         <div className="setting-row"><div><Upload size={16} /><span><strong>{text.restoreBackup}</strong><span>{backupStatus === "restored" ? text.backupRestored : backupStatus === "failed" ? text.backupFailed : text.restoreBackupDetail}</span></span></div>{confirmRestore ? <div className="confirm-actions"><button className="secondary-button" type="button" disabled={backupBusy} onClick={() => setConfirmRestore(false)}>{text.cancel}</button><button className="danger-button" type="button" disabled={backupBusy} onClick={() => { setBackupBusy(true); setBackupStatus(null); void commands.restoreBackup().then((value) => { if (value) { setSettings(value); setBackupStatus("restored"); setConfirmRestore(false); } }).catch(() => setBackupStatus("failed")).finally(() => setBackupBusy(false)); }}>{text.confirmRestore}</button></div> : <button className="secondary-button" type="button" disabled={!settings.storageAvailable || backupBusy} onClick={() => setConfirmRestore(true)}><Upload size={14} />{text.restoreBackup}</button>}</div>
@@ -397,7 +411,7 @@ function SettingsShell({ commands, settings, setSettings, text }: { commands: Ap
   </main>;
 }
 function SettingsSection({ id, icon, title, badge, children }: { id: string; icon: React.ReactNode; title: string; badge?: string; children: React.ReactNode }) { return <section className="settings-section" id={id}><h2>{icon}{title}{badge && <span className="section-badge">{badge}</span>}</h2><div className="section-rows">{children}</div></section>; }
-function SelectRow({ title, detail, value, onChange, options }: { title: string; detail: string; value: string; onChange(value: string): void; options: { value: string; label: string }[] }) { return <label className="setting-row"><div><span><strong>{title}</strong><span>{detail}</span></span></div><select aria-label={title} value={value} onChange={(event) => onChange(event.currentTarget.value)}>{options.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></label>; }
+function SelectRow({ title, detail, value, disabled = false, onChange, options }: { title: string; detail: string; value: string; disabled?: boolean; onChange(value: string): void; options: { value: string; label: string }[] }) { return <label className={`setting-row${disabled ? " disabled-row" : ""}`}><div><span><strong>{title}</strong><span>{detail}</span></span></div><select aria-label={title} value={value} disabled={disabled} onChange={(event) => onChange(event.currentTarget.value)}>{options.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></label>; }
 function StatusRow({ title, detail, state }: { title: string; detail: string; state: "available" | "unavailable" | "planned" }) { return <div className="setting-row"><div><span><strong>{title}</strong><span>{detail}</span></span></div><span className={`status-dot ${state}`} aria-label={detail} role="img" /></div>; }
 function ToggleRow({ title, detail, checked, disabled = false, onChange }: { title: string; detail: string; checked: boolean; disabled?: boolean; onChange(value: boolean): Promise<unknown> }) {
   const [saving, setSaving] = useState(false);

@@ -321,6 +321,8 @@ enum HotkeyStatus {
 struct SettingsView {
     language: Language,
     retention: RetentionPeriod,
+    storage_limit: crate::domain::StorageLimit,
+    evict_favorites_when_full: bool,
     start_at_sign_in: bool,
     start_minimized: bool,
     show_tray_icon: bool,
@@ -379,6 +381,8 @@ impl ApplicationSettings {
         SettingsView {
             language: current.language,
             retention: current.retention,
+            storage_limit: current.storage_limit,
+            evict_favorites_when_full: current.evict_favorites_when_full,
             start_at_sign_in: current.start_at_sign_in,
             start_minimized: current.start_minimized,
             show_tray_icon: current.show_tray_icon,
@@ -410,6 +414,32 @@ impl ApplicationSettings {
         self.persist_settings_coordinated();
         self.prune_expired_coordinated();
         self.view()
+    }
+
+    fn update_storage_policy(
+        &self,
+        storage_limit: crate::domain::StorageLimit,
+        evict_favorites_when_full: bool,
+    ) -> Result<(SettingsView, bool), String> {
+        let _coordinated = self.mutation_coordinator.lock();
+        let current = *lock_unpoisoned(&self.current);
+        let candidate = UserSettings {
+            storage_limit,
+            evict_favorites_when_full,
+            ..current
+        };
+        let persistence = self
+            .persistence
+            .as_ref()
+            .ok_or_else(|| "local clipboard storage is unavailable".to_owned())?;
+        let removed = persistence
+            .update_storage_policy(storage_limit, evict_favorites_when_full)
+            .map_err(|error| error.to_string())?;
+        *lock_unpoisoned(&self.current) = candidate;
+        if removed > 0 {
+            self.records.refresh_after_storage_maintenance_coordinated();
+        }
+        Ok((self.view(), removed > 0))
     }
 
     fn update_start_at_sign_in(&self, enabled: bool) -> SettingsView {
@@ -683,7 +713,7 @@ mod runtime_tests {
     use crate::{
         domain::{
             CapturedClipboard, ClipboardRepresentation, ContentIdentity, RetentionPeriod,
-            SourceIdentity, UserSettings,
+            SourceIdentity, StorageLimit, UserSettings,
         },
         platform::windows::clipboard::{ClipboardEvent, latest_clipboard_event_channel},
         services::persistence::{
@@ -864,6 +894,28 @@ mod runtime_tests {
         assert_eq!(records.list().len(), 1);
         assert_eq!(repository.load_recent(10).unwrap().len(), 1);
         assert!(storage_available.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn storage_policy_failure_does_not_publish_runtime_settings() {
+        let original = UserSettings::default();
+        let settings = ApplicationSettings {
+            current: Mutex::new(original),
+            persistence: None,
+            records: Arc::new(SessionRecordStore::default()),
+            storage_available: Arc::new(AtomicBool::new(false)),
+            hotkey_status: Mutex::new(HotkeyStatus::Unavailable),
+            custom_sound_path: std::path::PathBuf::new(),
+            capture_policy: Arc::new(crate::platform::windows::clipboard::CapturePolicy::default()),
+            mutation_coordinator: Arc::new(PersistenceMutationCoordinator::default()),
+        };
+
+        assert!(
+            settings
+                .update_storage_policy(StorageLimit::FiveGb, true)
+                .is_err()
+        );
+        assert_eq!(settings.current(), original);
     }
 
     #[test]
@@ -1764,6 +1816,23 @@ fn update_retention(
 
 #[cfg(windows)]
 #[tauri::command]
+fn update_storage_policy(
+    storage_limit: crate::domain::StorageLimit,
+    evict_favorites_when_full: bool,
+    settings: tauri::State<'_, Arc<ApplicationSettings>>,
+    app: tauri::AppHandle,
+) -> Result<SettingsView, String> {
+    let (view, records_changed) =
+        settings.update_storage_policy(storage_limit, evict_favorites_when_full)?;
+    let _ = app.emit("settings-changed", &view);
+    if records_changed {
+        let _ = app.emit("clipboard-records-changed", ());
+    }
+    Ok(view)
+}
+
+#[cfg(windows)]
+#[tauri::command]
 fn update_start_at_sign_in(
     enabled: bool,
     settings: tauri::State<'_, Arc<ApplicationSettings>>,
@@ -2622,6 +2691,7 @@ pub fn run() {
             get_settings,
             update_language,
             update_retention,
+            update_storage_policy,
             update_start_at_sign_in,
             update_start_minimized,
             update_show_tray_icon,
