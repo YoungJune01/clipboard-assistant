@@ -566,6 +566,23 @@ describe("window routing", () => {
     expect(screen.queryByText("Favorites")).not.toBeInTheDocument();
   });
 
+  it("updates the selected settings navigation item when a section is clicked", async () => {
+    const user = userEvent.setup();
+    render(<ClipboardAssistantApp windowLabel="settings" commands={commands([])} />);
+
+    const general = await screen.findByRole("link", { name: "常规" });
+    const application = screen.getByRole("link", { name: "应用" });
+    expect(general).toHaveAttribute("aria-current", "location");
+    expect(application).not.toHaveAttribute("aria-current");
+
+    await user.click(application);
+
+    expect(application).toHaveAttribute("aria-current", "location");
+    expect(application).toHaveClass("active");
+    expect(general).not.toHaveAttribute("aria-current");
+    expect(general).not.toHaveClass("active");
+  });
+
   it("requires confirmation before exiting the application", async () => {
     const api = commands([]);
     const user = userEvent.setup();

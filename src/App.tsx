@@ -322,6 +322,7 @@ function ClipboardItem({ record, index, selected, groups, itemRef, onSelect, onP
 
 function SettingsShell({ commands, settings, setSettings, text }: { commands: AppCommands; settings: SettingsState; setSettings(value: SettingsState): void; text: Dictionary }) {
   const hotkey = settings.hotkeyStatus === "available" ? text.shortcutAvailable : settings.hotkeyStatus === "conflict" ? text.shortcutConflict : text.shortcutUnavailable;
+  const [activeSection, setActiveSection] = useState("general");
   const [shortcutError, setShortcutError] = useState<string | null>(null);
   const [confirmClear, setConfirmClear] = useState(false); const [clearStatus, setClearStatus] = useState<"cleared" | "failed" | null>(null);
   const [backupStatus, setBackupStatus] = useState<"exported" | "restored" | "failed" | null>(null);
@@ -353,17 +354,28 @@ function SettingsShell({ commands, settings, setSettings, text }: { commands: Ap
     catch { setStoragePolicyError(true); }
     finally { setStoragePolicyBusy(false); }
   };
+  const selectSection = (event: React.MouseEvent<HTMLAnchorElement>, sectionId: string) => {
+    event.preventDefault();
+    setActiveSection(sectionId);
+    const section = document.getElementById(sectionId);
+    if (section && typeof section.scrollIntoView === "function") {
+      section.scrollIntoView({ behavior: "smooth", block: "start" });
+    }
+  };
+  const navigation = [
+    { id: "general", icon: <Settings2 size={17} />, label: text.general },
+    { id: "monitoring", icon: <Shield size={17} />, label: text.monitoring },
+    { id: "startup", icon: <MonitorUp size={17} />, label: text.startup },
+    { id: "appearance", icon: <Palette size={17} />, label: text.appearance },
+    { id: "storage", icon: <Database size={17} />, label: text.storage },
+    { id: "shortcuts", icon: <Keyboard size={17} />, label: text.shortcuts },
+    { id: "application", icon: <Power size={17} />, label: text.application },
+  ];
   return <main className="settings-shell">
     <aside className="settings-nav">
       <div className="settings-brand"><span className="settings-brand-mark"><Clipboard size={18} /></span><strong>{text.product}</strong></div>
       <nav aria-label={text.settings}>
-        <a href="#general" className="active"><Settings2 size={17} />{text.general}</a>
-        <a href="#monitoring"><Shield size={17} />{text.monitoring}</a>
-        <a href="#startup"><MonitorUp size={17} />{text.startup}</a>
-        <a href="#appearance"><Palette size={17} />{text.appearance}</a>
-        <a href="#storage"><Database size={17} />{text.storage}</a>
-        <a href="#shortcuts"><Keyboard size={17} />{text.shortcuts}</a>
-        <a href="#application"><Power size={17} />{text.application}</a>
+        {navigation.map((item) => <a key={item.id} href={`#${item.id}`} className={activeSection === item.id ? "active" : ""} aria-current={activeSection === item.id ? "location" : undefined} onClick={(event) => selectSection(event, item.id)}>{item.icon}{item.label}</a>)}
       </nav>
       <div className="nav-version"><Sparkles size={14} />{text.localPrivate}</div>
     </aside>
