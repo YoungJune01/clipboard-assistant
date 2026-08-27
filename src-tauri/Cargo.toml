@@ -5,6 +5,10 @@ description = "Windows desktop application for Clipboard Assistant"
 authors = ["Clipboard Assistant Contributors"]
 edition = "2024"
 
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
+
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [lib]

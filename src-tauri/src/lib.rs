@@ -2742,6 +2742,14 @@ mod desktop_configuration_tests {
     }
 
     #[test]
+    fn release_builds_embed_frontend_assets_with_the_custom_protocol() {
+        let manifest = include_str!("../Cargo.toml");
+
+        assert!(manifest.contains("default = [\"custom-protocol\"]"));
+        assert!(manifest.contains("custom-protocol = [\"tauri/custom-protocol\"]"));
+    }
+
+    #[test]
     fn explicit_exit_marks_the_runtime_before_shutdown() {
         let exiting = AtomicBool::new(false);
 
