@@ -133,6 +133,14 @@ pub(crate) fn search_connection(
                            WHERE p.record_id = r.id AND p.kind IN ('png', 'dib_v5')) AS has_image,
                     NULLIF(s.ocr_text, '') AS ocr_text,
                     NULLIF(s.qr_text, '') AS qr_text,
+                    (SELECT json_extract(p.text_value, '$[0]') FROM clipboard_representations p
+                     WHERE p.record_id = r.id AND p.kind = 'file_list' ORDER BY p.position LIMIT 1) AS file_path_1,
+                    (SELECT json_extract(p.text_value, '$[1]') FROM clipboard_representations p
+                     WHERE p.record_id = r.id AND p.kind = 'file_list' ORDER BY p.position LIMIT 1) AS file_path_2,
+                    (SELECT json_extract(p.text_value, '$[2]') FROM clipboard_representations p
+                     WHERE p.record_id = r.id AND p.kind = 'file_list' ORDER BY p.position LIMIT 1) AS file_path_3,
+                    COALESCE((SELECT json_array_length(p.text_value) FROM clipboard_representations p
+                     WHERE p.record_id = r.id AND p.kind = 'file_list' ORDER BY p.position LIMIT 1), 0) AS file_count,
                     (CASE WHEN lower(s.note) = lower(?1) THEN 1200 ELSE 0 END +
                      CASE WHEN lower(s.note) LIKE lower(?2) ESCAPE '\\' THEN 600 ELSE 0 END +
                      CASE WHEN lower(COALESCE(g.name, s.group_name)) LIKE lower(?2) ESCAPE '\\' THEN 500 ELSE 0 END +
@@ -162,7 +170,8 @@ pub(crate) fn search_connection(
                AND (?8 = 0 OR r.favorite = 1)
          )
          SELECT id, captured_at, source_application, note, group_id, pinned, favorite,
-                sensitive, content_kind, preview_text, has_image, ocr_text, qr_text, score
+                sensitive, content_kind, preview_text, has_image, ocr_text, qr_text,
+                file_path_1, file_path_2, file_path_3, file_count, score
          FROM candidates
          WHERE (?9 IS NULL OR score < ?9 OR
                 (score = ?9 AND (captured_at < ?10 OR
@@ -211,7 +220,16 @@ pub(crate) fn search_connection(
                 has_image: row.get(10)?,
                 ocr_text: row.get(11)?,
                 qr_text: row.get(12)?,
-                score: row.get(13)?,
+                file_paths: [
+                    row.get::<_, Option<String>>(13)?,
+                    row.get::<_, Option<String>>(14)?,
+                    row.get::<_, Option<String>>(15)?,
+                ]
+                .into_iter()
+                .flatten()
+                .collect(),
+                file_count: row.get(16)?,
+                score: row.get(17)?,
             })
         },
     )?;
@@ -283,6 +301,8 @@ struct SearchRow {
     has_image: bool,
     ocr_text: Option<String>,
     qr_text: Option<String>,
+    file_paths: Vec<String>,
+    file_count: usize,
     score: i64,
 }
 
@@ -306,6 +326,8 @@ impl SearchRow {
                 has_image: self.has_image,
                 ocr_text: self.ocr_text,
                 qr_text: self.qr_text,
+                file_paths: self.file_paths,
+                file_count: self.file_count,
                 content_kind,
                 note: self
                     .note
@@ -390,6 +412,32 @@ mod tests {
                 .unwrap();
             assert_eq!(page.items.len(), 1, "query={query}");
         }
+
+        let paths = vec![
+            r"C:\Users\admin\Downloads\quarterly-report.pdf".to_owned(),
+            r"C:\Users\admin\Downloads\budget.xlsx".to_owned(),
+            r"C:\Users\admin\Downloads\notes.txt".to_owned(),
+            r"C:\Users\admin\Downloads\archive.zip".to_owned(),
+        ];
+        let files = ClipboardRecord::from_capture(CapturedClipboard {
+            captured_at: Utc::now() + Duration::seconds(2),
+            source: SourceIdentity::default(),
+            content_identity: ContentIdentity::new("identity-file-search"),
+            representations: vec![ClipboardRepresentation::FileList {
+                paths: paths.clone(),
+            }],
+        });
+        repository.save_record(&files).unwrap();
+
+        let page = repository
+            .search_history(SearchQuery {
+                query: "quarterly-report".to_owned(),
+                ..SearchQuery::default()
+            })
+            .unwrap();
+        assert_eq!(page.items[0].id, files.id);
+        assert_eq!(page.items[0].file_paths, paths[..3]);
+        assert_eq!(page.items[0].file_count, paths.len());
     }
 
     #[test]

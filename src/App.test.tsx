@@ -17,6 +17,8 @@ const record: SessionRecord = {
   hasImage: false,
   ocrText: null,
   qrText: null,
+  filePaths: [],
+  fileCount: 0,
   note: null,
   groupId: null,
   contentKind: "text",
@@ -282,7 +284,7 @@ describe("quick panel", () => {
     try {
       render(<ClipboardAssistantApp windowLabel="quick-panel" commands={api} />);
       await screen.findByText("继续向下滚动加载更多");
-      expect(intersect).toBeDefined();
+      await waitFor(() => expect(intersect).toBeDefined());
 
       intersect!([{ isIntersecting: true } as IntersectionObserverEntry]);
 
@@ -634,6 +636,23 @@ describe("quick panel", () => {
 
     await waitFor(() => expect(api.updateRecordNote).toHaveBeenCalledWith(record.id, "GitHub 工作账号密码"));
     expect(api.pasteSelected).not.toHaveBeenCalled();
+  });
+
+  it("shows file names, type, location, and additional item count", async () => {
+    const files: SessionRecord = {
+      ...record,
+      id: "77777777-7777-4777-8777-777777777777",
+      text: null,
+      contentKind: "files",
+      filePaths: ["C:\\Users\\admin\\Downloads\\report.pdf", "C:\\Users\\admin\\Downloads\\budget.xlsx", "C:\\Users\\admin\\Downloads\\notes.txt"],
+      fileCount: 4,
+    };
+    render(<ClipboardAssistantApp windowLabel="quick-panel" commands={commands([files])} />);
+
+    expect(await screen.findByText("report.pdf，另有 3 项")).toBeInTheDocument();
+    expect(screen.getByText("PDF 文件 · 位于 Downloads")).toBeInTheDocument();
+    expect(screen.getByText("budget.xlsx · notes.txt")).toBeInTheDocument();
+    expect(screen.queryByText("剪贴内容")).not.toBeInTheDocument();
   });
 
   it("allows exactly 200 Unicode characters in a session note", async () => {

@@ -103,6 +103,8 @@ pub struct HistoryRecordSummary {
     pub has_image: bool,
     pub ocr_text: Option<String>,
     pub qr_text: Option<String>,
+    pub file_paths: Vec<String>,
+    pub file_count: usize,
     pub content_kind: ContentKind,
     pub note: Option<RecordNote>,
     pub group_id: Option<GroupId>,
@@ -2554,7 +2556,15 @@ fn load_page_from_connection(
                 EXISTS(SELECT 1 FROM clipboard_representations p \
                        WHERE p.record_id = r.id AND p.kind IN ('png', 'dib_v5')), \
                 (SELECT x.ocr_text FROM clipboard_recognition x WHERE x.record_id = r.id), \
-                (SELECT x.qr_text FROM clipboard_recognition x WHERE x.record_id = r.id) \
+                (SELECT x.qr_text FROM clipboard_recognition x WHERE x.record_id = r.id), \
+                (SELECT json_extract(p.text_value, '$[0]') FROM clipboard_representations p \
+                 WHERE p.record_id = r.id AND p.kind = 'file_list' ORDER BY p.position LIMIT 1), \
+                (SELECT json_extract(p.text_value, '$[1]') FROM clipboard_representations p \
+                 WHERE p.record_id = r.id AND p.kind = 'file_list' ORDER BY p.position LIMIT 1), \
+                (SELECT json_extract(p.text_value, '$[2]') FROM clipboard_representations p \
+                 WHERE p.record_id = r.id AND p.kind = 'file_list' ORDER BY p.position LIMIT 1), \
+                COALESCE((SELECT json_array_length(p.text_value) FROM clipboard_representations p \
+                 WHERE p.record_id = r.id AND p.kind = 'file_list' ORDER BY p.position LIMIT 1), 0) \
          FROM clipboard_records r WHERE 1 = 1",
     );
     let mut values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
@@ -2596,6 +2606,15 @@ fn load_page_from_connection(
             has_image: row.get(10)?,
             ocr_text: row.get(11)?,
             qr_text: row.get(12)?,
+            file_paths: [
+                row.get::<_, Option<String>>(13)?,
+                row.get::<_, Option<String>>(14)?,
+                row.get::<_, Option<String>>(15)?,
+            ]
+            .into_iter()
+            .flatten()
+            .collect(),
+            file_count: row.get(16)?,
         })
     })?;
     let mut records = Vec::with_capacity(requested);
@@ -3295,6 +3314,8 @@ struct DbSummary {
     has_image: bool,
     ocr_text: Option<String>,
     qr_text: Option<String>,
+    file_paths: Vec<String>,
+    file_count: usize,
 }
 
 impl DbSummary {
@@ -3309,6 +3330,8 @@ impl DbSummary {
             has_image: self.has_image,
             ocr_text: self.ocr_text,
             qr_text: self.qr_text,
+            file_paths: self.file_paths,
+            file_count: self.file_count,
             content_kind: parse_content_kind(&self.content_kind)
                 .ok_or(PersistenceError::InvalidData)?,
             note: self
@@ -4609,6 +4632,31 @@ mod tests {
                 .all(|record| record.id != rich.id)
         );
         assert_eq!(favorite_page.records[0].id, rich.id);
+    }
+
+    #[test]
+    fn history_summary_projects_file_names_and_total_count_after_reopen() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("history.sqlite3");
+        let paths = vec![
+            r"C:\Users\admin\Downloads\report.pdf".to_owned(),
+            r"C:\Users\admin\Downloads\budget.xlsx".to_owned(),
+            r"C:\Users\admin\Downloads\notes.txt".to_owned(),
+            r"C:\Users\admin\Downloads\archive.zip".to_owned(),
+        ];
+        let expected = file_list_record("file-summary", paths.clone());
+        SqliteRepository::open(path.clone())
+            .unwrap()
+            .save_record(&expected)
+            .unwrap();
+
+        let page = SqliteRepository::open(path)
+            .unwrap()
+            .load_page(HistoryQuery::default())
+            .unwrap();
+
+        assert_eq!(page.records[0].file_paths, paths[..3]);
+        assert_eq!(page.records[0].file_count, paths.len());
     }
 
     #[test]

@@ -46,6 +46,8 @@ pub struct SessionRecordView {
     pub has_image: bool,
     pub ocr_text: Option<String>,
     pub qr_text: Option<String>,
+    pub file_paths: Vec<String>,
+    pub file_count: usize,
     pub note: Option<RecordNote>,
     pub group_id: Option<GroupId>,
     pub content_kind: ContentKind,
@@ -1268,6 +1270,16 @@ impl SessionRecordView {
                 ClipboardRepresentation::Png { .. } | ClipboardRepresentation::DibV5 { .. }
             )
         });
+        let (file_paths, file_count) = record
+            .representations
+            .iter()
+            .find_map(|representation| match representation {
+                ClipboardRepresentation::FileList { paths } => {
+                    Some((paths.iter().take(3).cloned().collect(), paths.len()))
+                }
+                _ => None,
+            })
+            .unwrap_or_default();
         Self {
             id: record.id,
             captured_at: record.captured_at,
@@ -1276,6 +1288,8 @@ impl SessionRecordView {
             has_image,
             ocr_text: None,
             qr_text: None,
+            file_paths,
+            file_count,
             note: record.note.clone(),
             group_id: record.group_id,
             content_kind: record.content_kind(),
@@ -1294,6 +1308,8 @@ impl SessionRecordView {
             has_image: summary.has_image,
             ocr_text: summary.ocr_text,
             qr_text: summary.qr_text,
+            file_paths: summary.file_paths,
+            file_count: summary.file_count,
             note: summary.note,
             group_id: summary.group_id,
             content_kind: summary.content_kind,
@@ -2612,6 +2628,32 @@ mod tests {
             assert!(serde_json::to_string(details).unwrap().len() < 300 * 1024);
         }
         assert_eq!(memory.representations, sqlite.representations);
+    }
+
+    #[test]
+    fn memory_file_list_summary_projects_names_without_truncating_paste_payload() {
+        let paths = vec![
+            r"C:\Users\admin\Downloads\report.pdf".to_owned(),
+            r"C:\Users\admin\Downloads\budget.xlsx".to_owned(),
+            r"C:\Users\admin\Downloads\notes.txt".to_owned(),
+            r"C:\Users\admin\Downloads\archive.zip".to_owned(),
+        ];
+        let record = ClipboardRecord::from_capture(CapturedClipboard {
+            content_identity: ContentIdentity::new("memory-file-summary"),
+            captured_at: Utc::now(),
+            source: SourceIdentity::default(),
+            representations: vec![ClipboardRepresentation::FileList {
+                paths: paths.clone(),
+            }],
+        });
+        let store = SessionRecordStore::with_loaded(vec![record.clone()]);
+
+        let summary = store.list()[0].clone();
+        let payload = store.record_details(record.id).unwrap();
+
+        assert_eq!(summary.file_paths, paths[..3]);
+        assert_eq!(summary.file_count, paths.len());
+        assert_eq!(payload.representations, record.representations);
     }
 
     #[test]
