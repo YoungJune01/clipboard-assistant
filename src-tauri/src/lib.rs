@@ -1465,6 +1465,63 @@ fn paste_selected(
 
 #[cfg(windows)]
 #[tauri::command]
+fn copy_text(
+    value: String,
+    publisher: tauri::State<'_, platform::windows::clipboard::ClipboardPublisher>,
+) -> Result<(), String> {
+    publisher
+        .publish(&[domain::ClipboardRepresentation::UnicodeText { text: value }])
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(windows)]
+#[tauri::command]
+fn open_external_url(url: String) -> Result<(), String> {
+    let url = validate_external_url(&url)?;
+    let operation: Vec<u16> = "open\0".encode_utf16().collect();
+    let target: Vec<u16> = url.encode_utf16().chain(std::iter::once(0)).collect();
+    let result = unsafe {
+        windows::Win32::UI::Shell::ShellExecuteW(
+            None,
+            windows::core::PCWSTR(operation.as_ptr()),
+            windows::core::PCWSTR(target.as_ptr()),
+            windows::core::PCWSTR::null(),
+            windows::core::PCWSTR::null(),
+            windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL,
+        )
+    };
+    if result.0 as isize <= 32 {
+        Err("Windows could not open the web link".to_owned())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn validate_external_url(value: &str) -> Result<&str, String> {
+    let value = value.trim();
+    if value.is_empty()
+        || value.len() > 8192
+        || value
+            .chars()
+            .any(|character| character.is_control() || character.is_whitespace())
+    {
+        return Err("web link is invalid".to_owned());
+    }
+    let authority = value
+        .strip_prefix("https://")
+        .or_else(|| value.strip_prefix("http://"))
+        .ok_or_else(|| "only HTTP and HTTPS web links can be opened".to_owned())?;
+    let host = authority.split(['/', '?', '#']).next().unwrap_or_default();
+    if host.is_empty() || host.starts_with(['.', ':']) || host.ends_with('.') {
+        return Err("web link is invalid".to_owned());
+    }
+    Ok(value)
+}
+
+#[cfg(windows)]
+#[tauri::command]
 fn list_session_records(
     records: tauri::State<'_, Arc<SessionRecordStore>>,
 ) -> Vec<SessionRecordView> {
@@ -2555,6 +2612,7 @@ pub fn run() {
                 );
             let listener =
                 platform::windows::clipboard::ClipboardListener::start(clipboard_events)?;
+            let clipboard_publisher = listener.publisher();
             let settings_state = Arc::new(ApplicationSettings {
                 current: Mutex::new(user_settings),
                 persistence,
@@ -2621,7 +2679,7 @@ pub fn run() {
                 })?;
             let paste = SafePasteService::new(
                 platform::windows::paste::Win32PasteTarget::new(),
-                listener.publisher(),
+                clipboard_publisher.clone(),
                 Arc::clone(&panel_controller),
                 platform::windows::paste::Win32PasteInput,
             );
@@ -2673,6 +2731,7 @@ pub fn run() {
             app.manage(Arc::clone(&groups));
             app.manage(Arc::clone(&session_records));
             app.manage(Arc::clone(&coordinator));
+            app.manage(clipboard_publisher);
             app.manage(active_group);
             app.manage(Arc::clone(&settings_state));
             app.manage(desktop);
@@ -2742,6 +2801,8 @@ pub fn run() {
             begin_quick_panel_drag,
             finish_quick_panel_drag,
             paste_selected,
+            copy_text,
+            open_external_url,
             list_session_records,
             list_history_page,
             search_history,
@@ -2795,7 +2856,23 @@ pub fn run() {
 mod desktop_configuration_tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    use super::mark_application_exiting;
+    use super::{mark_application_exiting, validate_external_url};
+
+    #[test]
+    fn external_links_allow_only_valid_http_and_https_targets() {
+        assert_eq!(
+            validate_external_url("https://example.com/path?q=1"),
+            Ok("https://example.com/path?q=1")
+        );
+        assert_eq!(
+            validate_external_url(" http://localhost:8080/test "),
+            Ok("http://localhost:8080/test")
+        );
+        assert!(validate_external_url("javascript:alert(1)").is_err());
+        assert!(validate_external_url("file:///C:/Windows/win.ini").is_err());
+        assert!(validate_external_url("https://example.com/line\nbreak").is_err());
+        assert!(validate_external_url("https:///missing-host").is_err());
+    }
 
     #[test]
     fn dpi_awareness_is_manifest_owned_and_runtime_does_not_reset_it() {

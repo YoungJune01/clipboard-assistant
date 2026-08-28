@@ -70,10 +70,18 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .record-actions button.danger:hover, .record-actions button.danger:focus-visible { color: #b42342; background: rgba(255,228,230,.8); }
 .item-text { margin: 3px 0 7px; overflow: hidden; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; color: #202a3c; font-size: 13px; line-height: 18px; overflow-wrap: anywhere; }
 .item-text.web-url { color: var(--accent-deep); }
+.interactive-text { width: 100%; align-items: flex-start; gap: 5px; padding: 0; border: 0; background: transparent; text-align: left; cursor: pointer; }
+.interactive-text:hover { text-decoration: underline; }
+.interactive-text svg { display: inline; flex: 0 0 auto; margin: 3px 0 0 4px; vertical-align: top; }
 .recognition-result { margin: 4px 0 7px; padding: 6px 8px; border: 1px solid rgba(var(--accent-rgb),.14); border-radius: 5px; background: rgba(var(--accent-soft),.38); }
-.recognition-result strong { display: block; margin-bottom: 2px; color: var(--accent-deep); font-size: 10px; line-height: 14px; }
+.recognition-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; min-height: 22px; }
+.recognition-result strong { display: block; color: var(--accent-deep); font-size: 10px; line-height: 14px; }
+.recognition-actions { flex: 0 0 auto; display: flex; align-items: center; gap: 2px; }
+.recognition-actions button { width: 22px; height: 22px; display: grid; place-items: center; padding: 0; border: 0; border-radius: 5px; color: #64748b; background: transparent; cursor: pointer; }
+.recognition-actions button:hover, .recognition-actions button:focus-visible { color: var(--accent-deep); background: rgba(255,255,255,.7); outline: 0; }
 .recognition-result span { display: -webkit-box; overflow: hidden; -webkit-box-orient: vertical; -webkit-line-clamp: 4; color: #334155; font-size: 11px; line-height: 16px; overflow-wrap: anywhere; white-space: pre-wrap; }
-.qr-result span { display: block; max-height: 96px; overflow-y: auto; }
+.recognition-link { width: 100%; max-height: 96px; display: block; padding: 0; overflow-y: auto; border: 0; color: var(--accent-deep); background: transparent; font-size: 11px; line-height: 16px; overflow-wrap: anywhere; text-align: left; white-space: pre-wrap; cursor: pointer; }
+.recognition-link:hover { text-decoration: underline; }
 .image-preview { width: 100%; height: 112px; margin: 5px 0 7px; display: grid; place-items: center; overflow: hidden; border: 1px solid rgba(79,99,128,.14); border-radius: 6px; color: #7b8799; background: rgba(226,234,243,.48); }
 .image-preview img { display: block; max-width: 100%; max-height: 100%; width: auto; height: auto; object-fit: contain; }
 .image-preview.failed { color: #9a6a74; background: rgba(244,232,235,.55); }

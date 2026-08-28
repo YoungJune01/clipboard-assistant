@@ -61,6 +61,8 @@ function commands(records = [record], settingsOverrides: Partial<SettingsState> 
     updateRecordContent: vi.fn().mockImplementation(async (_id, text) => ({ ...record, text })),
     createTextRecord: vi.fn().mockImplementation(async (text, note, groupId) => ({ ...record, id: "55555555-5555-4555-8555-555555555555", text, note, groupId })),
     pasteSelected: vi.fn().mockResolvedValue("Paste command sent"),
+    copyText: vi.fn().mockResolvedValue(undefined),
+    openExternalUrl: vi.fn().mockResolvedValue(undefined),
     getRecordImagePreview: vi.fn().mockResolvedValue({ dataUrl: "data:image/png;base64,iVBORw0KGgo=", width: 120, height: 80 }),
     hideQuickPanel: vi.fn().mockResolvedValue(undefined),
     updateRecordNote: vi.fn().mockImplementation(async (_id, note) => ({
@@ -387,15 +389,41 @@ describe("quick panel", () => {
     expect(search).toHaveValue("");
   });
 
-  it("presents valid web URLs locally without turning them into navigation actions", async () => {
+  it("opens copied web URLs without triggering paste", async () => {
     const linkRecord = { ...record, text: "https://www.example.com/account?id=7" };
     const api = commands([linkRecord]);
     render(<ClipboardAssistantApp windowLabel="quick-panel" commands={api} />);
 
     expect(await screen.findByLabelText("网页链接: example.com")).toBeInTheDocument();
-    expect(screen.queryByRole("link")).not.toBeInTheDocument();
-    fireEvent.doubleClick(screen.getByText(linkRecord.text));
-    await waitFor(() => expect(api.pasteSelected).toHaveBeenCalledWith(linkRecord.id));
+    const open = screen.getByRole("button", { name: "使用默认浏览器打开链接: example.com" });
+    fireEvent.click(open);
+    fireEvent.doubleClick(open);
+    await waitFor(() => expect(api.openExternalUrl).toHaveBeenCalledWith(linkRecord.text));
+    expect(api.pasteSelected).not.toHaveBeenCalled();
+  });
+
+  it("copies recognition results and opens recognized HTTP links without pasting", async () => {
+    const imageRecord = { ...record, text: null, hasImage: true, contentKind: "image" as const, qrText: "https://example.com/qr", ocrText: "Visit https://docs.example.com/start for help" };
+    const api = commands([imageRecord]);
+    render(<ClipboardAssistantApp windowLabel="quick-panel" commands={api} />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "复制二维码内容" }));
+    fireEvent.click(screen.getByRole("button", { name: "复制识别文字" }));
+    fireEvent.doubleClick(screen.getByRole("button", { name: "复制识别文字" }));
+    await waitFor(() => expect(api.copyText).toHaveBeenNthCalledWith(1, imageRecord.qrText));
+    expect(api.copyText).toHaveBeenNthCalledWith(2, imageRecord.ocrText);
+    expect(api.pasteSelected).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getAllByRole("button", { name: "使用默认浏览器打开链接: docs.example.com" })[0]);
+    expect(api.openExternalUrl).toHaveBeenCalledWith("https://docs.example.com/start");
+  });
+
+  it("does not expose non-HTTP recognition content as a browser action", async () => {
+    const imageRecord = { ...record, text: null, hasImage: true, contentKind: "image" as const, qrText: "javascript:alert(1)", ocrText: null };
+    render(<ClipboardAssistantApp windowLabel="quick-panel" commands={commands([imageRecord])} />);
+
+    expect(await screen.findByText(imageRecord.qrText)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /使用默认浏览器打开链接/ })).not.toBeInTheDocument();
   });
 
   it("loads a bounded local preview only for image records", async () => {
@@ -760,6 +788,18 @@ describe("window routing", () => {
     expect(application).toHaveClass("active");
     expect(general).not.toHaveAttribute("aria-current");
     expect(general).not.toHaveClass("active");
+  });
+
+  it("links the settings navigation to image recognition", async () => {
+    const user = userEvent.setup();
+    render(<ClipboardAssistantApp windowLabel="settings" commands={commands([])} />);
+
+    const recognition = await screen.findByRole("link", { name: "图片识别" });
+    await user.click(recognition);
+
+    expect(recognition).toHaveAttribute("href", "#recognition");
+    expect(recognition).toHaveAttribute("aria-current", "location");
+    expect(screen.getByRole("heading", { name: /图片识别/ })).toBeInTheDocument();
   });
 
   it("requires confirmation before exiting the application", async () => {
