@@ -373,9 +373,32 @@ struct ApplicationSettings {
     storage_available: Arc<AtomicBool>,
     hotkey_status: Mutex<HotkeyStatus>,
     custom_sound_path: std::path::PathBuf,
+    app_data_dir: std::path::PathBuf,
     capture_policy: Arc<platform::windows::clipboard::CapturePolicy>,
     mutation_coordinator: Arc<PersistenceMutationCoordinator>,
     recognition: Option<Arc<services::recognition::RecognitionService>>,
+}
+
+#[cfg(windows)]
+impl ApplicationSettings {
+    fn storage_location(&self) -> Result<services::storage_location::StorageLocation, String> {
+        self.persistence
+            .as_ref()
+            .and_then(|persistence| persistence.storage_location(&self.app_data_dir))
+            .ok_or_else(|| "local clipboard storage is unavailable".to_owned())
+    }
+
+    fn move_storage(
+        &self,
+        destination: std::path::PathBuf,
+    ) -> Result<services::storage_location::StorageLocation, String> {
+        let _coordinated = self.mutation_coordinator.lock();
+        self.persistence
+            .as_ref()
+            .ok_or_else(|| "local clipboard storage is unavailable".to_owned())?
+            .move_storage(destination, self.app_data_dir.clone())
+            .map_err(|error| error.to_string())
+    }
 }
 
 #[cfg(windows)]
@@ -913,6 +936,7 @@ mod runtime_tests {
             storage_available: Arc::clone(&storage_available),
             hotkey_status: Mutex::new(HotkeyStatus::Unavailable),
             custom_sound_path: std::path::PathBuf::new(),
+            app_data_dir: std::path::PathBuf::new(),
             capture_policy: Arc::new(crate::platform::windows::clipboard::CapturePolicy::default()),
             mutation_coordinator: Arc::new(PersistenceMutationCoordinator::default()),
         };
@@ -935,6 +959,7 @@ mod runtime_tests {
             storage_available: Arc::new(AtomicBool::new(false)),
             hotkey_status: Mutex::new(HotkeyStatus::Unavailable),
             custom_sound_path: std::path::PathBuf::new(),
+            app_data_dir: std::path::PathBuf::new(),
             capture_policy: Arc::new(crate::platform::windows::clipboard::CapturePolicy::default()),
             mutation_coordinator: Arc::new(PersistenceMutationCoordinator::default()),
         };
@@ -992,6 +1017,7 @@ mod runtime_tests {
             storage_available,
             hotkey_status: Mutex::new(HotkeyStatus::Unavailable),
             custom_sound_path: std::path::PathBuf::new(),
+            app_data_dir: std::path::PathBuf::new(),
             capture_policy: Arc::new(crate::platform::windows::clipboard::CapturePolicy::default()),
             mutation_coordinator,
         });
@@ -1374,6 +1400,7 @@ mod runtime_tests {
             storage_available: Arc::new(AtomicBool::new(false)),
             hotkey_status: Mutex::new(HotkeyStatus::Unavailable),
             custom_sound_path: std::path::PathBuf::new(),
+            app_data_dir: std::path::PathBuf::new(),
             capture_policy: Arc::new(crate::platform::windows::clipboard::CapturePolicy::default()),
             mutation_coordinator: Arc::new(PersistenceMutationCoordinator::default()),
         };
@@ -1406,6 +1433,7 @@ mod runtime_tests {
             storage_available: Arc::new(AtomicBool::new(false)),
             hotkey_status: Mutex::new(HotkeyStatus::Unavailable),
             custom_sound_path: std::path::PathBuf::new(),
+            app_data_dir: std::path::PathBuf::new(),
             capture_policy: Arc::new(crate::platform::windows::clipboard::CapturePolicy::default()),
             mutation_coordinator: Arc::new(PersistenceMutationCoordinator::default()),
         });
@@ -2089,6 +2117,29 @@ fn export_backup(settings: tauri::State<'_, Arc<ApplicationSettings>>) -> Result
 
 #[cfg(windows)]
 #[tauri::command]
+fn get_storage_location(
+    settings: tauri::State<'_, Arc<ApplicationSettings>>,
+) -> Result<services::storage_location::StorageLocation, String> {
+    settings.storage_location()
+}
+
+#[cfg(windows)]
+#[tauri::command]
+fn choose_storage_location() -> Option<std::path::PathBuf> {
+    rfd::FileDialog::new().pick_folder()
+}
+
+#[cfg(windows)]
+#[tauri::command]
+fn move_storage(
+    destination: std::path::PathBuf,
+    settings: tauri::State<'_, Arc<ApplicationSettings>>,
+) -> Result<services::storage_location::StorageLocation, String> {
+    settings.move_storage(destination)
+}
+
+#[cfg(windows)]
+#[tauri::command]
 #[allow(clippy::too_many_arguments)]
 fn restore_backup(
     settings: tauri::State<'_, Arc<ApplicationSettings>>,
@@ -2518,11 +2569,12 @@ pub fn run() {
                 .as_ref()
                 .map(|directory| directory.join("capture-sound.wav"))
                 .unwrap_or_default();
-            let (repository, user_settings, excluded_applications, loaded_records) = app
-                .path()
-                .app_data_dir()
-                .ok()
-                .and_then(|directory| SqliteRepository::open_app_data(&directory).ok())
+            let (repository, user_settings, excluded_applications, loaded_records) = app_data_dir
+                .as_ref()
+                .and_then(|directory| {
+                    services::storage_location::resolve_database_path(directory).ok()
+                })
+                .and_then(|path| SqliteRepository::open(path).ok())
                 .and_then(|repository| {
                     let settings = repository.load_settings().ok()?;
                     repository
@@ -2620,6 +2672,7 @@ pub fn run() {
                 storage_available,
                 hotkey_status: Mutex::new(HotkeyStatus::Unavailable),
                 custom_sound_path,
+                app_data_dir: app_data_dir.unwrap_or_default(),
                 capture_policy,
                 mutation_coordinator,
                 recognition,
@@ -2841,6 +2894,9 @@ pub fn run() {
             preview_capture_sound,
             export_backup,
             restore_backup,
+            get_storage_location,
+            choose_storage_location,
+            move_storage,
             update_shortcuts,
             exit_application
         ]);

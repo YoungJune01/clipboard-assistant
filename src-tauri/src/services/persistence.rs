@@ -43,9 +43,10 @@ use crate::services::session_records::{
     MAX_CAPTURE_RECORD_BYTES, MAX_DETAIL_FILE_LIST_BYTES, MAX_DETAIL_FILE_LIST_PATHS,
     MAX_DETAIL_TEXT_BYTES, REPRESENTATION_OVERHEAD_BYTES,
 };
+use crate::services::storage_location::{self, StorageLocation};
 
 const SCHEMA_VERSION: i64 = 6;
-const DATABASE_FILE: &str = "clipboard-history.sqlite3";
+pub(crate) const DATABASE_FILE: &str = "clipboard-history.sqlite3";
 const MIGRATION_TEMP_SUFFIX: &str = ".migrate-v2";
 const MIGRATION_BACKUP_SUFFIX: &str = ".migrate-v1-backup";
 const DEFAULT_HISTORY_PAGE_LIMIT: usize = 50;
@@ -284,6 +285,11 @@ enum PersistenceCommand {
         RestoreBudget,
         mpsc::SyncSender<Result<RestoredData, PersistenceError>>,
     ),
+    MoveStorage(
+        PathBuf,
+        PathBuf,
+        mpsc::SyncSender<Result<StorageLocation, PersistenceError>>,
+    ),
 }
 
 enum PersistenceControl {
@@ -337,6 +343,13 @@ trait PersistenceBackend: Send + Sync {
         source: &Path,
         budget: RestoreBudget,
     ) -> Result<RestoredData, PersistenceError>;
+    fn move_storage(
+        &self,
+        _destination: &Path,
+        _app_data: &Path,
+    ) -> Result<StorageLocation, PersistenceError> {
+        Err(PersistenceError::WorkerUnavailable)
+    }
 }
 
 static THREAD_REAPER: LazyLock<Sender<JoinHandle<()>>> = LazyLock::new(|| {
@@ -478,6 +491,28 @@ impl PersistenceWorker {
         response
             .recv_timeout(BACKUP_WORKER_TIMEOUT)
             .map_err(|_| PersistenceError::WorkerUnavailable)?
+    }
+
+    pub(crate) fn move_storage(
+        &self,
+        destination: PathBuf,
+        app_data: PathBuf,
+    ) -> Result<StorageLocation, PersistenceError> {
+        let (reply, response) = mpsc::sync_channel(1);
+        self.enqueue(PersistenceCommand::MoveStorage(
+            destination,
+            app_data,
+            reply,
+        ))?;
+        response
+            .recv_timeout(BACKUP_WORKER_TIMEOUT)
+            .map_err(|_| PersistenceError::WorkerUnavailable)?
+    }
+
+    pub(crate) fn storage_location(&self, app_data: &Path) -> Option<StorageLocation> {
+        self.reader
+            .as_ref()
+            .map(|repository| storage_location::describe(&repository.path(), app_data))
     }
 
     fn enqueue(&self, command: PersistenceCommand) -> Result<(), PersistenceError> {
@@ -767,6 +802,9 @@ fn run_persistence_worker(
                 }
                 let _ = reply.send(result);
             }
+            PersistenceCommand::MoveStorage(destination, app_data, reply) => {
+                let _ = reply.send(repository.move_storage(&destination, &app_data));
+            }
         }
         processed = processed.saturating_add(1);
     }
@@ -797,12 +835,14 @@ fn reply_unavailable(command: PersistenceCommand) {
         PersistenceCommand::Restore(_, _, reply) => {
             let _ = reply.send(Err(PersistenceError::WorkerUnavailable));
         }
+        PersistenceCommand::MoveStorage(_, _, reply) => {
+            let _ = reply.send(Err(PersistenceError::WorkerUnavailable));
+        }
     }
 }
 
 pub struct SqliteRepository {
-    path: PathBuf,
-    connection: Mutex<Connection>,
+    state: Mutex<RepositoryState>,
     quota: DiskQuota,
     migration_locks: Arc<dyn MigrationLockProvider>,
     #[cfg(test)]
@@ -811,6 +851,27 @@ pub struct SqliteRepository {
     fail_next_restore_rollback: AtomicBool,
     #[cfg(test)]
     pause_after_restore_source_snapshot: Mutex<Option<Arc<(Barrier, Barrier)>>>,
+}
+
+struct RepositoryState {
+    path: PathBuf,
+    connection: Connection,
+}
+
+#[cfg(test)]
+impl std::ops::Deref for RepositoryState {
+    type Target = Connection;
+
+    fn deref(&self) -> &Self::Target {
+        &self.connection
+    }
+}
+
+#[cfg(test)]
+impl std::ops::DerefMut for RepositoryState {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.connection
+    }
 }
 
 impl SqliteRepository {
@@ -860,8 +921,7 @@ impl SqliteRepository {
         migrate(&mut connection)?;
         drop(migration_guard);
         Ok(Arc::new(Self {
-            path,
-            connection: Mutex::new(connection),
+            state: Mutex::new(RepositoryState { path, connection }),
             quota,
             migration_locks,
             #[cfg(test)]
@@ -873,25 +933,28 @@ impl SqliteRepository {
         }))
     }
 
-    pub fn path(&self) -> &Path {
-        &self.path
+    pub fn path(&self) -> PathBuf {
+        lock_unpoisoned(&self.state).path.clone()
     }
 
     pub fn schema_version(&self) -> Result<i64, PersistenceError> {
-        lock_unpoisoned(&self.connection)
+        lock_unpoisoned(&self.state)
+            .connection
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .map_err(Into::into)
     }
 
     fn backup_to(&self, destination: &Path) -> Result<(), PersistenceError> {
-        if same_file_path(&self.path, destination) {
+        let state = lock_unpoisoned(&self.state);
+        if same_file_path(&state.path, destination) {
             return Err(PersistenceError::InvalidData);
         }
         let temporary = backup_work_path(destination, ".exporting");
         remove_path_and_sidecars(&temporary)?;
         let result = (|| {
-            let connection = lock_unpoisoned(&self.connection);
-            connection.backup(rusqlite::MAIN_DB, &temporary, None)?;
+            state
+                .connection
+                .backup(rusqlite::MAIN_DB, &temporary, None)?;
             validate_backup_file(&temporary)?;
             if destination.exists() {
                 fs::remove_file(destination).map_err(PersistenceError::FileOperation)?;
@@ -905,15 +968,64 @@ impl SqliteRepository {
         result
     }
 
+    pub(crate) fn move_to_directory(
+        &self,
+        destination: &Path,
+        app_data: &Path,
+    ) -> Result<StorageLocation, PersistenceError> {
+        let mut state = lock_unpoisoned(&self.state);
+        let current_directory = state
+            .path
+            .parent()
+            .ok_or(PersistenceError::InvalidData)?
+            .to_path_buf();
+        storage_location::validate_destination(destination, &current_directory)?;
+        fs::create_dir_all(destination).map_err(PersistenceError::CreateDirectory)?;
+        let staging = destination.join(format!(".migrating-{}", uuid::Uuid::new_v4()));
+        let staged_database = staging.join(DATABASE_FILE);
+        let destination_database = destination.join(DATABASE_FILE);
+        let result = (|| {
+            fs::create_dir(&staging).map_err(PersistenceError::CreateDirectory)?;
+            state
+                .connection
+                .backup(rusqlite::MAIN_DB, &staged_database, None)?;
+            validate_backup_file(&staged_database)?;
+            fs::rename(&staged_database, &destination_database)
+                .map_err(PersistenceError::FileOperation)?;
+            let replacement = Connection::open(&destination_database)?;
+            replacement.busy_timeout(std::time::Duration::from_secs(2))?;
+            replacement.pragma_update(None, "foreign_keys", "ON")?;
+            let integrity: String =
+                replacement.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
+            if integrity != "ok"
+                || database_version_from_connection(&replacement)? != SCHEMA_VERSION
+            {
+                return Err(PersistenceError::InvalidData);
+            }
+            storage_location::write_bootstrap(app_data, destination)?;
+            let old_path = std::mem::replace(&mut state.path, destination_database.clone());
+            let old_connection = std::mem::replace(&mut state.connection, replacement);
+            drop(old_connection);
+            let _ = remove_path_and_sidecars(&old_path);
+            Ok(storage_location::describe(&state.path, app_data))
+        })();
+        let _ = fs::remove_dir_all(&staging);
+        if result.is_err() && state.path != destination_database {
+            let _ = remove_path_and_sidecars(&destination_database);
+        }
+        result
+    }
+
     pub(crate) fn restore_from(
         &self,
         source: &Path,
         budget: RestoreBudget,
     ) -> Result<RestoredData, PersistenceError> {
-        if same_file_path(&self.path, source) {
+        let mut state = lock_unpoisoned(&self.state);
+        if same_file_path(&state.path, source) {
             return Err(PersistenceError::InvalidData);
         }
-        let source_snapshot = backup_work_path(&self.path, ".restore-source");
+        let source_snapshot = backup_work_path(&state.path, ".restore-source");
         remove_path_and_sidecars(&source_snapshot)?;
         let snapshot_result = snapshot_backup_file(source, &source_snapshot);
         if let Err(error) = snapshot_result {
@@ -936,9 +1048,9 @@ impl SqliteRepository {
             return Err(error);
         }
 
-        let rollback = backup_work_path(&self.path, ".restore-rollback");
+        let rollback = backup_work_path(&state.path, ".restore-rollback");
         remove_path_and_sidecars(&rollback)?;
-        let mut connection = lock_unpoisoned(&self.connection);
+        let connection = &mut state.connection;
         connection.backup(rusqlite::MAIN_DB, &rollback, None)?;
         let restore_result = (|| {
             connection.restore(
@@ -949,11 +1061,11 @@ impl SqliteRepository {
             connection.pragma_update(None, "foreign_keys", "ON")?;
             let integrity: String =
                 connection.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
-            if integrity != "ok" || database_version_from_connection(&connection)? != SCHEMA_VERSION
+            if integrity != "ok" || database_version_from_connection(connection)? != SCHEMA_VERSION
             {
                 return Err(PersistenceError::InvalidData);
             }
-            validate_restore_connection(&connection, budget.max_record_bytes)?;
+            validate_restore_connection(connection, budget.max_record_bytes)?;
             let transaction = connection.transaction()?;
             enforce_disk_quota(&transaction, self.quota)?;
             transaction.commit()?;
@@ -964,11 +1076,11 @@ impl SqliteRepository {
             {
                 return Err(PersistenceError::WorkerUnavailable);
             }
-            let settings = load_settings_from_connection(&connection)?;
-            let excluded_applications = load_excluded_applications_from_connection(&connection)?;
-            let groups = load_groups_from_connection(&connection)?;
+            let settings = load_settings_from_connection(connection)?;
+            let excluded_applications = load_excluded_applications_from_connection(connection)?;
+            let groups = load_groups_from_connection(connection)?;
             let page = load_page_from_connection(
-                &connection,
+                connection,
                 HistoryQuery {
                     limit: 100,
                     ..HistoryQuery::default()
@@ -1035,24 +1147,24 @@ impl SqliteRepository {
         &self,
         max_record_bytes: usize,
     ) -> Result<(), PersistenceError> {
-        let connection = lock_unpoisoned(&self.connection);
-        validate_restore_connection(&connection, max_record_bytes)
+        let state = lock_unpoisoned(&self.state);
+        validate_restore_connection(&state.connection, max_record_bytes)
     }
 
     pub fn load_settings(&self) -> Result<UserSettings, PersistenceError> {
-        load_settings_from_connection(&lock_unpoisoned(&self.connection))
+        load_settings_from_connection(&lock_unpoisoned(&self.state).connection)
     }
 
     pub fn load_groups(&self) -> Result<Vec<(GroupId, String)>, PersistenceError> {
-        load_groups_from_connection(&lock_unpoisoned(&self.connection))
+        load_groups_from_connection(&lock_unpoisoned(&self.state).connection)
     }
 
     pub fn save_group(&self, id: GroupId, name: &str) -> Result<(), PersistenceError> {
+        let mut state = lock_unpoisoned(&self.state);
         let _migration_guard = self
             .migration_locks
-            .acquire(&self.path, MIGRATION_LOCK_TIMEOUT)?;
-        let mut connection = lock_unpoisoned(&self.connection);
-        let transaction = connection.transaction()?;
+            .acquire(&state.path, MIGRATION_LOCK_TIMEOUT)?;
+        let transaction = state.connection.transaction()?;
         transaction.execute(
             "INSERT INTO clipboard_groups(id, name, position) \
              VALUES (?1, ?2, COALESCE((SELECT MAX(position) + 1 FROM clipboard_groups), 0)) \
@@ -1065,11 +1177,11 @@ impl SqliteRepository {
     }
 
     pub fn save_group_order(&self, ids: &[GroupId]) -> Result<(), PersistenceError> {
+        let mut state = lock_unpoisoned(&self.state);
         let _migration_guard = self
             .migration_locks
-            .acquire(&self.path, MIGRATION_LOCK_TIMEOUT)?;
-        let mut connection = lock_unpoisoned(&self.connection);
-        let transaction = connection.transaction()?;
+            .acquire(&state.path, MIGRATION_LOCK_TIMEOUT)?;
+        let transaction = state.connection.transaction()?;
         for (position, id) in ids.iter().enumerate() {
             let changed = transaction.execute(
                 "UPDATE clipboard_groups SET position = ?1 WHERE id = ?2",
@@ -1084,11 +1196,11 @@ impl SqliteRepository {
     }
 
     pub fn delete_group(&self, id: GroupId) -> Result<usize, PersistenceError> {
+        let mut state = lock_unpoisoned(&self.state);
         let _migration_guard = self
             .migration_locks
-            .acquire(&self.path, MIGRATION_LOCK_TIMEOUT)?;
-        let mut connection = lock_unpoisoned(&self.connection);
-        let transaction = connection.transaction()?;
+            .acquire(&state.path, MIGRATION_LOCK_TIMEOUT)?;
+        let transaction = state.connection.transaction()?;
         let record_ids = record_ids_in_group(&transaction, id)?;
         let moved = transaction.execute(
             "UPDATE clipboard_records SET group_id = NULL WHERE group_id = ?1",
@@ -1109,11 +1221,11 @@ impl SqliteRepository {
     }
 
     pub fn save_settings(&self, settings: UserSettings) -> Result<(), PersistenceError> {
+        let mut state = lock_unpoisoned(&self.state);
         let _migration_guard = self
             .migration_locks
-            .acquire(&self.path, MIGRATION_LOCK_TIMEOUT)?;
-        let mut connection = lock_unpoisoned(&self.connection);
-        let transaction = connection.transaction()?;
+            .acquire(&state.path, MIGRATION_LOCK_TIMEOUT)?;
+        let transaction = state.connection.transaction()?;
         save_setting(&transaction, "language", language_value(settings.language))?;
         save_setting(
             &transaction,
@@ -1203,11 +1315,11 @@ impl SqliteRepository {
         qr_text: Option<&str>,
         status: &str,
     ) -> Result<(), PersistenceError> {
+        let mut state = lock_unpoisoned(&self.state);
         let _migration_guard = self
             .migration_locks
-            .acquire(&self.path, MIGRATION_LOCK_TIMEOUT)?;
-        let mut connection = lock_unpoisoned(&self.connection);
-        let transaction = connection.transaction()?;
+            .acquire(&state.path, MIGRATION_LOCK_TIMEOUT)?;
+        let transaction = state.connection.transaction()?;
         if !record_exists(&transaction, id)? {
             return Err(PersistenceError::InvalidData);
         }
@@ -1237,11 +1349,11 @@ impl SqliteRepository {
         storage_limit: StorageLimit,
         evict_favorites_when_full: bool,
     ) -> Result<usize, PersistenceError> {
+        let mut state = lock_unpoisoned(&self.state);
         let _migration_guard = self
             .migration_locks
-            .acquire(&self.path, MIGRATION_LOCK_TIMEOUT)?;
-        let mut connection = lock_unpoisoned(&self.connection);
-        let transaction = connection.transaction()?;
+            .acquire(&state.path, MIGRATION_LOCK_TIMEOUT)?;
+        let transaction = state.connection.transaction()?;
         save_setting(
             &transaction,
             "storage_limit",
@@ -1254,23 +1366,23 @@ impl SqliteRepository {
         )?;
         let removed = enforce_disk_quota(&transaction, self.quota)?;
         transaction.commit()?;
-        incremental_vacuum(&connection, self.quota)?;
+        incremental_vacuum(&state.connection, self.quota)?;
         Ok(removed)
     }
 
     pub fn load_excluded_applications(&self) -> Result<Vec<String>, PersistenceError> {
-        load_excluded_applications_from_connection(&lock_unpoisoned(&self.connection))
+        load_excluded_applications_from_connection(&lock_unpoisoned(&self.state).connection)
     }
 
     pub fn save_excluded_applications(
         &self,
         applications: &[String],
     ) -> Result<(), PersistenceError> {
+        let mut state = lock_unpoisoned(&self.state);
         let _migration_guard = self
             .migration_locks
-            .acquire(&self.path, MIGRATION_LOCK_TIMEOUT)?;
-        let mut connection = lock_unpoisoned(&self.connection);
-        let transaction = connection.transaction()?;
+            .acquire(&state.path, MIGRATION_LOCK_TIMEOUT)?;
+        let transaction = state.connection.transaction()?;
         let value =
             serde_json::to_string(applications).map_err(|_| PersistenceError::InvalidData)?;
         save_setting(&transaction, "excluded_applications", &value)?;
@@ -1283,11 +1395,11 @@ impl SqliteRepository {
         retention: RetentionPeriod,
         now: DateTime<Utc>,
     ) -> Result<usize, PersistenceError> {
+        let mut state = lock_unpoisoned(&self.state);
         let _migration_guard = self
             .migration_locks
-            .acquire(&self.path, MIGRATION_LOCK_TIMEOUT)?;
-        let mut connection = lock_unpoisoned(&self.connection);
-        let transaction = connection.transaction()?;
+            .acquire(&state.path, MIGRATION_LOCK_TIMEOUT)?;
+        let transaction = state.connection.transaction()?;
         let before = record_count(&transaction)?;
         if let Some(days) = retention.days() {
             let cutoff = now - Duration::days(days);
@@ -1299,7 +1411,7 @@ impl SqliteRepository {
         enforce_disk_quota(&transaction, self.quota)?;
         let after = record_count(&transaction)?;
         transaction.commit()?;
-        incremental_vacuum(&connection, self.quota)?;
+        incremental_vacuum(&state.connection, self.quota)?;
         Ok(before.saturating_sub(after))
     }
 
@@ -1312,34 +1424,34 @@ impl SqliteRepository {
     }
 
     pub fn load_page(&self, query: HistoryQuery) -> Result<HistoryPage, PersistenceError> {
-        let connection = lock_unpoisoned(&self.connection);
-        load_page_from_connection(&connection, query)
+        let state = lock_unpoisoned(&self.state);
+        load_page_from_connection(&state.connection, query)
     }
 
     pub fn search_history(
         &self,
         query: crate::services::search::SearchQuery,
     ) -> Result<crate::services::search::SearchPage, PersistenceError> {
-        let connection = lock_unpoisoned(&self.connection);
-        crate::services::search::search_connection(&connection, query)
+        let state = lock_unpoisoned(&self.state);
+        crate::services::search::search_connection(&state.connection, query)
     }
 
     pub fn full_record(&self, id: RecordId) -> Result<ClipboardRecord, PersistenceError> {
-        let connection = lock_unpoisoned(&self.connection);
-        let row = load_db_record(&connection, id)?;
-        validate_record_metadata(&connection, &row)?;
-        let representations = load_representations(&connection, &row.id)?;
-        let note = load_note(&connection, &row.id)?;
+        let state = lock_unpoisoned(&self.state);
+        let row = load_db_record(&state.connection, id)?;
+        validate_record_metadata(&state.connection, &row)?;
+        let representations = load_representations(&state.connection, &row.id)?;
+        let note = load_note(&state.connection, &row.id)?;
         row.into_record(representations, note)
     }
 
     pub fn record_details(&self, id: RecordId) -> Result<PersistedRecordDetails, PersistenceError> {
-        let connection = lock_unpoisoned(&self.connection);
-        let row = load_db_record(&connection, id)?;
-        validate_record_metadata(&connection, &row)?;
-        let representations = load_representation_details(&connection, &row.id)?;
+        let state = lock_unpoisoned(&self.state);
+        let row = load_db_record(&state.connection, id)?;
+        validate_record_metadata(&state.connection, &row)?;
+        let representations = load_representation_details(&state.connection, &row.id)?;
         let content_kind = content_kind_from_details(&representations);
-        let note = load_note(&connection, &row.id)?
+        let note = load_note(&state.connection, &row.id)?
             .map(RecordNote::new)
             .transpose()
             .map_err(|_| PersistenceError::InvalidData)?;
@@ -1371,8 +1483,8 @@ impl SqliteRepository {
         if budget.max_records == 0 || budget.max_total_bytes == 0 {
             return Ok(Vec::new());
         }
-        let connection = lock_unpoisoned(&self.connection);
-        let mut statement = connection.prepare(
+        let state = lock_unpoisoned(&self.state);
+        let mut statement = state.connection.prepare(
             "SELECT id, content_identity, captured_at, source_application, source_path, \
                     typeof(note), length(CAST(note AS BLOB)), group_id, pinned, favorite, sensitive \
              FROM clipboard_records ORDER BY captured_at DESC, id DESC",
@@ -1396,7 +1508,7 @@ impl SqliteRepository {
         let mut total_bytes = 0_usize;
         for row in rows {
             let row = row?;
-            let Some(record_bytes) = representation_metadata_bytes(&connection, &row)? else {
+            let Some(record_bytes) = representation_metadata_bytes(&state.connection, &row)? else {
                 continue;
             };
             if record_bytes > budget.max_record_bytes {
@@ -1408,10 +1520,10 @@ impl SqliteRepository {
             if next_total > budget.max_total_bytes {
                 break;
             }
-            let Ok(representations) = load_representations(&connection, &row.id) else {
+            let Ok(representations) = load_representations(&state.connection, &row.id) else {
                 continue;
             };
-            let Ok(note) = load_note(&connection, &row.id) else {
+            let Ok(note) = load_note(&state.connection, &row.id) else {
                 continue;
             };
             let Ok(record) = row.into_record(representations, note) else {
@@ -1427,11 +1539,11 @@ impl SqliteRepository {
     }
 
     fn save_record_inner(&self, record: &ClipboardRecord) -> Result<(), PersistenceError> {
+        let mut state = lock_unpoisoned(&self.state);
         let _migration_guard = self
             .migration_locks
-            .acquire(&self.path, MIGRATION_LOCK_TIMEOUT)?;
-        let mut connection = lock_unpoisoned(&self.connection);
-        let transaction = connection.transaction()?;
+            .acquire(&state.path, MIGRATION_LOCK_TIMEOUT)?;
+        let transaction = state.connection.transaction()?;
         write_record(&transaction, record)?;
         let removed = enforce_disk_quota(&transaction, self.quota)?;
         if !record_exists(&transaction, record.id)? {
@@ -1439,7 +1551,7 @@ impl SqliteRepository {
         }
         transaction.commit()?;
         if removed > 0 {
-            incremental_vacuum(&connection, self.quota)?;
+            incremental_vacuum(&state.connection, self.quota)?;
         }
         Ok(())
     }
@@ -1550,11 +1662,11 @@ impl RecordPersistence for SqliteRepository {
     }
 
     fn update_note(&self, id: RecordId, note: Option<&RecordNote>) -> Result<(), PersistenceError> {
+        let mut state = lock_unpoisoned(&self.state);
         let _migration_guard = self
             .migration_locks
-            .acquire(&self.path, MIGRATION_LOCK_TIMEOUT)?;
-        let mut connection = lock_unpoisoned(&self.connection);
-        let transaction = connection.transaction()?;
+            .acquire(&state.path, MIGRATION_LOCK_TIMEOUT)?;
+        let transaction = state.connection.transaction()?;
         let changed = transaction.execute(
             "UPDATE clipboard_records SET note = ?1 WHERE id = ?2",
             params![note.map(RecordNote::as_str), id.as_uuid().to_string()],
@@ -1569,7 +1681,7 @@ impl RecordPersistence for SqliteRepository {
         }
         transaction.commit()?;
         if removed > 0 {
-            incremental_vacuum(&connection, self.quota)?;
+            incremental_vacuum(&state.connection, self.quota)?;
         }
         Ok(())
     }
@@ -1579,25 +1691,27 @@ impl RecordPersistence for SqliteRepository {
     }
 
     fn delete_record(&self, id: RecordId) -> Result<(), PersistenceError> {
+        let state = lock_unpoisoned(&self.state);
         let _migration_guard = self
             .migration_locks
-            .acquire(&self.path, MIGRATION_LOCK_TIMEOUT)?;
-        let connection = lock_unpoisoned(&self.connection);
-        connection.execute(
+            .acquire(&state.path, MIGRATION_LOCK_TIMEOUT)?;
+        state.connection.execute(
             "DELETE FROM clipboard_records WHERE id = ?1",
             [id.as_uuid().to_string()],
         )?;
-        incremental_vacuum(&connection, self.quota)?;
+        incremental_vacuum(&state.connection, self.quota)?;
         Ok(())
     }
 
     fn clear_records(&self) -> Result<usize, PersistenceError> {
+        let state = lock_unpoisoned(&self.state);
         let _migration_guard = self
             .migration_locks
-            .acquire(&self.path, MIGRATION_LOCK_TIMEOUT)?;
-        let connection = lock_unpoisoned(&self.connection);
-        let removed = connection.execute("DELETE FROM clipboard_records", [])?;
-        incremental_vacuum(&connection, self.quota)?;
+            .acquire(&state.path, MIGRATION_LOCK_TIMEOUT)?;
+        let removed = state
+            .connection
+            .execute("DELETE FROM clipboard_records", [])?;
+        incremental_vacuum(&state.connection, self.quota)?;
         Ok(removed)
     }
 
@@ -1689,6 +1803,14 @@ impl PersistenceBackend for SqliteRepository {
         budget: RestoreBudget,
     ) -> Result<RestoredData, PersistenceError> {
         self.restore_from(source, budget)
+    }
+
+    fn move_storage(
+        &self,
+        destination: &Path,
+        app_data: &Path,
+    ) -> Result<StorageLocation, PersistenceError> {
+        self.move_to_directory(destination, app_data)
     }
 }
 
@@ -3774,6 +3896,140 @@ mod tests {
     }
 
     #[test]
+    fn moving_storage_preserves_data_reopens_from_bootstrap_and_stays_writable() {
+        let root = tempdir().unwrap();
+        let app_data = root.path().join("app-data");
+        let destination = root.path().join("custom-storage");
+        fs::create_dir_all(&app_data).unwrap();
+        let original_path = app_data.join(DATABASE_FILE);
+        let repository = SqliteRepository::open(original_path.clone()).unwrap();
+        let group = GroupId::new();
+        repository.save_group(group, "Accounts").unwrap();
+        let mut expected = text_record("move-record", Utc::now(), "saved before move");
+        expected.group_id = Some(group);
+        expected.note = Some(RecordNote::new("work account").unwrap());
+        repository.save_record(&expected).unwrap();
+        repository
+            .save_recognition(
+                expected.id,
+                Some("recognized invoice"),
+                Some("https://example.test/account"),
+                "complete",
+            )
+            .unwrap();
+        let settings = UserSettings {
+            language: Language::En,
+            retention: RetentionPeriod::Forever,
+            accent_color: AccentColor::Rose,
+            ..UserSettings::default()
+        };
+        repository.save_settings(settings).unwrap();
+        repository
+            .save_excluded_applications(&["KeePass.exe".to_owned()])
+            .unwrap();
+
+        let location = repository
+            .move_to_directory(&destination, &app_data)
+            .unwrap();
+        let destination_path = destination.join(DATABASE_FILE);
+
+        assert_eq!(location.database_path, destination_path);
+        assert!(!location.is_default);
+        assert_eq!(repository.path(), destination_path);
+        assert!(!original_path.exists());
+        assert_eq!(repository.load_recent(10).unwrap(), vec![expected.clone()]);
+        assert_eq!(
+            repository.load_groups().unwrap(),
+            vec![(group, "Accounts".to_owned())]
+        );
+        assert_eq!(repository.load_settings().unwrap(), settings);
+        assert_eq!(
+            repository.load_excluded_applications().unwrap(),
+            vec!["KeePass.exe".to_owned()]
+        );
+        let recognized = repository.load_page(HistoryQuery::default()).unwrap();
+        let recognized = recognized
+            .records
+            .iter()
+            .find(|record| record.id == expected.id)
+            .unwrap();
+        assert_eq!(recognized.ocr_text.as_deref(), Some("recognized invoice"));
+        assert_eq!(
+            recognized.qr_text.as_deref(),
+            Some("https://example.test/account")
+        );
+
+        let after_move = text_record("after-move", Utc::now(), "saved without restart");
+        repository.save_record(&after_move).unwrap();
+        drop(repository);
+
+        let resolved = storage_location::resolve_database_path(&app_data).unwrap();
+        assert_eq!(resolved, destination_path);
+        let reopened = SqliteRepository::open(resolved).unwrap();
+        let records = reopened.load_recent(10).unwrap();
+        assert_eq!(records.len(), 2);
+        assert!(records.contains(&expected));
+        assert!(records.contains(&after_move));
+    }
+
+    #[test]
+    fn rejected_storage_move_keeps_the_original_database_active_and_cleans_staging() {
+        let root = tempdir().unwrap();
+        let app_data = root.path().join("app-data");
+        let destination = root.path().join("occupied");
+        fs::create_dir_all(&app_data).unwrap();
+        fs::create_dir_all(&destination).unwrap();
+        fs::write(destination.join("keep.txt"), b"occupied").unwrap();
+        let original_path = app_data.join(DATABASE_FILE);
+        let repository = SqliteRepository::open(original_path.clone()).unwrap();
+        let expected = text_record("original", Utc::now(), "still available");
+        repository.save_record(&expected).unwrap();
+
+        assert!(
+            repository
+                .move_to_directory(&destination, &app_data)
+                .is_err()
+        );
+
+        assert_eq!(repository.path(), original_path);
+        assert_eq!(repository.load_recent(10).unwrap(), vec![expected]);
+        assert!(!app_data.join("storage-location.json").exists());
+        assert_eq!(
+            fs::read_dir(&destination)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<Vec<_>>(),
+            vec![std::ffi::OsString::from("keep.txt")]
+        );
+    }
+
+    #[test]
+    fn queued_storage_move_orders_writes_and_keeps_worker_available() {
+        let root = tempdir().unwrap();
+        let app_data = root.path().join("app-data");
+        let destination = root.path().join("custom-storage");
+        fs::create_dir_all(&app_data).unwrap();
+        let repository = SqliteRepository::open(app_data.join(DATABASE_FILE)).unwrap();
+        let available = Arc::new(AtomicBool::new(true));
+        let worker =
+            PersistenceWorker::start(Arc::clone(&repository), Arc::clone(&available)).unwrap();
+        let before = text_record("queued-before", Utc::now(), "before move");
+        let after = text_record("queued-after", Utc::now(), "after move");
+
+        worker.save_record(&before).unwrap();
+        worker
+            .move_storage(destination.clone(), app_data.clone())
+            .unwrap();
+        worker.save_record(&after).unwrap();
+
+        assert!(available.load(Ordering::Acquire));
+        assert_eq!(repository.path(), destination.join(DATABASE_FILE));
+        let records = repository.load_recent(10).unwrap();
+        assert!(records.contains(&before));
+        assert!(records.contains(&after));
+    }
+
+    #[test]
     fn restore_snapshot_failure_rolls_back_and_keeps_the_worker_available() {
         let directory = tempdir().unwrap();
         let live = SqliteRepository::open(directory.path().join("live.sqlite3")).unwrap();
@@ -4007,7 +4263,7 @@ mod tests {
         let source = SqliteRepository::open(source_path.clone()).unwrap();
         let source_record = text_record("source", Utc::now(), "replace me");
         source.save_record(&source_record).unwrap();
-        lock_unpoisoned(&source.connection)
+        lock_unpoisoned(&source.state)
             .execute(
                 "UPDATE clipboard_representations
                  SET kind = ?1, text_value = NULL, blob_value = ?2
@@ -4465,7 +4721,7 @@ mod tests {
         repository.save_record(&valid).unwrap();
         let malformed = text_record("malformed", Utc::now(), "bad");
         repository.save_record(&malformed).unwrap();
-        lock_unpoisoned(&repository.connection)
+        lock_unpoisoned(&repository.state)
             .execute(
                 "UPDATE clipboard_representations
              SET kind = 'file_list', text_value = '[\"bad\\u0000path\"]', blob_value = NULL
@@ -4689,7 +4945,7 @@ mod tests {
                 ..UserSettings::default()
             })
             .unwrap();
-        let connection = lock_unpoisoned(&repository.connection);
+        let connection = lock_unpoisoned(&repository.state);
 
         assert_eq!(
             effective_quota_limits(&connection, repository.quota).unwrap(),
@@ -4702,7 +4958,7 @@ mod tests {
                 ..UserSettings::default()
             })
             .unwrap();
-        let connection = lock_unpoisoned(&repository.connection);
+        let connection = lock_unpoisoned(&repository.state);
         assert_eq!(
             effective_quota_limits(&connection, repository.quota).unwrap(),
             (None, Some(10 * 1024 * 1024 * 1024))
@@ -4714,7 +4970,7 @@ mod tests {
                 ..UserSettings::default()
             })
             .unwrap();
-        let connection = lock_unpoisoned(&repository.connection);
+        let connection = lock_unpoisoned(&repository.state);
         assert_eq!(
             effective_quota_limits(&connection, repository.quota).unwrap(),
             (None, None)
@@ -4743,7 +4999,7 @@ mod tests {
             ))
             .unwrap();
         {
-            let mut connection = lock_unpoisoned(&repository.connection);
+            let mut connection = lock_unpoisoned(&repository.state);
             let transaction = connection.transaction().unwrap();
             write_record(
                 &transaction,
@@ -4784,7 +5040,7 @@ mod tests {
         let mut favorite = text_record("favorite", now, "favorite");
         favorite.favorite = true;
         {
-            let mut connection = lock_unpoisoned(&repository.connection);
+            let mut connection = lock_unpoisoned(&repository.state);
             let transaction = connection.transaction().unwrap();
             write_record(&transaction, &favorite).unwrap();
             write_record(
@@ -4805,7 +5061,7 @@ mod tests {
         {
             let mut latest = text_record("latest", now + Duration::seconds(2), "latest");
             latest.favorite = true;
-            let mut connection = lock_unpoisoned(&repository.connection);
+            let mut connection = lock_unpoisoned(&repository.state);
             let transaction = connection.transaction().unwrap();
             write_record(&transaction, &latest).unwrap();
             transaction.commit().unwrap();
@@ -4836,7 +5092,7 @@ mod tests {
         let source = SqliteRepository::open(source_path.clone()).unwrap();
         let oversized = text_record("oversized", Utc::now(), "placeholder");
         source.save_record(&oversized).unwrap();
-        lock_unpoisoned(&source.connection)
+        lock_unpoisoned(&source.state)
             .execute(
                 "UPDATE clipboard_representations
                  SET kind = 'png', text_value = NULL, blob_value = zeroblob(?1)
@@ -4872,7 +5128,7 @@ mod tests {
         for record in [&oldest, &middle, &malformed, &newest] {
             repository.save_record(record).unwrap();
         }
-        lock_unpoisoned(&repository.connection)
+        lock_unpoisoned(&repository.state)
             .execute(
                 "UPDATE clipboard_records SET content_kind = 'corrupt'
                  WHERE id = ?1",
@@ -4935,7 +5191,7 @@ mod tests {
         repository.save_record(&pinned).unwrap();
         repository.save_record(&favorite).unwrap();
         {
-            let mut connection = lock_unpoisoned(&repository.connection);
+            let mut connection = lock_unpoisoned(&repository.state);
             let transaction = connection.transaction().unwrap();
             write_record(
                 &transaction,
@@ -5008,7 +5264,7 @@ mod tests {
         repository.save_record(&small).unwrap();
         let oversized_id = RecordId::new();
         {
-            let connection = lock_unpoisoned(&repository.connection);
+            let connection = lock_unpoisoned(&repository.state);
             connection
                 .execute(
                     "INSERT INTO clipboard_records (
@@ -5052,7 +5308,7 @@ mod tests {
         let record = text_record("oversized-details", Utc::now(), "caption");
         repository.save_record(&record).unwrap();
         {
-            let connection = lock_unpoisoned(&repository.connection);
+            let connection = lock_unpoisoned(&repository.state);
             connection
                 .execute(
                     "UPDATE clipboard_representations
@@ -5108,7 +5364,7 @@ mod tests {
         repository.save_record(&valid).unwrap();
         let malformed_id = RecordId::new();
         {
-            let connection = lock_unpoisoned(&repository.connection);
+            let connection = lock_unpoisoned(&repository.state);
             connection
                 .execute(
                     "INSERT INTO clipboard_records (
@@ -5190,7 +5446,7 @@ mod tests {
                 now + Duration::seconds(index),
                 "x",
             );
-            let mut connection = lock_unpoisoned(&repository.connection);
+            let mut connection = lock_unpoisoned(&repository.state);
             save_record_transaction(&mut connection, &item).unwrap();
         }
 
@@ -5232,7 +5488,7 @@ mod tests {
     fn sqlite_uses_incremental_auto_vacuum() {
         let directory = tempdir().unwrap();
         let repository = SqliteRepository::open(directory.path().join("history.sqlite3")).unwrap();
-        let mode: i64 = lock_unpoisoned(&repository.connection)
+        let mode: i64 = lock_unpoisoned(&repository.state)
             .query_row("PRAGMA auto_vacuum", [], |row| row.get(0))
             .unwrap();
 
@@ -5247,7 +5503,7 @@ mod tests {
         {
             let repository = SqliteRepository::open(path.clone()).unwrap();
             repository.save_record(&record).unwrap();
-            let connection = lock_unpoisoned(&repository.connection);
+            let connection = lock_unpoisoned(&repository.state);
             connection
                 .execute("DROP TABLE clipboard_recognition", [])
                 .unwrap();
@@ -5372,7 +5628,7 @@ mod tests {
         }
 
         let repository = SqliteRepository::open(path).unwrap();
-        let connection = lock_unpoisoned(&repository.connection);
+        let connection = lock_unpoisoned(&repository.state);
         let mode: i64 = connection
             .query_row("PRAGMA auto_vacuum", [], |row| row.get(0))
             .unwrap();

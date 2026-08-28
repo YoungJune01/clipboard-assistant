@@ -69,6 +69,7 @@ export interface SearchCursor { score: number; capturedAt: string; id: string; }
 export interface SearchPage { items: SessionRecord[]; nextCursor: SearchCursor | null; }
 export interface SessionRecord { id: string; capturedAt: string; sourceApplication: string | null; text: string | null; hasImage: boolean; ocrText: string | null; qrText: string | null; filePaths: string[]; fileCount: number; note: string | null; groupId: string | null; contentKind: ContentKind; pinned: boolean; favorite: boolean; sensitive: boolean; }
 export interface ImagePreview { dataUrl: string; width: number; height: number; }
+export interface StorageLocation { directory: string; databasePath: string; dataSizeBytes: number; isDefault: boolean; }
 export interface AppCommands {
   listSessionRecords(): Promise<SessionRecord[]>; pasteSelected(recordId: string): Promise<string>;
   copyText(value: string): Promise<void>; openExternalUrl(url: string): Promise<void>;
@@ -84,6 +85,9 @@ export interface AppCommands {
   clearClipboardHistory(): Promise<number>;
   exportBackup(): Promise<boolean>;
   restoreBackup(): Promise<SettingsState | null>;
+  getStorageLocation(): Promise<StorageLocation>;
+  chooseStorageLocation(): Promise<string | null>;
+  moveStorage(destination: string): Promise<StorageLocation>;
   exitApplication(): Promise<void>;
   listClipboardGroups(): Promise<ClipboardGroup[]>; createClipboardGroup(name: string): Promise<ClipboardGroup>;
   getActiveGroup(): Promise<ActiveGroupState>; setActiveGroup(kind: ActiveGroupState["kind"], groupId?: string): Promise<ActiveGroupState>;
@@ -132,6 +136,9 @@ const tauriCommands: AppCommands = {
   clearClipboardHistory: () => invoke("clear_clipboard_history"),
   exportBackup: () => invoke("export_backup"),
   restoreBackup: () => invoke("restore_backup"),
+  getStorageLocation: () => invoke("get_storage_location"),
+  chooseStorageLocation: () => invoke("choose_storage_location"),
+  moveStorage: (destination) => invoke("move_storage", { destination }),
   exitApplication: () => invoke("exit_application"),
   listClipboardGroups: () => invoke("list_clipboard_groups"),
   getActiveGroup: () => invoke("get_active_group"),
@@ -468,6 +475,36 @@ function SettingsShell({ commands, settings, setSettings, text }: { commands: Ap
   const [monitoringError, setMonitoringError] = useState(false);
   const [storagePolicyBusy, setStoragePolicyBusy] = useState(false);
   const [storagePolicyError, setStoragePolicyError] = useState(false);
+  const [storageLocation, setStorageLocation] = useState<StorageLocation | null>(null);
+  const [pendingStorageLocation, setPendingStorageLocation] = useState<string | null>(null);
+  const [storageMoveStatus, setStorageMoveStatus] = useState<"moved" | "failed" | null>(null);
+  const [storageMoveBusy, setStorageMoveBusy] = useState(false);
+  useEffect(() => {
+    if (!settings.storageAvailable) return;
+    void commands.getStorageLocation().then(setStorageLocation).catch(() => setStorageMoveStatus("failed"));
+  }, [commands, settings.storageAvailable]);
+  const chooseStorageLocation = async () => {
+    const destination = await commands.chooseStorageLocation();
+    if (destination) {
+      setPendingStorageLocation(destination);
+      setStorageMoveStatus(null);
+    }
+  };
+  const moveStorage = async () => {
+    if (!pendingStorageLocation) return;
+    setStorageMoveBusy(true);
+    setStorageMoveStatus(null);
+    try {
+      setStorageLocation(await commands.moveStorage(pendingStorageLocation));
+      setPendingStorageLocation(null);
+      setStorageMoveStatus("moved");
+    } catch {
+      setPendingStorageLocation(null);
+      setStorageMoveStatus("failed");
+    } finally {
+      setStorageMoveBusy(false);
+    }
+  };
   const saveExcludedApplications = async (applications: string[]) => {
     setMonitoringError(false);
     try { setSettings(await commands.updateExcludedApplications(applications)); return true; }
@@ -538,6 +575,7 @@ function SettingsShell({ commands, settings, setSettings, text }: { commands: Ap
         <div className={`setting-row${settings.soundEnabled ? "" : " disabled-row"}`}><div><Upload size={16} /><span><strong>{text.customSound}</strong><span>{text.customSoundDetail}</span></span></div><button className="secondary-button" type="button" disabled={!settings.soundEnabled} onClick={() => void commands.chooseCustomSound().then((value) => value && setSettings(value))}><Upload size={14} />{settings.customSoundAvailable ? text.replaceFile : text.chooseFile}</button></div>
       </SettingsSection>
       <SettingsSection id="storage" icon={<Database size={18} />} title={text.storage}>
+        <div className="setting-row storage-location-row"><div><FolderInput size={16} /><span><strong>{text.storageLocation}</strong><span className="storage-path" title={storageLocation?.directory ?? text.storageLocationUnavailable}>{pendingStorageLocation ?? storageLocation?.directory ?? text.storageLocationUnavailable}</span><span>{storageMoveStatus === "moved" ? text.storageMoved : storageMoveStatus === "failed" ? text.storageMoveFailed : storageLocation ? text.storageLocationDetail(formatBytes(storageLocation.dataSizeBytes), storageLocation.isDefault) : text.storageLocationDetail("-", true)}</span></span></div>{pendingStorageLocation ? <div className="confirm-actions"><button className="secondary-button" type="button" disabled={storageMoveBusy} onClick={() => setPendingStorageLocation(null)}>{text.cancel}</button><button className="secondary-button" type="button" disabled={storageMoveBusy} onClick={() => void moveStorage()}><FolderInput size={14} />{text.confirmMoveStorage}</button></div> : <button className="secondary-button" type="button" disabled={!settings.storageAvailable || storageMoveBusy || backupBusy} onClick={() => void chooseStorageLocation()}><FolderInput size={14} />{text.changeStorageLocation}</button>}</div>
         <SelectRow title={text.retention} detail={text.retentionDetail} value={settings.retention} onChange={(value) => void commands.updateRetention(value as RetentionPeriod).then(setSettings)} options={[{ value: "one_day", label: text.oneDay }, { value: "seven_days", label: text.sevenDays }, { value: "thirty_days", label: text.thirtyDays }, { value: "ninety_days", label: text.ninetyDays }, { value: "forever", label: text.forever }]} />
         <SelectRow title={text.storageLimit} detail={storagePolicyError ? text.storagePolicySaveFailed : text.storageLimitDetail} value={settings.storageLimit} disabled={storagePolicyBusy} onChange={(value) => void updateStoragePolicy(value as StorageLimit, settings.evictFavoritesWhenFull)} options={[{ value: "oneGb", label: text.oneGb }, { value: "fiveGb", label: text.fiveGb }, { value: "tenGb", label: text.tenGb }, { value: "unlimited", label: text.unlimitedStorage }]} />
         <ToggleRow title={text.evictFavoritesWhenFull} detail={storagePolicyError ? text.storagePolicySaveFailed : text.evictFavoritesWhenFullDetail} checked={settings.evictFavoritesWhenFull} disabled={storagePolicyBusy} onChange={(enabled) => updateStoragePolicy(settings.storageLimit, enabled)} />
@@ -566,6 +604,7 @@ function SettingsShell({ commands, settings, setSettings, text }: { commands: Ap
 function SettingsSection({ id, icon, title, badge, children }: { id: string; icon: React.ReactNode; title: string; badge?: string; children: React.ReactNode }) { return <section className="settings-section" id={id}><h2>{icon}{title}{badge && <span className="section-badge">{badge}</span>}</h2><div className="section-rows">{children}</div></section>; }
 function SelectRow({ title, detail, value, disabled = false, onChange, options }: { title: string; detail: string; value: string; disabled?: boolean; onChange(value: string): void; options: { value: string; label: string }[] }) { return <label className={`setting-row${disabled ? " disabled-row" : ""}`}><div><span><strong>{title}</strong><span>{detail}</span></span></div><select aria-label={title} value={value} disabled={disabled} onChange={(event) => onChange(event.currentTarget.value)}>{options.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></label>; }
 function StatusRow({ title, detail, state }: { title: string; detail: string; state: "available" | "unavailable" | "planned" }) { return <div className="setting-row"><div><span><strong>{title}</strong><span>{detail}</span></span></div><span className={`status-dot ${state}`} aria-label={detail} role="img" /></div>; }
+function formatBytes(value: number) { if (!Number.isFinite(value) || value <= 0) return "0 B"; const units = ["B", "KB", "MB", "GB", "TB"]; const index = Math.min(Math.floor(Math.log(value) / Math.log(1024)), units.length - 1); return `${(value / 1024 ** index).toFixed(index === 0 ? 0 : 1)} ${units[index]}`; }
 function ToggleRow({ title, detail, checked, disabled = false, onChange }: { title: string; detail: string; checked: boolean; disabled?: boolean; onChange(value: boolean): Promise<unknown> }) {
   const [saving, setSaving] = useState(false);
   return <label className={`setting-row toggle-row${disabled ? " disabled-row" : ""}`}><div><span><strong>{title}</strong><span>{detail}</span></span></div><span className="toggle-control"><input type="checkbox" aria-label={title} checked={checked} disabled={disabled || saving} onChange={(event) => { const value = event.currentTarget.checked; setSaving(true); void onChange(value).finally(() => setSaving(false)); }} /><span className="toggle" aria-hidden="true" /></span></label>;

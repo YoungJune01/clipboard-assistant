@@ -158,6 +158,9 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .setting-row > div > span { display: grid; }
 .setting-row strong { display: block; color: #263449; font-size: 12px; font-weight: 600; }
 .setting-row span { display: block; margin-top: 2px; color: #7b8798; font-size: 10px; }
+.storage-location-row > div:first-child { flex: 1 1 auto; overflow: hidden; }
+.storage-location-row > div:first-child > span { min-width: 0; }
+.storage-path { max-width: 430px; overflow: hidden; color: #536176 !important; text-overflow: ellipsis; white-space: nowrap; }
 .planned-row { color: #8792a2; background: rgba(246,248,251,.32); }
 .planned-row strong { color: #697587; }
 .planned-row svg { color: #8792a2; }

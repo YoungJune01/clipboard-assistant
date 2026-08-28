@@ -76,6 +76,9 @@ function commands(records = [record], settingsOverrides: Partial<SettingsState> 
     clearClipboardHistory: vi.fn().mockResolvedValue(records.length),
     exportBackup: vi.fn().mockResolvedValue(true),
     restoreBackup: vi.fn().mockImplementation(async () => settings),
+    getStorageLocation: vi.fn().mockResolvedValue({ directory: "C:\\ClipboardAssistant", databasePath: "C:\\ClipboardAssistant\\clipboard-history.sqlite3", dataSizeBytes: 1048576, isDefault: true }),
+    chooseStorageLocation: vi.fn().mockResolvedValue(null),
+    moveStorage: vi.fn().mockImplementation(async (destination) => ({ directory: destination, databasePath: `${destination}\\clipboard-history.sqlite3`, dataSizeBytes: 1048576, isDefault: false })),
     exitApplication: vi.fn().mockResolvedValue(undefined),
     listClipboardGroups: vi.fn().mockResolvedValue([]),
     getActiveGroup: vi.fn().mockResolvedValue({ kind: "all", groupId: null }),
@@ -911,6 +914,66 @@ describe("window routing", () => {
     expect(await screen.findByLabelText("Storage limit")).toHaveValue("fiveGb");
     expect(screen.getByRole("checkbox", { name: "Allow favorite eviction when full" })).toBeChecked();
     expect(screen.getByRole("option", { name: "Unlimited" })).toBeInTheDocument();
+  });
+
+  it("shows the current storage location and ignores a cancelled folder picker", async () => {
+    const api = commands([]);
+    const user = userEvent.setup();
+    render(<ClipboardAssistantApp windowLabel="settings" commands={api} />);
+
+    expect(await screen.findByText(String.raw`C:\ClipboardAssistant`)).toBeInTheDocument();
+    expect(screen.getByText(/当前数据 1\.0 MB/)).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "更改位置" }));
+
+    expect(api.chooseStorageLocation).toHaveBeenCalledTimes(1);
+    expect(api.moveStorage).not.toHaveBeenCalled();
+    expect(screen.queryByRole("button", { name: "确认迁移" })).not.toBeInTheDocument();
+  });
+
+  it("requires confirmation and updates the visible path after moving storage", async () => {
+    const api = commands([]);
+    vi.mocked(api.chooseStorageLocation).mockResolvedValue(String.raw`D:\ClipboardData`);
+    const user = userEvent.setup();
+    render(<ClipboardAssistantApp windowLabel="settings" commands={api} />);
+
+    await user.click(await screen.findByRole("button", { name: "更改位置" }));
+    expect(await screen.findByText(String.raw`D:\ClipboardData`)).toBeInTheDocument();
+    expect(api.moveStorage).not.toHaveBeenCalled();
+
+    await user.click(screen.getByRole("button", { name: "确认迁移" }));
+
+    await waitFor(() => expect(api.moveStorage).toHaveBeenCalledWith(String.raw`D:\ClipboardData`));
+    expect(await screen.findByText("数据已迁移，无需重启")).toBeInTheDocument();
+    expect(screen.getByText(String.raw`D:\ClipboardData`)).toBeInTheDocument();
+  });
+
+  it("can cancel a pending storage move", async () => {
+    const api = commands([]);
+    vi.mocked(api.chooseStorageLocation).mockResolvedValue(String.raw`D:\ClipboardData`);
+    const user = userEvent.setup();
+    render(<ClipboardAssistantApp windowLabel="settings" commands={api} />);
+
+    await user.click(await screen.findByRole("button", { name: "更改位置" }));
+    await user.click(await screen.findByRole("button", { name: "取消" }));
+
+    expect(api.moveStorage).not.toHaveBeenCalled();
+    expect(screen.getByText(String.raw`C:\ClipboardAssistant`)).toBeInTheDocument();
+    expect(screen.queryByText(String.raw`D:\ClipboardData`)).not.toBeInTheDocument();
+  });
+
+  it("reports a failed storage move and retains the original visible path", async () => {
+    const api = commands([]);
+    vi.mocked(api.chooseStorageLocation).mockResolvedValue(String.raw`D:\ClipboardData`);
+    vi.mocked(api.moveStorage).mockRejectedValueOnce(new Error("destination is occupied"));
+    const user = userEvent.setup();
+    render(<ClipboardAssistantApp windowLabel="settings" commands={api} />);
+
+    await user.click(await screen.findByRole("button", { name: "更改位置" }));
+    await user.click(await screen.findByRole("button", { name: "确认迁移" }));
+
+    expect(await screen.findByText("迁移失败，仍在使用原位置")).toBeInTheDocument();
+    expect(screen.getByText(String.raw`C:\ClipboardAssistant`)).toBeInTheDocument();
+    expect(screen.queryByText(String.raw`D:\ClipboardData`)).not.toBeInTheDocument();
   });
 
   it("updates offline OCR and QR recognition independently", async () => {
