@@ -1,3 +1,4 @@
+pub mod backup;
 pub mod panel;
 pub mod paste;
 pub mod persistence;

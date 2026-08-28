@@ -39,6 +39,7 @@ use crate::domain::{
     GroupId, HistoryCursor, HistoryQuery, Language, RecordId, RecordNote, RetentionPeriod,
     ShortcutModifiers, SourceIdentity, StorageLimit, UserSettings,
 };
+use crate::services::backup;
 use crate::services::session_records::{
     MAX_CAPTURE_RECORD_BYTES, MAX_DETAIL_FILE_LIST_BYTES, MAX_DETAIL_FILE_LIST_PATHS,
     MAX_DETAIL_TEXT_BYTES, REPRESENTATION_OVERHEAD_BYTES,
@@ -157,6 +158,7 @@ pub enum PersistenceError {
     CreateDirectory(std::io::Error),
     FileOperation(std::io::Error),
     Database(rusqlite::Error),
+    Backup(backup::BackupError),
     InvalidData,
     UnsupportedRepresentationKind(String),
     UnsupportedSchema(i64),
@@ -177,6 +179,7 @@ impl fmt::Display for PersistenceError {
                 formatter.write_str("local clipboard storage migration is unavailable")
             }
             Self::Database(_) => formatter.write_str("local clipboard storage is unavailable"),
+            Self::Backup(error) => error.fmt(formatter),
             Self::InvalidData => {
                 formatter.write_str("local clipboard storage contains invalid data")
             }
@@ -205,6 +208,7 @@ impl Error for PersistenceError {
             Self::CreateDirectory(error) => Some(error),
             Self::FileOperation(error) => Some(error),
             Self::Database(error) => Some(error),
+            Self::Backup(error) => Some(error),
             Self::WorkerStart(error) => Some(error),
             Self::InvalidData
             | Self::UnsupportedRepresentationKind(_)
@@ -214,6 +218,12 @@ impl Error for PersistenceError {
             | Self::RestoreRollbackFailed
             | Self::WorkerUnavailable => None,
         }
+    }
+}
+
+impl From<backup::BackupError> for PersistenceError {
+    fn from(error: backup::BackupError) -> Self {
+        Self::Backup(error)
     }
 }
 
@@ -949,22 +959,17 @@ impl SqliteRepository {
         if same_file_path(&state.path, destination) {
             return Err(PersistenceError::InvalidData);
         }
-        let temporary = backup_work_path(destination, ".exporting");
-        remove_path_and_sidecars(&temporary)?;
+        let snapshot = backup_work_path(destination, ".snapshot");
+        remove_path_and_sidecars(&snapshot)?;
         let result = (|| {
             state
                 .connection
-                .backup(rusqlite::MAIN_DB, &temporary, None)?;
-            validate_backup_file(&temporary)?;
-            if destination.exists() {
-                fs::remove_file(destination).map_err(PersistenceError::FileOperation)?;
-            }
-            fs::rename(&temporary, destination).map_err(PersistenceError::FileOperation)?;
+                .backup(rusqlite::MAIN_DB, &snapshot, None)?;
+            validate_backup_file(&snapshot)?;
+            backup::create_archive(&snapshot, None, destination, env!("CARGO_PKG_VERSION"))?;
             Ok(())
         })();
-        if result.is_err() {
-            let _ = remove_path_and_sidecars(&temporary);
-        }
+        let _ = remove_path_and_sidecars(&snapshot);
         result
     }
 
@@ -1025,9 +1030,12 @@ impl SqliteRepository {
         if same_file_path(&state.path, source) {
             return Err(PersistenceError::InvalidData);
         }
+        let staging_parent = state.path.parent().ok_or(PersistenceError::InvalidData)?;
+        let prepared = backup::prepare_restore(source, staging_parent)?;
+        let restore_source = prepared.database_path();
         let source_snapshot = backup_work_path(&state.path, ".restore-source");
         remove_path_and_sidecars(&source_snapshot)?;
-        let snapshot_result = snapshot_backup_file(source, &source_snapshot);
+        let snapshot_result = snapshot_backup_file(restore_source, &source_snapshot);
         if let Err(error) = snapshot_result {
             let _ = remove_path_and_sidecars(&source_snapshot);
             return Err(error);
@@ -3893,6 +3901,39 @@ mod tests {
         assert_eq!(restored.settings.retention, RetentionPeriod::Forever);
         assert_eq!(restored.settings.accent_color, AccentColor::Rose);
         assert_eq!(repository.load_recent(10).unwrap(), vec![expected]);
+    }
+
+    #[test]
+    fn verified_archive_with_invalid_sqlite_leaves_live_database_untouched() {
+        let directory = tempdir().unwrap();
+        let live_path = directory.path().join("live.sqlite3");
+        let invalid_database = directory.path().join("invalid.sqlite3");
+        let backup_path = directory.path().join("invalid.clipbackup");
+        let repository = SqliteRepository::open(live_path).unwrap();
+        let expected = text_record("live-record", Utc::now(), "keep current data");
+        repository.save_record(&expected).unwrap();
+        fs::write(&invalid_database, b"not a sqlite database").unwrap();
+        crate::services::backup::create_archive(&invalid_database, None, &backup_path, "0.1.0")
+            .unwrap();
+
+        let result = repository.restore_from(
+            &backup_path,
+            RestoreBudget {
+                max_records: 500,
+                max_total_bytes: crate::services::session_records::DEFAULT_STORE_BYTES,
+                max_record_bytes: crate::services::session_records::MAX_CAPTURE_RECORD_BYTES,
+            },
+        );
+
+        assert!(result.is_err());
+        assert_eq!(repository.load_recent(10).unwrap(), vec![expected]);
+        assert!(fs::read_dir(directory.path()).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".restore-archive-")
+        }));
     }
 
     #[test]
