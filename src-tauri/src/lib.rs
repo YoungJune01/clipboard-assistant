@@ -31,11 +31,11 @@ use tauri::tray::{MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, Tray
 #[cfg(windows)]
 use domain::{
     AccentColor, CaptureSound, Language, RetentionPeriod, Shortcut, ShortcutKey, ShortcutModifiers,
-    UserSettings,
+    SyncInterval, UserSettings, WebDavConfig,
 };
 
 #[cfg(windows)]
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 #[cfg(windows)]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -341,6 +341,244 @@ struct SettingsView {
     offline_ocr_enabled: bool,
     qr_recognition_enabled: bool,
     ocr_language_available: bool,
+    webdav: WebDavSettingsView,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WebDavSettingsView {
+    enabled: bool,
+    endpoint: String,
+    remote_folder: String,
+    interval: SyncInterval,
+    allow_insecure_http: bool,
+    credential_configured: bool,
+    last_result: Option<String>,
+    last_success_at: Option<chrono::DateTime<chrono::Utc>>,
+    next_run_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WebDavSettingsInput {
+    enabled: bool,
+    endpoint: String,
+    remote_folder: String,
+    interval: SyncInterval,
+    allow_insecure_http: bool,
+    username: Option<String>,
+    password: Option<String>,
+}
+
+#[cfg(windows)]
+struct WebDavSyncRuntime {
+    config: Mutex<WebDavConfig>,
+    persistence: Option<Arc<PersistenceWorker>>,
+    staging_root: std::path::PathBuf,
+    scheduler: Mutex<Option<services::sync::SyncScheduler>>,
+}
+
+#[cfg(windows)]
+impl WebDavSyncRuntime {
+    fn new(
+        config: WebDavConfig,
+        persistence: Option<Arc<PersistenceWorker>>,
+        app_data_dir: &std::path::Path,
+    ) -> Arc<Self> {
+        let runtime = Arc::new(Self {
+            config: Mutex::new(config),
+            persistence,
+            staging_root: app_data_dir.join("webdav-sync"),
+            scheduler: Mutex::new(None),
+        });
+        runtime.reconfigure_scheduler();
+        runtime
+    }
+
+    fn view(&self) -> WebDavSettingsView {
+        let config = lock_unpoisoned(&self.config).clone();
+        WebDavSettingsView {
+            enabled: config.enabled,
+            endpoint: config.endpoint,
+            remote_folder: config.remote_folder,
+            interval: config.interval,
+            allow_insecure_http: config.allow_insecure_http,
+            credential_configured: platform::windows::credentials::read_webdav_credential()
+                .is_ok_and(|credential| credential.is_some()),
+            last_result: config.last_result,
+            last_success_at: config.last_success_at,
+            next_run_at: if config.enabled {
+                config
+                    .last_success_at
+                    .and_then(|last| services::sync::next_run(last, config.interval))
+                    .or_else(|| services::sync::next_run(chrono::Utc::now(), config.interval))
+            } else {
+                None
+            },
+        }
+    }
+
+    fn update(self: &Arc<Self>, input: WebDavSettingsInput) -> Result<WebDavSettingsView, String> {
+        let mut config = lock_unpoisoned(&self.config).clone();
+        config.enabled = input.enabled;
+        config.endpoint = input.endpoint.trim().to_owned();
+        config.remote_folder = input.remote_folder.trim().trim_matches('/').to_owned();
+        config.interval = input.interval;
+        config.allow_insecure_http = input.allow_insecure_http;
+        if config.enabled && config.endpoint.is_empty() {
+            return Err("webdav_invalid_configuration".to_owned());
+        }
+        let previous_credential = platform::windows::credentials::read_webdav_credential()
+            .map_err(|_| "webdav_credential_read_failed".to_owned())?;
+        let credential_changed = input.username.is_some() || input.password.is_some();
+        if credential_changed {
+            let username = input.username.unwrap_or_default().trim().to_owned();
+            let password = input.password.unwrap_or_default();
+            if username.is_empty() || password.is_empty() {
+                return Err("webdav_credentials_required".to_owned());
+            }
+            platform::windows::credentials::write_webdav_credential(&username, &password)
+                .map_err(|_| "webdav_credential_save_failed".to_owned())?;
+        }
+        if let Err(error) = self.persist_config(&config) {
+            if credential_changed {
+                restore_webdav_credential(previous_credential);
+            }
+            return Err(error);
+        }
+        *lock_unpoisoned(&self.config) = config;
+        self.reconfigure_scheduler();
+        Ok(self.view())
+    }
+
+    fn test_connection(&self, input: WebDavSettingsInput) -> Result<(), String> {
+        let config = WebDavConfig {
+            enabled: true,
+            endpoint: input.endpoint.trim().to_owned(),
+            remote_folder: input.remote_folder.trim().trim_matches('/').to_owned(),
+            interval: input.interval,
+            allow_insecure_http: input.allow_insecure_http,
+            ..lock_unpoisoned(&self.config).clone()
+        };
+        let credential = credential_from_input_or_store(input.username, input.password)?;
+        services::sync::ReqwestWebDavClient::new(&config, credential)
+            .map_err(|error| error.to_string())?
+            .test_connection()
+            .map_err(|error| error.to_string())
+    }
+
+    fn synchronize_now(&self) -> Result<WebDavSettingsView, String> {
+        let persistence = self
+            .persistence
+            .as_ref()
+            .ok_or_else(|| "local clipboard storage is unavailable".to_owned())?;
+        let credential = credential_from_input_or_store(None, None)?;
+        let mut config = lock_unpoisoned(&self.config).clone();
+        let client = services::sync::ReqwestWebDavClient::new(&config, credential)
+            .map_err(|error| error.to_string())?;
+        let result = services::sync::synchronize(
+            &mut config,
+            &client,
+            persistence.as_ref(),
+            &self.staging_root,
+            chrono::Utc::now(),
+        );
+        if let Err(error) = &result {
+            config.last_result = Some(
+                match error {
+                    services::sync::SyncError::Authentication => "authentication_failed",
+                    services::sync::SyncError::InvalidRemoteData => "invalid_remote_data",
+                    services::sync::SyncError::InvalidConfiguration => "invalid_configuration",
+                    _ => "failed",
+                }
+                .to_owned(),
+            );
+        }
+        self.persist_config(&config)?;
+        *lock_unpoisoned(&self.config) = config;
+        result.map_err(|error| error.to_string())?;
+        Ok(self.view())
+    }
+
+    fn remove(self: &Arc<Self>) -> Result<WebDavSettingsView, String> {
+        let config = WebDavConfig::default();
+        let previous_credential = platform::windows::credentials::read_webdav_credential()
+            .map_err(|_| "webdav_credential_read_failed".to_owned())?;
+        platform::windows::credentials::delete_webdav_credential()
+            .map_err(|_| "webdav_credential_delete_failed".to_owned())?;
+        if let Err(error) = self.persist_config(&config) {
+            restore_webdav_credential(previous_credential);
+            return Err(error);
+        }
+        *lock_unpoisoned(&self.config) = config;
+        self.reconfigure_scheduler();
+        Ok(self.view())
+    }
+
+    fn persist_config(&self, config: &WebDavConfig) -> Result<(), String> {
+        self.persistence
+            .as_ref()
+            .ok_or_else(|| "local clipboard storage is unavailable".to_owned())?
+            .save_webdav_config(config)
+            .map_err(|error| error.to_string())
+    }
+
+    fn reconfigure_scheduler(self: &Arc<Self>) {
+        let config = lock_unpoisoned(&self.config).clone();
+        let mut scheduler = lock_unpoisoned(&self.scheduler);
+        *scheduler = None;
+        if !config.enabled || config.interval == SyncInterval::Manual {
+            return;
+        }
+        let runtime = Arc::downgrade(self);
+        *scheduler = services::sync::SyncScheduler::start(
+            config.interval,
+            Arc::new(move || {
+                if let Some(runtime) = runtime.upgrade() {
+                    let _ = runtime.synchronize_now();
+                }
+            }),
+        );
+    }
+}
+
+#[cfg(windows)]
+fn restore_webdav_credential(credential: Option<platform::windows::credentials::StoredCredential>) {
+    match credential {
+        Some(credential) => {
+            let _ = platform::windows::credentials::write_webdav_credential(
+                &credential.username,
+                &credential.password,
+            );
+        }
+        None => {
+            let _ = platform::windows::credentials::delete_webdav_credential();
+        }
+    }
+}
+
+#[cfg(windows)]
+fn credential_from_input_or_store(
+    username: Option<String>,
+    password: Option<String>,
+) -> Result<services::sync::WebDavCredential, String> {
+    if username.is_some() || password.is_some() {
+        let username = username.unwrap_or_default().trim().to_owned();
+        let password = password.unwrap_or_default();
+        if username.is_empty() || password.is_empty() {
+            return Err("webdav_credentials_required".to_owned());
+        }
+        return Ok(services::sync::WebDavCredential::new(username, password));
+    }
+    let credential = platform::windows::credentials::read_webdav_credential()
+        .map_err(|_| "webdav_credential_read_failed".to_owned())?
+        .ok_or_else(|| "webdav_credentials_required".to_owned())?;
+    Ok(services::sync::WebDavCredential::new(
+        credential.username,
+        credential.password,
+    ))
 }
 
 #[cfg(windows)]
@@ -377,6 +615,7 @@ struct ApplicationSettings {
     capture_policy: Arc<platform::windows::clipboard::CapturePolicy>,
     mutation_coordinator: Arc<PersistenceMutationCoordinator>,
     recognition: Option<Arc<services::recognition::RecognitionService>>,
+    webdav: Arc<WebDavSyncRuntime>,
 }
 
 #[cfg(windows)]
@@ -428,6 +667,7 @@ impl ApplicationSettings {
             offline_ocr_enabled: current.offline_ocr_enabled,
             qr_recognition_enabled: current.qr_recognition_enabled,
             ocr_language_available: platform::windows::ocr::installed_language_available(),
+            webdav: self.webdav.view(),
         }
     }
 
@@ -779,6 +1019,14 @@ mod runtime_tests {
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     };
+
+    fn disabled_webdav() -> Arc<super::WebDavSyncRuntime> {
+        super::WebDavSyncRuntime::new(
+            crate::domain::WebDavConfig::default(),
+            None,
+            std::path::Path::new(""),
+        )
+    }
     use tempfile::tempdir;
 
     #[test]
@@ -927,6 +1175,7 @@ mod runtime_tests {
         }
         let settings = ApplicationSettings {
             recognition: None,
+            webdav: disabled_webdav(),
             current: Mutex::new(UserSettings {
                 retention: RetentionPeriod::Forever,
                 ..UserSettings::default()
@@ -953,6 +1202,7 @@ mod runtime_tests {
         let original = UserSettings::default();
         let settings = ApplicationSettings {
             recognition: None,
+            webdav: disabled_webdav(),
             current: Mutex::new(original),
             persistence: None,
             records: Arc::new(SessionRecordStore::default()),
@@ -1008,6 +1258,7 @@ mod runtime_tests {
         ));
         let settings = Arc::new(ApplicationSettings {
             recognition: None,
+            webdav: disabled_webdav(),
             current: Mutex::new(UserSettings {
                 retention: RetentionPeriod::OneDay,
                 ..UserSettings::default()
@@ -1390,6 +1641,7 @@ mod runtime_tests {
     fn hiding_the_tray_also_disables_start_minimized() {
         let settings = ApplicationSettings {
             recognition: None,
+            webdav: disabled_webdav(),
             current: Mutex::new(UserSettings {
                 start_minimized: true,
                 show_tray_icon: true,
@@ -1424,6 +1676,7 @@ mod runtime_tests {
         }));
         let settings = Arc::new(ApplicationSettings {
             recognition: None,
+            webdav: disabled_webdav(),
             current: Mutex::new(UserSettings {
                 retention: RetentionPeriod::OneDay,
                 ..UserSettings::default()
@@ -2140,6 +2393,52 @@ fn move_storage(
 
 #[cfg(windows)]
 #[tauri::command]
+fn update_webdav_settings(
+    input: WebDavSettingsInput,
+    settings: tauri::State<'_, Arc<ApplicationSettings>>,
+    app: tauri::AppHandle,
+) -> Result<SettingsView, String> {
+    settings.webdav.update(input)?;
+    let view = settings.view();
+    let _ = app.emit("settings-changed", &view);
+    Ok(view)
+}
+
+#[cfg(windows)]
+#[tauri::command]
+fn test_webdav_connection(
+    input: WebDavSettingsInput,
+    settings: tauri::State<'_, Arc<ApplicationSettings>>,
+) -> Result<(), String> {
+    settings.webdav.test_connection(input)
+}
+
+#[cfg(windows)]
+#[tauri::command]
+fn sync_webdav_now(
+    settings: tauri::State<'_, Arc<ApplicationSettings>>,
+    app: tauri::AppHandle,
+) -> Result<SettingsView, String> {
+    settings.webdav.synchronize_now()?;
+    let view = settings.view();
+    let _ = app.emit("settings-changed", &view);
+    Ok(view)
+}
+
+#[cfg(windows)]
+#[tauri::command]
+fn remove_webdav_settings(
+    settings: tauri::State<'_, Arc<ApplicationSettings>>,
+    app: tauri::AppHandle,
+) -> Result<SettingsView, String> {
+    settings.webdav.remove()?;
+    let view = settings.view();
+    let _ = app.emit("settings-changed", &view);
+    Ok(view)
+}
+
+#[cfg(windows)]
+#[tauri::command]
 #[allow(clippy::too_many_arguments)]
 fn restore_backup(
     settings: tauri::State<'_, Arc<ApplicationSettings>>,
@@ -2611,6 +2910,10 @@ pub fn run() {
                 .into_iter()
                 .map(|(id, name)| ClipboardGroupView { id, name })
                 .collect();
+            let webdav_config = repository
+                .as_ref()
+                .and_then(|repository| repository.load_webdav_config().ok())
+                .unwrap_or_default();
             let groups = Arc::new(ClipboardGroups {
                 groups: Mutex::new(loaded_groups),
                 repository: repository.clone(),
@@ -2654,6 +2957,13 @@ pub fn run() {
                 });
                 session_records.attach_recognition(Arc::clone(recognition));
             }
+            let webdav = WebDavSyncRuntime::new(
+                webdav_config,
+                persistence.clone(),
+                app_data_dir
+                    .as_deref()
+                    .unwrap_or_else(|| std::path::Path::new("")),
+            );
             let capture_policy = Arc::new(platform::windows::clipboard::CapturePolicy::new(
                 normalize_excluded_applications(excluded_applications).unwrap_or_default(),
             ));
@@ -2676,6 +2986,7 @@ pub fn run() {
                 capture_policy,
                 mutation_coordinator,
                 recognition,
+                webdav,
             });
             let settings_window = app
                 .get_webview_window("settings")
@@ -2897,6 +3208,10 @@ pub fn run() {
             get_storage_location,
             choose_storage_location,
             move_storage,
+            update_webdav_settings,
+            test_webdav_connection,
+            sync_webdav_now,
+            remove_webdav_settings,
             update_shortcuts,
             exit_application
         ]);

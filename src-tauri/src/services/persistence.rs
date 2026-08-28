@@ -37,7 +37,7 @@ use crate::domain::{
     AccentColor, CaptureSound, ClipboardRecord, ClipboardRepresentation,
     ClipboardRepresentationDetails, ClipboardRepresentationKind, ContentIdentity, ContentKind,
     GroupId, HistoryCursor, HistoryQuery, Language, RecordId, RecordNote, RetentionPeriod,
-    ShortcutModifiers, SourceIdentity, StorageLimit, UserSettings,
+    ShortcutModifiers, SourceIdentity, StorageLimit, UserSettings, WebDavConfig,
 };
 use crate::services::backup;
 use crate::services::session_records::{
@@ -430,6 +430,20 @@ impl PersistenceWorker {
             .recv_timeout(self.response_timeout)
             .map_err(|_| self.degrade())?;
         result.map_err(|error| self.degrade_with(error))
+    }
+
+    pub fn load_webdav_config(&self) -> Result<WebDavConfig, PersistenceError> {
+        self.reader
+            .as_ref()
+            .ok_or(PersistenceError::WorkerUnavailable)?
+            .load_webdav_config()
+    }
+
+    pub fn save_webdav_config(&self, config: &WebDavConfig) -> Result<(), PersistenceError> {
+        self.reader
+            .as_ref()
+            .ok_or(PersistenceError::WorkerUnavailable)?
+            .save_webdav_config(config)
     }
 
     pub fn update_storage_policy(
@@ -1161,6 +1175,25 @@ impl SqliteRepository {
 
     pub fn load_settings(&self) -> Result<UserSettings, PersistenceError> {
         load_settings_from_connection(&lock_unpoisoned(&self.state).connection)
+    }
+
+    pub fn load_webdav_config(&self) -> Result<WebDavConfig, PersistenceError> {
+        setting(&lock_unpoisoned(&self.state).connection, "webdav_config")?
+            .map(|value| serde_json::from_str(&value).map_err(|_| PersistenceError::InvalidData))
+            .transpose()
+            .map(Option::unwrap_or_default)
+    }
+
+    pub fn save_webdav_config(&self, config: &WebDavConfig) -> Result<(), PersistenceError> {
+        let value = serde_json::to_string(config).map_err(|_| PersistenceError::InvalidData)?;
+        let mut state = lock_unpoisoned(&self.state);
+        let _migration_guard = self
+            .migration_locks
+            .acquire(&state.path, MIGRATION_LOCK_TIMEOUT)?;
+        let transaction = state.connection.transaction()?;
+        save_setting(&transaction, "webdav_config", &value)?;
+        transaction.commit()?;
+        Ok(())
     }
 
     pub fn load_groups(&self) -> Result<Vec<(GroupId, String)>, PersistenceError> {

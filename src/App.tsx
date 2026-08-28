@@ -4,6 +4,7 @@ import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
   Clipboard,
+  Cloud,
   Check,
   Copy,
   ChevronDown,
@@ -55,10 +56,13 @@ export type StorageLimit = "oneGb" | "fiveGb" | "tenGb" | "unlimited";
 export type HotkeyStatus = "available" | "conflict" | "unavailable";
 export type AccentColor = "blue" | "teal" | "rose" | "violet" | "amber";
 export type CaptureSound = "default" | "custom";
+export type SyncInterval = "manual" | "fifteen_minutes" | "one_hour" | "six_hours" | "daily";
+export interface WebDavSettings { enabled: boolean; endpoint: string; remoteFolder: string; interval: SyncInterval; allowInsecureHttp: boolean; credentialConfigured: boolean; lastResult: string | null; lastSuccessAt: string | null; nextRunAt: string | null; }
+export interface WebDavSettingsInput { enabled: boolean; endpoint: string; remoteFolder: string; interval: SyncInterval; allowInsecureHttp: boolean; username: string | null; password: string | null; }
 export type ShortcutKey = "a" | "b" | "c" | "d" | "e" | "f" | "g" | "h" | "i" | "j" | "k" | "l" | "m" | "n" | "o" | "p" | "q" | "r" | "s" | "t" | "u" | "v" | "w" | "x" | "y" | "z" | "digit0" | "digit1" | "digit2" | "digit3" | "digit4" | "digit5" | "digit6" | "digit7" | "digit8" | "digit9" | "f1" | "f2" | "f3" | "f4" | "f5" | "f6" | "f7" | "f8" | "f9" | "f10" | "f11" | "f12" | "left" | "right" | "up" | "down" | "space";
 export interface ShortcutModifiers { ctrl: boolean; alt: boolean; shift: boolean; win: boolean; }
 export interface Shortcut { modifiers: ShortcutModifiers; key: ShortcutKey; }
-export interface SettingsState { language: Language; retention: RetentionPeriod; storageLimit: StorageLimit; evictFavoritesWhenFull: boolean; startAtSignIn: boolean; startMinimized: boolean; showTrayIcon: boolean; accentColor: AccentColor; soundEnabled: boolean; captureSound: CaptureSound; customSoundAvailable: boolean; activationShortcut: Shortcut; groupShortcutModifiers: ShortcutModifiers; quickPasteEnabled: boolean; quickPasteModifiers: ShortcutModifiers; storageAvailable: boolean; hotkeyStatus: HotkeyStatus; capturePaused: boolean; excludedApplications: string[]; offlineOcrEnabled: boolean; qrRecognitionEnabled: boolean; ocrLanguageAvailable: boolean; }
+export interface SettingsState { language: Language; retention: RetentionPeriod; storageLimit: StorageLimit; evictFavoritesWhenFull: boolean; startAtSignIn: boolean; startMinimized: boolean; showTrayIcon: boolean; accentColor: AccentColor; soundEnabled: boolean; captureSound: CaptureSound; customSoundAvailable: boolean; activationShortcut: Shortcut; groupShortcutModifiers: ShortcutModifiers; quickPasteEnabled: boolean; quickPasteModifiers: ShortcutModifiers; storageAvailable: boolean; hotkeyStatus: HotkeyStatus; capturePaused: boolean; excludedApplications: string[]; offlineOcrEnabled: boolean; qrRecognitionEnabled: boolean; ocrLanguageAvailable: boolean; webdav: WebDavSettings; }
 export interface ClipboardGroup { id: string; name: string; }
 export interface ActiveGroupState { kind: "all" | "ungrouped" | "group"; groupId: string | null; }
 export type ContentKind = "text" | "rich_text" | "image" | "files";
@@ -88,6 +92,10 @@ export interface AppCommands {
   getStorageLocation(): Promise<StorageLocation>;
   chooseStorageLocation(): Promise<string | null>;
   moveStorage(destination: string): Promise<StorageLocation>;
+  updateWebDavSettings(input: WebDavSettingsInput): Promise<SettingsState>;
+  testWebDavConnection(input: WebDavSettingsInput): Promise<void>;
+  syncWebDavNow(): Promise<SettingsState>;
+  removeWebDavSettings(): Promise<SettingsState>;
   exitApplication(): Promise<void>;
   listClipboardGroups(): Promise<ClipboardGroup[]>; createClipboardGroup(name: string): Promise<ClipboardGroup>;
   getActiveGroup(): Promise<ActiveGroupState>; setActiveGroup(kind: ActiveGroupState["kind"], groupId?: string): Promise<ActiveGroupState>;
@@ -119,7 +127,7 @@ export interface AppCommands {
 }
 const CTRL_ALT: ShortcutModifiers = { ctrl: true, alt: true, shift: false, win: false };
 const CTRL_SHIFT: ShortcutModifiers = { ctrl: true, alt: false, shift: true, win: false };
-const defaults: SettingsState = { language: "zh_cn", retention: "thirty_days", storageLimit: "oneGb", evictFavoritesWhenFull: false, startAtSignIn: false, startMinimized: false, showTrayIcon: true, accentColor: "blue", soundEnabled: true, captureSound: "default", customSoundAvailable: false, activationShortcut: { modifiers: CTRL_SHIFT, key: "v" }, groupShortcutModifiers: CTRL_ALT, quickPasteEnabled: false, quickPasteModifiers: CTRL_ALT, storageAvailable: false, hotkeyStatus: "unavailable", capturePaused: false, excludedApplications: [], offlineOcrEnabled: false, qrRecognitionEnabled: false, ocrLanguageAvailable: false };
+const defaults: SettingsState = { language: "zh_cn", retention: "thirty_days", storageLimit: "oneGb", evictFavoritesWhenFull: false, startAtSignIn: false, startMinimized: false, showTrayIcon: true, accentColor: "blue", soundEnabled: true, captureSound: "default", customSoundAvailable: false, activationShortcut: { modifiers: CTRL_SHIFT, key: "v" }, groupShortcutModifiers: CTRL_ALT, quickPasteEnabled: false, quickPasteModifiers: CTRL_ALT, storageAvailable: false, hotkeyStatus: "unavailable", capturePaused: false, excludedApplications: [], offlineOcrEnabled: false, qrRecognitionEnabled: false, ocrLanguageAvailable: false, webdav: { enabled: false, endpoint: "", remoteFolder: "", interval: "manual", allowInsecureHttp: false, credentialConfigured: false, lastResult: null, lastSuccessAt: null, nextRunAt: null } };
 const tauriCommands: AppCommands = {
   listSessionRecords: () => invoke("list_session_records"), pasteSelected: (recordId) => invoke("paste_selected", { recordId }),
   copyText: (value) => invoke("copy_text", { value }), openExternalUrl: (url) => invoke("open_external_url", { url }),
@@ -139,6 +147,10 @@ const tauriCommands: AppCommands = {
   getStorageLocation: () => invoke("get_storage_location"),
   chooseStorageLocation: () => invoke("choose_storage_location"),
   moveStorage: (destination) => invoke("move_storage", { destination }),
+  updateWebDavSettings: (input) => invoke("update_webdav_settings", { input }),
+  testWebDavConnection: (input) => invoke("test_webdav_connection", { input }),
+  syncWebDavNow: () => invoke("sync_webdav_now"),
+  removeWebDavSettings: () => invoke("remove_webdav_settings"),
   exitApplication: () => invoke("exit_application"),
   listClipboardGroups: () => invoke("list_clipboard_groups"),
   getActiveGroup: () => invoke("get_active_group"),
@@ -479,6 +491,11 @@ function SettingsShell({ commands, settings, setSettings, text }: { commands: Ap
   const [pendingStorageLocation, setPendingStorageLocation] = useState<string | null>(null);
   const [storageMoveStatus, setStorageMoveStatus] = useState<"moved" | "failed" | null>(null);
   const [storageMoveBusy, setStorageMoveBusy] = useState(false);
+  const [webdavDraft, setWebdavDraft] = useState(() => ({ endpoint: settings.webdav.endpoint, remoteFolder: settings.webdav.remoteFolder, interval: settings.webdav.interval, username: "", password: "" }));
+  const [webdavBusy, setWebdavBusy] = useState(false);
+  const [webdavStatus, setWebdavStatus] = useState<"saved" | "tested" | "synced" | "failed" | null>(null);
+  const [pendingInsecureWebDav, setPendingInsecureWebDav] = useState<"save" | "test" | null>(null);
+  useEffect(() => { setWebdavDraft((draft) => ({ ...draft, endpoint: settings.webdav.endpoint, remoteFolder: settings.webdav.remoteFolder, interval: settings.webdav.interval })); }, [settings.webdav.endpoint, settings.webdav.remoteFolder, settings.webdav.interval]);
   useEffect(() => {
     if (!settings.storageAvailable) return;
     void commands.getStorageLocation().then(setStorageLocation).catch(() => setStorageMoveStatus("failed"));
@@ -527,6 +544,25 @@ function SettingsShell({ commands, settings, setSettings, text }: { commands: Ap
     catch { setStoragePolicyError(true); }
     finally { setStoragePolicyBusy(false); }
   };
+  const webdavInput = (enabled = settings.webdav.enabled, allowInsecureHttp = settings.webdav.allowInsecureHttp): WebDavSettingsInput => ({ enabled, endpoint: webdavDraft.endpoint.trim(), remoteFolder: webdavDraft.remoteFolder.trim(), interval: webdavDraft.interval, allowInsecureHttp, username: webdavDraft.username.trim() || null, password: webdavDraft.password || null });
+  const runWebdav = async (action: () => Promise<SettingsState | void>, success: "saved" | "tested" | "synced" | null) => {
+    setWebdavBusy(true); setWebdavStatus(null);
+    try { const value = await action(); if (value) setSettings(value); setWebdavDraft((draft) => ({ ...draft, password: "" })); setWebdavStatus(success); }
+    catch { setWebdavStatus("failed"); }
+    finally { setWebdavBusy(false); }
+  };
+  const saveWebdav = async (enabled = settings.webdav.enabled, confirmed = false) => {
+    const insecure = webdavDraft.endpoint.trim().toLocaleLowerCase().startsWith("http://");
+    if (insecure && !settings.webdav.allowInsecureHttp && !confirmed) { setPendingInsecureWebDav("save"); return; }
+    setPendingInsecureWebDav(null);
+    await runWebdav(() => commands.updateWebDavSettings(webdavInput(enabled, insecure || settings.webdav.allowInsecureHttp)), "saved");
+  };
+  const testWebdav = async (confirmed = false) => {
+    const insecure = webdavDraft.endpoint.trim().toLocaleLowerCase().startsWith("http://");
+    if (insecure && !settings.webdav.allowInsecureHttp && !confirmed) { setPendingInsecureWebDav("test"); return; }
+    setPendingInsecureWebDav(null);
+    await runWebdav(() => commands.testWebDavConnection(webdavInput(true, insecure || settings.webdav.allowInsecureHttp)), "tested");
+  };
   const selectSection = (event: React.MouseEvent<HTMLAnchorElement>, sectionId: string) => {
     event.preventDefault();
     setActiveSection(sectionId);
@@ -541,6 +577,7 @@ function SettingsShell({ commands, settings, setSettings, text }: { commands: Ap
     { id: "startup", icon: <MonitorUp size={17} />, label: text.startup },
     { id: "appearance", icon: <Palette size={17} />, label: text.appearance },
     { id: "storage", icon: <Database size={17} />, label: text.storage },
+    { id: "sync", icon: <Cloud size={17} />, label: text.webdavSync },
     { id: "recognition", icon: <ScanLine size={17} />, label: text.recognition },
     { id: "shortcuts", icon: <Keyboard size={17} />, label: text.shortcuts },
     { id: "application", icon: <Power size={17} />, label: text.application },
@@ -584,6 +621,15 @@ function SettingsShell({ commands, settings, setSettings, text }: { commands: Ap
         <div className="setting-row"><div><Upload size={16} /><span><strong>{text.restoreBackup}</strong><span>{backupStatus === "restored" ? text.backupRestored : backupStatus === "failed" ? text.backupFailed : text.restoreBackupDetail}</span></span></div>{confirmRestore ? <div className="confirm-actions"><button className="secondary-button" type="button" disabled={backupBusy} onClick={() => setConfirmRestore(false)}>{text.cancel}</button><button className="danger-button" type="button" disabled={backupBusy} onClick={() => { setBackupBusy(true); setBackupStatus(null); void commands.restoreBackup().then((value) => { if (value) { setSettings(value); setBackupStatus("restored"); setConfirmRestore(false); } }).catch(() => setBackupStatus("failed")).finally(() => setBackupBusy(false)); }}>{text.confirmRestore}</button></div> : <button className="secondary-button" type="button" disabled={!settings.storageAvailable || backupBusy} onClick={() => setConfirmRestore(true)}><Upload size={14} />{text.restoreBackup}</button>}</div>
         <div className="setting-row danger-row"><div><Trash2 size={16} /><span><strong>{text.clearHistory}</strong><span>{clearStatus === "cleared" ? text.historyCleared : clearStatus === "failed" ? text.clearHistoryFailed : text.clearHistoryDetail}</span></span></div>{confirmClear ? <div className="confirm-actions"><button className="secondary-button" type="button" onClick={() => setConfirmClear(false)}>{text.cancel}</button><button className="danger-button" type="button" onClick={() => { setClearStatus(null); void commands.clearClipboardHistory().then(() => { setClearStatus("cleared"); setConfirmClear(false); }).catch(() => setClearStatus("failed")); }}>{text.confirmClear}</button></div> : <button className="danger-button" type="button" disabled={!settings.storageAvailable} onClick={() => setConfirmClear(true)}><Trash2 size={14} />{text.clearHistory}</button>}</div>
       </SettingsSection>
+      <SettingsSection id="sync" icon={<Cloud size={18} />} title={text.webdavSync} badge={text.optIn}>
+        <ToggleRow title={text.enableWebdav} detail={text.enableWebdavDetail} checked={settings.webdav.enabled} disabled={webdavBusy || !settings.storageAvailable} onChange={(enabled) => saveWebdav(enabled)} />
+        <div className="setting-row webdav-fields"><div><Cloud size={16} /><span><strong>{text.webdavServer}</strong><span>{webdavStatus === "failed" ? text.webdavFailed : text.webdavServerDetail}</span></span></div><div className="field-stack"><input aria-label={text.webdavServer} placeholder="https://dav.example.com/" value={webdavDraft.endpoint} onChange={(event) => setWebdavDraft({ ...webdavDraft, endpoint: event.currentTarget.value })} /><input aria-label={text.webdavFolder} placeholder="ClipboardAssistant" value={webdavDraft.remoteFolder} onChange={(event) => setWebdavDraft({ ...webdavDraft, remoteFolder: event.currentTarget.value })} /></div></div>
+        <div className="setting-row webdav-fields"><div><Shield size={16} /><span><strong>{text.webdavCredentials}</strong><span>{settings.webdav.credentialConfigured ? text.webdavCredentialsStored : text.webdavCredentialsDetail}</span></span></div><div className="field-stack"><input aria-label={text.webdavUsername} autoComplete="username" placeholder={text.webdavUsername} value={webdavDraft.username} onChange={(event) => setWebdavDraft({ ...webdavDraft, username: event.currentTarget.value })} /><input aria-label={text.webdavPassword} type="password" autoComplete="new-password" placeholder={settings.webdav.credentialConfigured ? text.webdavPasswordUnchanged : text.webdavPassword} value={webdavDraft.password} onChange={(event) => setWebdavDraft({ ...webdavDraft, password: event.currentTarget.value })} /></div></div>
+        <SelectRow title={text.syncInterval} detail={text.syncIntervalDetail} value={webdavDraft.interval} disabled={webdavBusy} onChange={(interval) => setWebdavDraft({ ...webdavDraft, interval: interval as SyncInterval })} options={[{ value: "manual", label: text.syncManual }, { value: "fifteen_minutes", label: text.syncFifteenMinutes }, { value: "one_hour", label: text.syncOneHour }, { value: "six_hours", label: text.syncSixHours }, { value: "daily", label: text.syncDaily }]} />
+        {pendingInsecureWebDav && <div className="setting-row warning-row"><div><Shield size={16} /><span><strong>{text.insecureWebdav}</strong><span>{text.insecureWebdavDetail}</span></span></div><div className="confirm-actions"><button className="secondary-button" type="button" onClick={() => setPendingInsecureWebDav(null)}>{text.cancel}</button><button className="danger-button" type="button" onClick={() => void (pendingInsecureWebDav === "test" ? testWebdav(true) : saveWebdav(settings.webdav.enabled, true))}>{text.confirmInsecureWebdav}</button></div></div>}
+        <div className="setting-row"><div><span><strong>{text.webdavStatus}</strong><span>{webdavStatus === "tested" ? text.webdavTested : webdavStatus === "saved" ? text.webdavSaved : webdavStatus === "synced" ? text.webdavSynced : syncStatusText(settings.webdav, text)}</span></span></div><div className="confirm-actions"><button className="secondary-button" type="button" disabled={webdavBusy || !webdavDraft.endpoint.trim()} onClick={() => void testWebdav()}>{text.testConnection}</button><button className="secondary-button" type="button" disabled={webdavBusy || !settings.webdav.enabled} onClick={() => void runWebdav(() => commands.syncWebDavNow(), "synced")}><Upload size={14} />{text.syncNow}</button><button className="secondary-button" type="button" disabled={webdavBusy} onClick={() => void saveWebdav()}>{text.save}</button></div></div>
+        {(settings.webdav.endpoint || settings.webdav.credentialConfigured) && <div className="setting-row danger-row"><div><Trash2 size={16} /><span><strong>{text.removeWebdav}</strong><span>{text.removeWebdavDetail}</span></span></div><button className="danger-button" type="button" disabled={webdavBusy} onClick={() => void runWebdav(() => commands.removeWebDavSettings(), null)}><Trash2 size={14} />{text.removeWebdav}</button></div>}
+      </SettingsSection>
       <SettingsSection id="recognition" icon={<ScanLine size={18} />} title={text.recognition} badge={text.localPrivate}>
         <ToggleRow title={text.offlineOcr} detail={settings.ocrLanguageAvailable ? text.offlineOcrDetail : text.ocrLanguageUnavailable} checked={settings.offlineOcrEnabled} disabled={!settings.ocrLanguageAvailable} onChange={(enabled) => commands.updateRecognition(enabled, settings.qrRecognitionEnabled).then(setSettings)} />
         <ToggleRow title={text.qrRecognition} detail={text.qrRecognitionDetail} checked={settings.qrRecognitionEnabled} onChange={(enabled) => commands.updateRecognition(settings.offlineOcrEnabled, enabled).then(setSettings)} />
@@ -605,6 +651,7 @@ function SettingsSection({ id, icon, title, badge, children }: { id: string; ico
 function SelectRow({ title, detail, value, disabled = false, onChange, options }: { title: string; detail: string; value: string; disabled?: boolean; onChange(value: string): void; options: { value: string; label: string }[] }) { return <label className={`setting-row${disabled ? " disabled-row" : ""}`}><div><span><strong>{title}</strong><span>{detail}</span></span></div><select aria-label={title} value={value} disabled={disabled} onChange={(event) => onChange(event.currentTarget.value)}>{options.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></label>; }
 function StatusRow({ title, detail, state }: { title: string; detail: string; state: "available" | "unavailable" | "planned" }) { return <div className="setting-row"><div><span><strong>{title}</strong><span>{detail}</span></span></div><span className={`status-dot ${state}`} aria-label={detail} role="img" /></div>; }
 function formatBytes(value: number) { if (!Number.isFinite(value) || value <= 0) return "0 B"; const units = ["B", "KB", "MB", "GB", "TB"]; const index = Math.min(Math.floor(Math.log(value) / Math.log(1024)), units.length - 1); return `${(value / 1024 ** index).toFixed(index === 0 ? 0 : 1)} ${units[index]}`; }
+function syncStatusText(webdav: WebDavSettings, text: Dictionary) { if (!webdav.enabled) return text.webdavDisabled; if (webdav.lastResult === "conflict") return text.webdavConflict; if (webdav.lastResult === "authentication_failed") return text.webdavAuthenticationFailed; if (webdav.lastResult === "invalid_remote_data") return text.webdavInvalidRemote; if (webdav.lastSuccessAt) return text.webdavLastSuccess(new Date(webdav.lastSuccessAt).toLocaleString()); return text.webdavReady; }
 function ToggleRow({ title, detail, checked, disabled = false, onChange }: { title: string; detail: string; checked: boolean; disabled?: boolean; onChange(value: boolean): Promise<unknown> }) {
   const [saving, setSaving] = useState(false);
   return <label className={`setting-row toggle-row${disabled ? " disabled-row" : ""}`}><div><span><strong>{title}</strong><span>{detail}</span></span></div><span className="toggle-control"><input type="checkbox" aria-label={title} checked={checked} disabled={disabled || saving} onChange={(event) => { const value = event.currentTarget.checked; setSaving(true); void onChange(value).finally(() => setSaving(false)); }} /><span className="toggle" aria-hidden="true" /></span></label>;

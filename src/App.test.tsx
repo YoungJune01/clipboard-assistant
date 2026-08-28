@@ -27,6 +27,18 @@ const record: SessionRecord = {
   sensitive: false,
 };
 
+const disabledWebDav: SettingsState["webdav"] = {
+  enabled: false,
+  endpoint: "",
+  remoteFolder: "",
+  interval: "manual",
+  allowInsecureHttp: false,
+  credentialConfigured: false,
+  lastResult: null,
+  lastSuccessAt: null,
+  nextRunAt: null,
+};
+
 function commands(records = [record], settingsOverrides: Partial<SettingsState> = {}): AppCommands {
   let settings: SettingsState = {
     language: "zh_cn",
@@ -52,6 +64,7 @@ function commands(records = [record], settingsOverrides: Partial<SettingsState> 
     qrRecognitionEnabled: false,
     ocrLanguageAvailable: true,
     ...settingsOverrides,
+    webdav: settingsOverrides.webdav ?? disabledWebDav,
   };
   let activeGroupListener: ((active: { kind: "all" | "ungrouped" | "group"; groupId: string | null }) => void) | undefined;
   return {
@@ -145,6 +158,19 @@ function commands(records = [record], settingsOverrides: Partial<SettingsState> 
     previewCaptureSound: vi.fn().mockResolvedValue(undefined),
     updateShortcuts: vi.fn().mockImplementation(async (activationShortcut, groupShortcutModifiers, quickPasteEnabled, quickPasteModifiers) => {
       settings = { ...settings, activationShortcut, groupShortcutModifiers, quickPasteEnabled, quickPasteModifiers };
+      return settings;
+    }),
+    updateWebDavSettings: vi.fn().mockImplementation(async (input) => {
+      settings = { ...settings, webdav: { ...settings.webdav, ...input, credentialConfigured: Boolean(input.username && input.password) || settings.webdav.credentialConfigured } };
+      return settings;
+    }),
+    testWebDavConnection: vi.fn().mockResolvedValue(undefined),
+    syncWebDavNow: vi.fn().mockImplementation(async () => {
+      settings = { ...settings, webdav: { ...settings.webdav, lastResult: "uploaded", lastSuccessAt: "2026-08-28T12:00:00Z" } };
+      return settings;
+    }),
+    removeWebDavSettings: vi.fn().mockImplementation(async () => {
+      settings = { ...settings, webdav: disabledWebDav };
       return settings;
     }),
     setWindowTitle: vi.fn().mockResolvedValue(undefined),
@@ -1023,7 +1049,7 @@ describe("window routing", () => {
     expect(await screen.findByLabelText("快速剪贴板")).toBeInTheDocument();
     expect(document.documentElement.lang).toBe("zh-CN");
 
-    update!({ language: "en", retention: "thirty_days", storageLimit: "oneGb", evictFavoritesWhenFull: false, startAtSignIn: false, startMinimized: false, showTrayIcon: true, accentColor: "rose", soundEnabled: true, captureSound: "default", customSoundAvailable: false, activationShortcut: { modifiers: { ctrl: true, alt: false, shift: true, win: false }, key: "v" }, groupShortcutModifiers: { ctrl: true, alt: true, shift: false, win: false }, quickPasteEnabled: false, quickPasteModifiers: { ctrl: true, alt: true, shift: false, win: false }, storageAvailable: true, hotkeyStatus: "available", capturePaused: false, excludedApplications: [], offlineOcrEnabled: false, qrRecognitionEnabled: false, ocrLanguageAvailable: true });
+    update!({ language: "en", retention: "thirty_days", storageLimit: "oneGb", evictFavoritesWhenFull: false, startAtSignIn: false, startMinimized: false, showTrayIcon: true, accentColor: "rose", soundEnabled: true, captureSound: "default", customSoundAvailable: false, activationShortcut: { modifiers: { ctrl: true, alt: false, shift: true, win: false }, key: "v" }, groupShortcutModifiers: { ctrl: true, alt: true, shift: false, win: false }, quickPasteEnabled: false, quickPasteModifiers: { ctrl: true, alt: true, shift: false, win: false }, storageAvailable: true, hotkeyStatus: "available", capturePaused: false, excludedApplications: [], offlineOcrEnabled: false, qrRecognitionEnabled: false, ocrLanguageAvailable: true, webdav: disabledWebDav });
 
     expect(await screen.findByLabelText("Quick clipboard")).toBeInTheDocument();
     await waitFor(() => expect(document.documentElement.lang).toBe("en"));
@@ -1120,5 +1146,74 @@ describe("window routing", () => {
     await user.click(recorder);
     fireEvent.keyDown(recorder, { code: "Digit7", key: "7", altKey: true, shiftKey: true });
     expect(api.updateShortcuts).toHaveBeenCalledWith(expect.anything(), expect.anything(), true, { ctrl: false, alt: true, shift: true, win: false });
+  });
+
+  it("keeps WebDAV disabled without making sync requests", async () => {
+    const api = commands([]);
+    render(<ClipboardAssistantApp windowLabel="settings" commands={api} />);
+
+    expect(await screen.findByText("同步已关闭，不会发起网络请求")).toBeInTheDocument();
+    expect(api.testWebDavConnection).not.toHaveBeenCalled();
+    expect(api.syncWebDavNow).not.toHaveBeenCalled();
+    expect(api.updateWebDavSettings).not.toHaveBeenCalled();
+  });
+
+  it("saves an HTTPS WebDAV configuration and runs a manual sync", async () => {
+    const api = commands([], { webdav: { ...disabledWebDav, enabled: true } });
+    const user = userEvent.setup();
+    render(<ClipboardAssistantApp windowLabel="settings" commands={api} />);
+
+    await user.type(await screen.findByLabelText("服务器地址"), "https://dav.example.test/root/");
+    await user.type(screen.getByLabelText("远端文件夹"), "ClipboardAssistant");
+    await user.type(screen.getByLabelText("用户名"), "alice");
+    await user.type(screen.getByLabelText("密码"), "secret");
+    await user.click(screen.getByRole("button", { name: "保存" }));
+
+    await waitFor(() => expect(api.updateWebDavSettings).toHaveBeenCalledWith({
+      enabled: true,
+      endpoint: "https://dav.example.test/root/",
+      remoteFolder: "ClipboardAssistant",
+      interval: "manual",
+      allowInsecureHttp: false,
+      username: "alice",
+      password: "secret",
+    }));
+    expect(await screen.findByText("同步设置已保存")).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "立即同步" }));
+    await waitFor(() => expect(api.syncWebDavNow).toHaveBeenCalledTimes(1));
+    expect(await screen.findByText("同步已完成")).toBeInTheDocument();
+  });
+
+  it("requires explicit confirmation before testing an HTTP WebDAV server", async () => {
+    const api = commands([]);
+    const user = userEvent.setup();
+    render(<ClipboardAssistantApp windowLabel="settings" commands={api} />);
+
+    await user.type(await screen.findByLabelText("服务器地址"), "http://192.168.1.20/dav/");
+    await user.type(screen.getByLabelText("用户名"), "local-user");
+    await user.type(screen.getByLabelText("密码"), "local-password");
+    await user.click(screen.getByRole("button", { name: "测试连接" }));
+
+    expect(api.testWebDavConnection).not.toHaveBeenCalled();
+    expect(screen.getByText("HTTP 连接不安全")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "仍然使用 HTTP" }));
+    await waitFor(() => expect(api.testWebDavConnection).toHaveBeenCalledWith(expect.objectContaining({
+      endpoint: "http://192.168.1.20/dav/",
+      allowInsecureHttp: true,
+    })));
+    expect(await screen.findByText("连接测试成功")).toBeInTheDocument();
+  });
+
+  it("removes the WebDAV configuration and stored credential reference", async () => {
+    const api = commands([], { webdav: { ...disabledWebDav, endpoint: "https://dav.example.test/", credentialConfigured: true } });
+    const user = userEvent.setup();
+    render(<ClipboardAssistantApp windowLabel="settings" commands={api} />);
+
+    await user.click(await screen.findByRole("button", { name: "删除 WebDAV 配置" }));
+
+    await waitFor(() => expect(api.removeWebDavSettings).toHaveBeenCalledTimes(1));
+    expect(screen.queryByRole("button", { name: "删除 WebDAV 配置" })).not.toBeInTheDocument();
+    expect(screen.getByText("同步已关闭，不会发起网络请求")).toBeInTheDocument();
   });
 });

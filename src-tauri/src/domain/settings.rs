@@ -1,3 +1,4 @@
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -201,6 +202,62 @@ pub struct UserSettings {
     pub offline_ocr_enabled: bool,
     #[serde(default)]
     pub qr_recognition_enabled: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SyncInterval {
+    #[default]
+    Manual,
+    FifteenMinutes,
+    OneHour,
+    SixHours,
+    Daily,
+}
+
+impl SyncInterval {
+    pub fn duration(self) -> Option<std::time::Duration> {
+        match self {
+            Self::Manual => None,
+            Self::FifteenMinutes => Some(std::time::Duration::from_secs(15 * 60)),
+            Self::OneHour => Some(std::time::Duration::from_secs(60 * 60)),
+            Self::SixHours => Some(std::time::Duration::from_secs(6 * 60 * 60)),
+            Self::Daily => Some(std::time::Duration::from_secs(24 * 60 * 60)),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WebDavConfig {
+    pub enabled: bool,
+    pub endpoint: String,
+    pub remote_folder: String,
+    pub interval: SyncInterval,
+    pub allow_insecure_http: bool,
+    pub device_id: String,
+    pub last_local_sha256: Option<String>,
+    pub last_remote_sha256: Option<String>,
+    pub last_etag: Option<String>,
+    pub last_success_at: Option<DateTime<Utc>>,
+    pub last_result: Option<String>,
+}
+
+impl Default for WebDavConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            endpoint: String::new(),
+            remote_folder: String::new(),
+            interval: SyncInterval::Manual,
+            allow_insecure_http: false,
+            device_id: uuid::Uuid::new_v4().to_string(),
+            last_local_sha256: None,
+            last_remote_sha256: None,
+            last_etag: None,
+            last_success_at: None,
+            last_result: None,
+        }
+    }
 }
 
 impl Default for UserSettings {

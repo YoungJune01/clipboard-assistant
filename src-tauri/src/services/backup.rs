@@ -18,7 +18,7 @@ const ASSETS_DIRECTORY: &str = "assets/";
 const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
 const MAX_DATABASE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_ASSET_BYTES: u64 = 256 * 1024 * 1024;
-const MAX_ARCHIVE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+pub(crate) const MAX_ARCHIVE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const MAX_ARCHIVE_ENTRIES: usize = 10_000;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -205,7 +205,7 @@ fn write_archive(
     Ok(())
 }
 
-fn verify_archive(path: &Path) -> Result<BackupManifest, BackupError> {
+pub(crate) fn verify_archive(path: &Path) -> Result<BackupManifest, BackupError> {
     if fs::metadata(path)?.len() > MAX_ARCHIVE_BYTES {
         return Err(BackupError::InvalidArchive);
     }

@@ -14,5 +14,6 @@ pub use record::{
 };
 pub use settings::{
     AccentColor, AppSettings, CaptureSound, ClipboardSettings, Language, PasteSettings,
-    RetentionPeriod, Shortcut, ShortcutKey, ShortcutModifiers, StorageLimit, UserSettings,
+    RetentionPeriod, Shortcut, ShortcutKey, ShortcutModifiers, StorageLimit, SyncInterval,
+    UserSettings, WebDavConfig,
 };

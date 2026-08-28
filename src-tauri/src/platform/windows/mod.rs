@@ -1,5 +1,6 @@
 pub mod activation;
 pub mod clipboard;
+pub mod credentials;
 pub mod hotkey;
 mod message_loop;
 pub mod monitor;
