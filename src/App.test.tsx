@@ -154,6 +154,12 @@ function commands(records = [record], settingsOverrides: Partial<SettingsState> 
   };
 }
 
+async function openNoteEditor(content = "real clipboard text") {
+  const item = (await screen.findByText(content)).closest("article")!;
+  fireEvent.click(within(item).getByRole("button", { name: "添加备注" }));
+  return within(item).getByLabelText(`${content}的备注`);
+}
+
 function deferred<T>() {
   let resolve!: (value: T) => void;
   let reject!: (reason?: unknown) => void;
@@ -362,7 +368,7 @@ describe("quick panel", () => {
     render(<ClipboardAssistantApp windowLabel="quick-panel" commands={commands([record, second])} />);
     await screen.findByText("private value");
 
-    fireEvent.keyDown(window, { key: "ArrowDown" });
+    fireEvent.click(screen.getByText("private value"));
 
     const announcement = await screen.findByRole("status", { name: "" });
     await waitFor(() => expect(announcement).toHaveTextContent("已选择第 2 项，共 2 项，来源 Browser"));
@@ -382,7 +388,7 @@ describe("quick panel", () => {
     expect(screen.queryByText("another item")).not.toBeInTheDocument();
 
     fireEvent.change(search, { target: { value: "" } });
-    const note = screen.getByLabelText("real clipboard text的备注");
+    const note = await openNoteEditor();
     fireEvent.keyDown(note, { key: "x" });
     expect(search).toHaveValue("");
     fireEvent.keyDown(window, { key: "n", isComposing: true, keyCode: 229 });
@@ -526,18 +532,23 @@ describe("quick panel", () => {
     await waitFor(() => expect(screen.queryByText("已发送粘贴命令")).not.toBeInTheDocument());
   });
 
-  it("creates groups, filters records, and assigns a record inline", async () => {
+  it("assigns records and creates groups from the record context menu", async () => {
     const api = commands([{ ...record, groupId: null }]);
     vi.mocked(api.listClipboardGroups).mockResolvedValue([{ id: "22222222-2222-4222-8222-222222222222", name: "账号" }]);
     render(<ClipboardAssistantApp windowLabel="quick-panel" commands={api} />);
 
-    fireEvent.change(await screen.findByLabelText("real clipboard text的分组"), { target: { value: "22222222-2222-4222-8222-222222222222" } });
+    const item = (await screen.findByText("real clipboard text")).closest("article")!;
+    fireEvent.contextMenu(item, { clientX: 100, clientY: 100 });
+    fireEvent.click(await screen.findByRole("menuitemradio", { name: "账号" }));
     await waitFor(() => expect(api.updateRecordGroup).toHaveBeenCalledWith(record.id, "22222222-2222-4222-8222-222222222222"));
 
-    fireEvent.click(screen.getByLabelText("添加分组"));
+    fireEvent.contextMenu(item, { clientX: 100, clientY: 100 });
+    fireEvent.click(await screen.findByRole("menuitem", { name: "新建分组并添加" }));
     fireEvent.change(screen.getByLabelText("分组名称"), { target: { value: "工作" } });
     fireEvent.submit(screen.getByLabelText("分组名称").closest("form")!);
     await waitFor(() => expect(api.createClipboardGroup).toHaveBeenCalledWith("工作"));
+    await waitFor(() => expect(api.updateRecordGroup).toHaveBeenCalledWith(record.id, "11111111-1111-4111-8111-111111111111"));
+    expect(api.pasteSelected).not.toHaveBeenCalled();
   });
 
   it("reorders groups and disables movement at the ordered edges", async () => {
@@ -569,8 +580,9 @@ describe("quick panel", () => {
     fireEvent.click(screen.getByRole("alertdialog").querySelector("button.danger")!);
 
     await waitFor(() => expect(api.deleteClipboardGroup).toHaveBeenCalledWith(groupId));
-    expect(screen.getByText("real clipboard text")).toBeInTheDocument();
-    expect(screen.getByLabelText("real clipboard text的分组")).toHaveValue("");
+    const item = screen.getByText("real clipboard text").closest("article")!;
+    fireEvent.contextMenu(item, { clientX: 100, clientY: 100 });
+    expect(await screen.findByRole("menuitemradio", { name: "未分组" })).toHaveAttribute("aria-checked", "true");
   });
 
   it("synchronizes the active group selected by a global shortcut", async () => {
@@ -591,7 +603,7 @@ describe("quick panel", () => {
   it("keeps note editing isolated from selection paste gestures", async () => {
     const api = commands();
     render(<ClipboardAssistantApp windowLabel="quick-panel" commands={api} />);
-    const note = await screen.findByLabelText("real clipboard text的备注");
+    const note = await openNoteEditor();
 
     fireEvent.click(note);
     fireEvent.doubleClick(note);
@@ -606,11 +618,29 @@ describe("quick panel", () => {
     expect(screen.getByText("备注已保存")).toBeInTheDocument();
   });
 
+  it("shows saved notes as compact color labels and edits them in place", async () => {
+    const noted = { ...record, note: "项目延期时的常用回复" };
+    const api = commands([noted]);
+    render(<ClipboardAssistantApp windowLabel="quick-panel" commands={api} />);
+
+    const noteLabel = await screen.findByRole("button", { name: "real clipboard text的备注" });
+    expect(noteLabel).toHaveTextContent("备注: 项目延期时的常用回复");
+    expect(noteLabel).toHaveClass("note-chip");
+
+    fireEvent.click(noteLabel);
+    const editor = screen.getByLabelText("real clipboard text的备注");
+    fireEvent.change(editor, { target: { value: "GitHub 工作账号密码" } });
+    fireEvent.keyDown(editor, { key: "Enter" });
+
+    await waitFor(() => expect(api.updateRecordNote).toHaveBeenCalledWith(record.id, "GitHub 工作账号密码"));
+    expect(api.pasteSelected).not.toHaveBeenCalled();
+  });
+
   it("allows exactly 200 Unicode characters in a session note", async () => {
     const api = commands();
     const user = userEvent.setup();
     render(<ClipboardAssistantApp windowLabel="quick-panel" commands={api} />);
-    const note = await screen.findByLabelText("real clipboard text的备注");
+    const note = await openNoteEditor();
 
     await user.click(note);
     await user.paste("😀".repeat(201));
@@ -727,29 +757,23 @@ describe("quick panel", () => {
     await waitFor(() => expect(unlisten).toHaveBeenCalledTimes(1));
   });
 
-  it("keeps the latest note response and preserves a failed draft for retry", async () => {
-    const first = deferred<typeof record>();
-    const second = deferred<typeof record>();
+  it("preserves a failed note draft for retry", async () => {
     const api = commands();
     vi.mocked(api.updateRecordNote)
-      .mockReturnValueOnce(first.promise)
-      .mockReturnValueOnce(second.promise)
-      .mockRejectedValueOnce(new Error("save failed"));
+      .mockRejectedValueOnce(new Error("save failed"))
+      .mockResolvedValueOnce({ ...record, note: "retry me" });
     render(<ClipboardAssistantApp windowLabel="quick-panel" commands={api} />);
-    const note = await screen.findByLabelText("real clipboard text的备注");
-
-    fireEvent.change(note, { target: { value: "old" } });
-    fireEvent.keyDown(note, { key: "Enter" });
-    fireEvent.change(note, { target: { value: "new" } });
-    fireEvent.keyDown(note, { key: "Enter" });
-    second.resolve({ ...record, note: "new" });
-    first.resolve({ ...record, note: "old" });
-    await waitFor(() => expect(note).toHaveValue("new"));
+    const note = await openNoteEditor();
 
     fireEvent.change(note, { target: { value: "retry me" } });
     fireEvent.keyDown(note, { key: "Enter" });
     expect(await screen.findByRole("alert")).toHaveTextContent("备注保存失败");
-    expect(note).toHaveValue("retry me");
+    const draft = await screen.findByRole("button", { name: "real clipboard text的备注" });
+    expect(draft).toHaveTextContent("retry me");
+
+    fireEvent.click(draft);
+    fireEvent.keyDown(screen.getByLabelText("real clipboard text的备注"), { key: "Enter" });
+    await waitFor(() => expect(api.updateRecordNote).toHaveBeenLastCalledWith(record.id, "retry me"));
   });
 });
 describe("window routing", () => {
