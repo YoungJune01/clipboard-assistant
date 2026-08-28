@@ -1,12 +1,38 @@
+use std::sync::OnceLock;
+
 use windows::{
     Graphics::Imaging::BitmapDecoder,
     Media::Ocr::OcrEngine,
     Storage::Streams::{DataWriter, InMemoryRandomAccessStream},
+    Win32::Foundation::RPC_E_CHANGED_MODE,
     Win32::System::WinRT::{RO_INIT_MULTITHREADED, RoInitialize},
 };
 
+fn initialize_winrt() -> Result<(), String> {
+    match unsafe { RoInitialize(RO_INIT_MULTITHREADED) } {
+        Ok(()) => Ok(()),
+        Err(error) if error.code() == RPC_E_CHANGED_MODE => Ok(()),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn create_engine() -> Result<OcrEngine, String> {
+    if let Ok(engine) = OcrEngine::TryCreateFromUserProfileLanguages() {
+        return Ok(engine);
+    }
+    let languages = OcrEngine::AvailableRecognizerLanguages().map_err(|error| error.to_string())?;
+    let count = languages.Size().map_err(|error| error.to_string())?;
+    for index in 0..count {
+        let language = languages.GetAt(index).map_err(|error| error.to_string())?;
+        if let Ok(engine) = OcrEngine::TryCreateFromLanguage(&language) {
+            return Ok(engine);
+        }
+    }
+    Err("no Windows OCR language is available".to_owned())
+}
+
 pub(crate) fn recognize_png(bytes: &[u8]) -> Result<String, String> {
-    unsafe { RoInitialize(RO_INIT_MULTITHREADED) }.map_err(|error| error.to_string())?;
+    initialize_winrt()?;
     let stream = InMemoryRandomAccessStream::new().map_err(|error| error.to_string())?;
     let writer = DataWriter::CreateDataWriter(&stream).map_err(|error| error.to_string())?;
     writer
@@ -25,8 +51,7 @@ pub(crate) fn recognize_png(bytes: &[u8]) -> Result<String, String> {
         .GetSoftwareBitmapAsync()
         .and_then(|operation| operation.get())
         .map_err(|error| error.to_string())?;
-    let engine =
-        OcrEngine::TryCreateFromUserProfileLanguages().map_err(|error| error.to_string())?;
+    let engine = create_engine()?;
     engine
         .RecognizeAsync(&bitmap)
         .and_then(|operation| operation.get())
@@ -36,6 +61,13 @@ pub(crate) fn recognize_png(bytes: &[u8]) -> Result<String, String> {
 }
 
 pub(crate) fn installed_language_available() -> bool {
-    unsafe { RoInitialize(RO_INIT_MULTITHREADED) }.is_ok()
-        && OcrEngine::TryCreateFromUserProfileLanguages().is_ok()
+    static AVAILABLE: OnceLock<bool> = OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        std::thread::Builder::new()
+            .name("ocr-capability-check".to_owned())
+            .spawn(|| initialize_winrt().is_ok() && create_engine().is_ok())
+            .ok()
+            .and_then(|thread| thread.join().ok())
+            .unwrap_or(false)
+    })
 }

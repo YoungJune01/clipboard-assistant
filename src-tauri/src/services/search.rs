@@ -131,6 +131,8 @@ pub(crate) fn search_connection(
                      ORDER BY p.position LIMIT 1) AS preview_text,
                     EXISTS(SELECT 1 FROM clipboard_representations p
                            WHERE p.record_id = r.id AND p.kind IN ('png', 'dib_v5')) AS has_image,
+                    NULLIF(s.ocr_text, '') AS ocr_text,
+                    NULLIF(s.qr_text, '') AS qr_text,
                     (CASE WHEN lower(s.note) = lower(?1) THEN 1200 ELSE 0 END +
                      CASE WHEN lower(s.note) LIKE lower(?2) ESCAPE '\\' THEN 600 ELSE 0 END +
                      CASE WHEN lower(COALESCE(g.name, s.group_name)) LIKE lower(?2) ESCAPE '\\' THEN 500 ELSE 0 END +
@@ -160,7 +162,7 @@ pub(crate) fn search_connection(
                AND (?8 = 0 OR r.favorite = 1)
          )
          SELECT id, captured_at, source_application, note, group_id, pinned, favorite,
-                sensitive, content_kind, preview_text, has_image, score
+                sensitive, content_kind, preview_text, has_image, ocr_text, qr_text, score
          FROM candidates
          WHERE (?9 IS NULL OR score < ?9 OR
                 (score = ?9 AND (captured_at < ?10 OR
@@ -207,7 +209,9 @@ pub(crate) fn search_connection(
                 content_kind: row.get(8)?,
                 text: row.get(9)?,
                 has_image: row.get(10)?,
-                score: row.get(11)?,
+                ocr_text: row.get(11)?,
+                qr_text: row.get(12)?,
+                score: row.get(13)?,
             })
         },
     )?;
@@ -277,6 +281,8 @@ struct SearchRow {
     content_kind: String,
     text: Option<String>,
     has_image: bool,
+    ocr_text: Option<String>,
+    qr_text: Option<String>,
     score: i64,
 }
 
@@ -298,6 +304,8 @@ impl SearchRow {
                 source_application: self.source_application,
                 text: self.text,
                 has_image: self.has_image,
+                ocr_text: self.ocr_text,
+                qr_text: self.qr_text,
                 content_kind,
                 note: self
                     .note

@@ -38,13 +38,16 @@ pub(crate) struct RecognitionService {
 }
 
 impl RecognitionService {
-    pub(crate) fn start(persistence: Arc<PersistenceWorker>) -> std::io::Result<Arc<Self>> {
+    pub(crate) fn start(
+        persistence: Arc<PersistenceWorker>,
+        on_saved: Arc<dyn Fn() + Send + Sync>,
+    ) -> std::io::Result<Arc<Self>> {
         let (sender, receiver) = mpsc::sync_channel(QUEUE_CAPACITY);
         let scheduled = Arc::new(Mutex::new(HashSet::new()));
         let worker_scheduled = Arc::clone(&scheduled);
         let thread = thread::Builder::new()
             .name("clipboard-recognition".to_owned())
-            .spawn(move || run_worker(receiver, persistence, worker_scheduled))?;
+            .spawn(move || run_worker(receiver, persistence, worker_scheduled, on_saved))?;
         Ok(Arc::new(Self {
             sender: Mutex::new(Some(sender)),
             scheduled,
@@ -106,6 +109,7 @@ fn run_worker(
     receiver: mpsc::Receiver<RecognitionJob>,
     persistence: Arc<PersistenceWorker>,
     scheduled: Arc<Mutex<HashSet<ContentIdentity>>>,
+    on_saved: Arc<dyn Fn() + Send + Sync>,
 ) {
     while let Ok(job) = receiver.recv() {
         let decoded = image::load_from_memory(&job.image);
@@ -114,7 +118,12 @@ fn run_worker(
             Ok((ocr, qr)) => (ocr, qr, "complete"),
             Err(_) => (None, None, "failed"),
         };
-        let _ = persistence.save_recognition(job.id, ocr, qr, status);
+        if persistence
+            .save_recognition(job.id, ocr, qr, status)
+            .is_ok()
+        {
+            on_saved();
+        }
         lock_unpoisoned(&scheduled).remove(&job.identity);
     }
 }

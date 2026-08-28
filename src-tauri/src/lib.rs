@@ -2528,8 +2528,15 @@ pub fn run() {
                     Arc::clone(&storage_available),
                 )),
             };
+            let recognition_app = app.handle().clone();
             let recognition = persistence.as_ref().and_then(|persistence| {
-                services::recognition::RecognitionService::start(Arc::clone(persistence)).ok()
+                services::recognition::RecognitionService::start(
+                    Arc::clone(persistence),
+                    Arc::new(move || {
+                        let _ = recognition_app.emit("clipboard-records-changed", ());
+                    }),
+                )
+                .ok()
             });
             if let Some(recognition) = &recognition {
                 recognition.set_options(services::recognition::RecognitionOptions {

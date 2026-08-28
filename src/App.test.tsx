@@ -15,6 +15,8 @@ const record: SessionRecord = {
   sourceApplication: "Editor",
   text: "real clipboard text",
   hasImage: false,
+  ocrText: null,
+  qrText: null,
   note: null,
   groupId: null,
   contentKind: "text",
@@ -161,6 +163,25 @@ function deferred<T>() {
 }
 
 describe("quick panel", () => {
+  it("shows locally recognized QR and OCR content on image records", async () => {
+    const imageRecord: SessionRecord = {
+      ...record,
+      id: "11111111-2222-4333-8444-555555555555",
+      text: null,
+      hasImage: true,
+      ocrText: "发票号码 20260828",
+      qrText: "https://example.local/account",
+      contentKind: "image",
+    };
+    render(<ClipboardAssistantApp windowLabel="quick-panel" commands={commands([imageRecord])} />);
+
+    expect(await screen.findByText("二维码内容")).toBeInTheDocument();
+    expect(screen.getByText("https://example.local/account")).toBeInTheDocument();
+    expect(screen.getByText("识别文字")).toBeInTheDocument();
+    expect(screen.getByText("发票号码 20260828")).toBeInTheDocument();
+    expect(screen.queryByText("图片剪贴内容")).not.toBeInTheDocument();
+  });
+
   it("filters the durable page by content category", async () => {
     const imageRecord = { ...record, id: "44444444-4444-4444-8444-444444444444", text: null, hasImage: true, contentKind: "image" as const };
     render(<ClipboardAssistantApp windowLabel="quick-panel" commands={commands([record, imageRecord])} />);

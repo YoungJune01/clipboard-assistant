@@ -101,6 +101,8 @@ pub struct HistoryRecordSummary {
     pub source_application: Option<String>,
     pub text: Option<String>,
     pub has_image: bool,
+    pub ocr_text: Option<String>,
+    pub qr_text: Option<String>,
     pub content_kind: ContentKind,
     pub note: Option<RecordNote>,
     pub group_id: Option<GroupId>,
@@ -2550,7 +2552,9 @@ fn load_page_from_connection(
                  WHERE p.record_id = r.id AND p.kind = 'unicode_text' \
                  ORDER BY p.position LIMIT 1), \
                 EXISTS(SELECT 1 FROM clipboard_representations p \
-                       WHERE p.record_id = r.id AND p.kind IN ('png', 'dib_v5')) \
+                       WHERE p.record_id = r.id AND p.kind IN ('png', 'dib_v5')), \
+                (SELECT x.ocr_text FROM clipboard_recognition x WHERE x.record_id = r.id), \
+                (SELECT x.qr_text FROM clipboard_recognition x WHERE x.record_id = r.id) \
          FROM clipboard_records r WHERE 1 = 1",
     );
     let mut values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
@@ -2590,6 +2594,8 @@ fn load_page_from_connection(
             content_kind: row.get(8)?,
             text: row.get(9)?,
             has_image: row.get(10)?,
+            ocr_text: row.get(11)?,
+            qr_text: row.get(12)?,
         })
     })?;
     let mut records = Vec::with_capacity(requested);
@@ -3287,6 +3293,8 @@ struct DbSummary {
     content_kind: String,
     text: Option<String>,
     has_image: bool,
+    ocr_text: Option<String>,
+    qr_text: Option<String>,
 }
 
 impl DbSummary {
@@ -3299,6 +3307,8 @@ impl DbSummary {
             source_application: self.source_application,
             text: self.text,
             has_image: self.has_image,
+            ocr_text: self.ocr_text,
+            qr_text: self.qr_text,
             content_kind: parse_content_kind(&self.content_kind)
                 .ok_or(PersistenceError::InvalidData)?,
             note: self
@@ -5229,6 +5239,15 @@ mod tests {
         }
 
         let repository = SqliteRepository::open(path.clone()).unwrap();
+        let history = repository.load_page(HistoryQuery::default()).unwrap();
+        assert_eq!(
+            history.records[0].ocr_text.as_deref(),
+            Some("offline invoice number alpha")
+        );
+        assert_eq!(
+            history.records[0].qr_text.as_deref(),
+            Some("https://local.example/qr-beta")
+        );
         for query in ["invoice number alpha", "qr-beta"] {
             let page = repository
                 .search_history(crate::services::search::SearchQuery {
@@ -5238,6 +5257,14 @@ mod tests {
                 .unwrap();
             assert_eq!(page.items.len(), 1);
             assert_eq!(page.items[0].id, id);
+            assert_eq!(
+                page.items[0].ocr_text.as_deref(),
+                Some("offline invoice number alpha")
+            );
+            assert_eq!(
+                page.items[0].qr_text.as_deref(),
+                Some("https://local.example/qr-beta")
+            );
         }
         RecordPersistence::delete_record(repository.as_ref(), id).unwrap();
         drop(repository);
