@@ -92,8 +92,10 @@ pub(crate) fn refresh_search_record(
                 COALESCE((SELECT group_concat(p.text_value, char(10))
                           FROM clipboard_representations p
                           WHERE p.record_id = r.id AND p.kind = 'file_list'), ''),
-                '',
-                ''
+                COALESCE((SELECT x.ocr_text FROM clipboard_recognition x
+                          WHERE x.record_id = r.id), ''),
+                COALESCE((SELECT x.qr_text FROM clipboard_recognition x
+                          WHERE x.record_id = r.id), '')
          FROM clipboard_records r WHERE r.id = ?1",
         [record_id],
     )?;

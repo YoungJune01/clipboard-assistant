@@ -92,6 +92,7 @@ pub struct SessionRecordStore {
     persistence: NotePersistence,
     storage_available: Arc<AtomicBool>,
     mutation_coordinator: Arc<PersistenceMutationCoordinator>,
+    recognition: Mutex<Option<Arc<crate::services::recognition::RecognitionService>>>,
 }
 
 pub(crate) struct SessionRestoreGuard<'a> {
@@ -162,6 +163,7 @@ impl SessionRecordStore {
             persistence: NotePersistence::NotConfigured,
             storage_available: Arc::new(AtomicBool::new(false)),
             mutation_coordinator: Arc::new(PersistenceMutationCoordinator::default()),
+            recognition: Mutex::new(None),
         }
     }
 
@@ -203,6 +205,7 @@ impl SessionRecordStore {
             persistence: NotePersistence::Durable(persistence),
             storage_available,
             mutation_coordinator,
+            recognition: Mutex::new(None),
         };
         store.replace_loaded(records);
         store
@@ -280,6 +283,7 @@ impl SessionRecordStore {
             persistence: NotePersistence::Durable(persistence),
             storage_available,
             mutation_coordinator,
+            recognition: Mutex::new(None),
         };
         store.replace_page_for_query(query, page);
         store
@@ -314,6 +318,7 @@ impl SessionRecordStore {
             persistence: NotePersistence::SessionOnly,
             storage_available,
             mutation_coordinator: Arc::new(PersistenceMutationCoordinator::default()),
+            recognition: Mutex::new(None),
         };
         store.replace_loaded(records);
         store
@@ -334,6 +339,13 @@ impl SessionRecordStore {
 
     pub fn capture(&self, capture: CapturedClipboard) -> bool {
         !matches!(self.capture_one(capture), CaptureStatus::RejectedTooLarge)
+    }
+
+    pub(crate) fn attach_recognition(
+        &self,
+        recognition: Arc<crate::services::recognition::RecognitionService>,
+    ) {
+        *lock_unpoisoned(&self.recognition) = Some(recognition);
     }
 
     pub(crate) fn capture_one(&self, mut capture: CapturedClipboard) -> CaptureStatus {
@@ -1020,6 +1032,9 @@ impl SessionRecordStore {
             if persistence.save_record(record).is_err() {
                 self.storage_available.store(false, Ordering::Release);
             } else {
+                if let Some(recognition) = lock_unpoisoned(&self.recognition).as_ref() {
+                    recognition.enqueue(record);
+                }
                 let _ = self.refresh_loaded_window();
             }
         }

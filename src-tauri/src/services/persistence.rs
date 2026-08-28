@@ -44,7 +44,7 @@ use crate::services::session_records::{
     MAX_DETAIL_TEXT_BYTES, REPRESENTATION_OVERHEAD_BYTES,
 };
 
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 const DATABASE_FILE: &str = "clipboard-history.sqlite3";
 const MIGRATION_TEMP_SUFFIX: &str = ".migrate-v2";
 const MIGRATION_BACKUP_SUFFIX: &str = ".migrate-v1-backup";
@@ -262,6 +262,13 @@ enum PersistenceCommand {
         mpsc::SyncSender<Result<usize, PersistenceError>>,
     ),
     SaveExcludedApplications(Vec<String>, mpsc::SyncSender<Result<(), PersistenceError>>),
+    SaveRecognition(
+        RecordId,
+        Option<String>,
+        Option<String>,
+        String,
+        mpsc::SyncSender<Result<(), PersistenceError>>,
+    ),
     Prune(
         RetentionPeriod,
         DateTime<Utc>,
@@ -307,6 +314,13 @@ trait PersistenceBackend: Send + Sync {
     fn persist_excluded_applications(
         &self,
         applications: &[String],
+    ) -> Result<(), PersistenceError>;
+    fn persist_recognition(
+        &self,
+        id: RecordId,
+        ocr_text: Option<&str>,
+        qr_text: Option<&str>,
+        status: &str,
     ) -> Result<(), PersistenceError>;
     fn prune_records(
         &self,
@@ -414,6 +428,18 @@ impl PersistenceWorker {
     ) -> Result<(), PersistenceError> {
         self.request(|reply| {
             PersistenceCommand::SaveExcludedApplications(applications.to_vec(), reply)
+        })
+    }
+
+    pub(crate) fn save_recognition(
+        &self,
+        id: RecordId,
+        ocr_text: Option<String>,
+        qr_text: Option<String>,
+        status: impl Into<String>,
+    ) -> Result<(), PersistenceError> {
+        self.request(|reply| {
+            PersistenceCommand::SaveRecognition(id, ocr_text, qr_text, status.into(), reply)
         })
     }
 
@@ -702,6 +728,20 @@ fn run_persistence_worker(
                     repository_healthy = false;
                 }
             }
+            PersistenceCommand::SaveRecognition(id, ocr_text, qr_text, status, reply) => {
+                let result = repository.persist_recognition(
+                    id,
+                    ocr_text.as_deref(),
+                    qr_text.as_deref(),
+                    &status,
+                );
+                let failed = result.is_err();
+                let _ = reply.send(result);
+                if failed {
+                    storage_available.store(false, Ordering::Release);
+                    repository_healthy = false;
+                }
+            }
             PersistenceCommand::Prune(retention, now, reply) => {
                 let result = repository.prune_records(retention, now);
                 let failed = result.is_err();
@@ -734,7 +774,8 @@ fn reply_unavailable(command: PersistenceCommand) {
         | PersistenceCommand::UpdateNote(_, _, reply)
         | PersistenceCommand::DeleteRecord(_, reply)
         | PersistenceCommand::SaveSettings(_, reply)
-        | PersistenceCommand::SaveExcludedApplications(_, reply) => {
+        | PersistenceCommand::SaveExcludedApplications(_, reply)
+        | PersistenceCommand::SaveRecognition(_, _, _, _, reply) => {
             let _ = reply.send(Err(PersistenceError::WorkerUnavailable));
         }
         PersistenceCommand::UpdateStoragePolicy(_, _, reply) => {
@@ -1120,6 +1161,16 @@ impl SqliteRepository {
             "quick_paste_enabled",
             bool_value(settings.quick_paste_enabled),
         )?;
+        save_setting(
+            &transaction,
+            "offline_ocr_enabled",
+            bool_value(settings.offline_ocr_enabled),
+        )?;
+        save_setting(
+            &transaction,
+            "qr_recognition_enabled",
+            bool_value(settings.qr_recognition_enabled),
+        )?;
         let activation_shortcut = serde_json::to_string(&settings.activation_shortcut)
             .map_err(|_| PersistenceError::InvalidData)?;
         let group_shortcut_modifiers = serde_json::to_string(&settings.group_shortcut_modifiers)
@@ -1137,6 +1188,42 @@ impl SqliteRepository {
             "quick_paste_modifiers",
             &quick_paste_modifiers,
         )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn save_recognition(
+        &self,
+        id: RecordId,
+        ocr_text: Option<&str>,
+        qr_text: Option<&str>,
+        status: &str,
+    ) -> Result<(), PersistenceError> {
+        let _migration_guard = self
+            .migration_locks
+            .acquire(&self.path, MIGRATION_LOCK_TIMEOUT)?;
+        let mut connection = lock_unpoisoned(&self.connection);
+        let transaction = connection.transaction()?;
+        if !record_exists(&transaction, id)? {
+            return Err(PersistenceError::InvalidData);
+        }
+        transaction.execute(
+            "INSERT INTO clipboard_recognition(record_id, ocr_text, qr_text, status, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(record_id) DO UPDATE SET
+                ocr_text = excluded.ocr_text,
+                qr_text = excluded.qr_text,
+                status = excluded.status,
+                updated_at = excluded.updated_at",
+            params![
+                id.as_uuid().to_string(),
+                ocr_text,
+                qr_text,
+                status,
+                Utc::now().to_rfc3339()
+            ],
+        )?;
+        crate::services::search::refresh_search_record(&transaction, &id.as_uuid().to_string())?;
         transaction.commit()?;
         Ok(())
     }
@@ -1570,6 +1657,16 @@ impl PersistenceBackend for SqliteRepository {
         SqliteRepository::save_excluded_applications(self, applications)
     }
 
+    fn persist_recognition(
+        &self,
+        id: RecordId,
+        ocr_text: Option<&str>,
+        qr_text: Option<&str>,
+        status: &str,
+    ) -> Result<(), PersistenceError> {
+        self.save_recognition(id, ocr_text, qr_text, status)
+    }
+
     fn prune_records(
         &self,
         retention: RetentionPeriod,
@@ -1736,6 +1833,12 @@ fn load_settings_from_connection(
     let quick_paste_enabled = setting(connection, "quick_paste_enabled")?
         .and_then(|value| parse_bool(&value))
         .unwrap_or(false);
+    let offline_ocr_enabled = setting(connection, "offline_ocr_enabled")?
+        .and_then(|value| parse_bool(&value))
+        .unwrap_or(false);
+    let qr_recognition_enabled = setting(connection, "qr_recognition_enabled")?
+        .and_then(|value| parse_bool(&value))
+        .unwrap_or(false);
     let activation_shortcut = setting(connection, "activation_shortcut")?
         .and_then(|value| serde_json::from_str(&value).ok())
         .unwrap_or_default();
@@ -1766,6 +1869,8 @@ fn load_settings_from_connection(
         group_shortcut_modifiers,
         quick_paste_enabled,
         quick_paste_modifiers,
+        offline_ocr_enabled,
+        qr_recognition_enabled,
     })
 }
 
@@ -2336,8 +2441,24 @@ fn migrate(connection: &mut Connection) -> Result<(), PersistenceError> {
     if version == 4 {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         crate::services::search::create_search_schema(&transaction)?;
-        crate::services::search::rebuild_search_index(&transaction)?;
         transaction.pragma_update(None, "user_version", 5)?;
+        transaction.commit()?;
+    }
+    let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version == 5 {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute_batch(
+            "CREATE TABLE IF NOT EXISTS clipboard_recognition (
+                 record_id TEXT PRIMARY KEY NOT NULL
+                    REFERENCES clipboard_records(id) ON DELETE CASCADE,
+                 ocr_text TEXT,
+                 qr_text TEXT,
+                 status TEXT NOT NULL,
+                 updated_at TEXT NOT NULL
+             );",
+        )?;
+        crate::services::search::rebuild_search_index(&transaction)?;
+        transaction.pragma_update(None, "user_version", 6)?;
         transaction.commit()?;
     }
     Ok(())
@@ -2387,7 +2508,15 @@ fn create_schema(connection: &mut Connection) -> Result<(), PersistenceError> {
                 name TEXT NOT NULL,
                 position INTEGER NOT NULL
          );
-         PRAGMA user_version = 5;
+         CREATE TABLE clipboard_recognition (
+                record_id TEXT PRIMARY KEY NOT NULL
+                    REFERENCES clipboard_records(id) ON DELETE CASCADE,
+                ocr_text TEXT,
+                qr_text TEXT,
+                status TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+         );
+         PRAGMA user_version = 6;
          COMMIT;",
     )?;
     crate::services::search::create_search_schema(connection)?;
@@ -3422,6 +3551,16 @@ mod tests {
         }
 
         fn persist_settings(&self, _settings: UserSettings) -> Result<(), PersistenceError> {
+            Ok(())
+        }
+
+        fn persist_recognition(
+            &self,
+            _id: RecordId,
+            _ocr_text: Option<&str>,
+            _qr_text: Option<&str>,
+            _status: &str,
+        ) -> Result<(), PersistenceError> {
             Ok(())
         }
 
@@ -5043,6 +5182,82 @@ mod tests {
     }
 
     #[test]
+    fn schema_five_migrates_recognition_storage_without_losing_search() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("history.sqlite3");
+        let record = text_record("v5-record", Utc::now(), "existing searchable text");
+        {
+            let repository = SqliteRepository::open(path.clone()).unwrap();
+            repository.save_record(&record).unwrap();
+            let connection = lock_unpoisoned(&repository.connection);
+            connection
+                .execute("DROP TABLE clipboard_recognition", [])
+                .unwrap();
+            connection.pragma_update(None, "user_version", 5).unwrap();
+        }
+
+        let repository = SqliteRepository::open(path).unwrap();
+        let page = repository
+            .search_history(crate::services::search::SearchQuery {
+                query: "existing searchable".to_owned(),
+                ..Default::default()
+            })
+            .unwrap();
+
+        assert_eq!(repository.schema_version().unwrap(), SCHEMA_VERSION);
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].id, record.id);
+    }
+
+    #[test]
+    fn recognition_persists_refreshes_search_and_cascades_on_delete() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("history.sqlite3");
+        let record = text_record("recognized", Utc::now(), "unrelated preview");
+        let id = record.id;
+        {
+            let repository = SqliteRepository::open(path.clone()).unwrap();
+            repository.save_record(&record).unwrap();
+            repository
+                .save_recognition(
+                    id,
+                    Some("offline invoice number alpha"),
+                    Some("https://local.example/qr-beta"),
+                    "complete",
+                )
+                .unwrap();
+        }
+
+        let repository = SqliteRepository::open(path.clone()).unwrap();
+        for query in ["invoice number alpha", "qr-beta"] {
+            let page = repository
+                .search_history(crate::services::search::SearchQuery {
+                    query: query.to_owned(),
+                    ..Default::default()
+                })
+                .unwrap();
+            assert_eq!(page.items.len(), 1);
+            assert_eq!(page.items[0].id, id);
+        }
+        RecordPersistence::delete_record(repository.as_ref(), id).unwrap();
+        drop(repository);
+
+        let connection = Connection::open(path).unwrap();
+        let recognition_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM clipboard_recognition", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let search_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM clipboard_search", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(recognition_count, 0);
+        assert_eq!(search_count, 0);
+    }
+
+    #[test]
     fn version_one_database_migrates_to_incremental_auto_vacuum() {
         let directory = tempdir().unwrap();
         let path = directory.path().join("history.sqlite3");
@@ -5481,6 +5696,8 @@ mod tests {
                         shift: true,
                         ..ShortcutModifiers::default()
                     },
+                    offline_ocr_enabled: true,
+                    qr_recognition_enabled: true,
                 })
                 .unwrap();
         }
@@ -5518,6 +5735,8 @@ mod tests {
                     shift: true,
                     ..ShortcutModifiers::default()
                 },
+                offline_ocr_enabled: true,
+                qr_recognition_enabled: true,
             }
         );
     }

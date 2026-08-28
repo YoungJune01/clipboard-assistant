@@ -29,6 +29,7 @@ import {
   Upload,
   Play,
   RotateCcw,
+  ScanLine,
   Shield,
   Trash2,
   Volume2,
@@ -50,7 +51,7 @@ export type CaptureSound = "default" | "custom";
 export type ShortcutKey = "a" | "b" | "c" | "d" | "e" | "f" | "g" | "h" | "i" | "j" | "k" | "l" | "m" | "n" | "o" | "p" | "q" | "r" | "s" | "t" | "u" | "v" | "w" | "x" | "y" | "z" | "digit0" | "digit1" | "digit2" | "digit3" | "digit4" | "digit5" | "digit6" | "digit7" | "digit8" | "digit9" | "f1" | "f2" | "f3" | "f4" | "f5" | "f6" | "f7" | "f8" | "f9" | "f10" | "f11" | "f12" | "left" | "right" | "up" | "down" | "space";
 export interface ShortcutModifiers { ctrl: boolean; alt: boolean; shift: boolean; win: boolean; }
 export interface Shortcut { modifiers: ShortcutModifiers; key: ShortcutKey; }
-export interface SettingsState { language: Language; retention: RetentionPeriod; storageLimit: StorageLimit; evictFavoritesWhenFull: boolean; startAtSignIn: boolean; startMinimized: boolean; showTrayIcon: boolean; accentColor: AccentColor; soundEnabled: boolean; captureSound: CaptureSound; customSoundAvailable: boolean; activationShortcut: Shortcut; groupShortcutModifiers: ShortcutModifiers; quickPasteEnabled: boolean; quickPasteModifiers: ShortcutModifiers; storageAvailable: boolean; hotkeyStatus: HotkeyStatus; capturePaused: boolean; excludedApplications: string[]; }
+export interface SettingsState { language: Language; retention: RetentionPeriod; storageLimit: StorageLimit; evictFavoritesWhenFull: boolean; startAtSignIn: boolean; startMinimized: boolean; showTrayIcon: boolean; accentColor: AccentColor; soundEnabled: boolean; captureSound: CaptureSound; customSoundAvailable: boolean; activationShortcut: Shortcut; groupShortcutModifiers: ShortcutModifiers; quickPasteEnabled: boolean; quickPasteModifiers: ShortcutModifiers; storageAvailable: boolean; hotkeyStatus: HotkeyStatus; capturePaused: boolean; excludedApplications: string[]; offlineOcrEnabled: boolean; qrRecognitionEnabled: boolean; ocrLanguageAvailable: boolean; }
 export interface ClipboardGroup { id: string; name: string; }
 export interface ActiveGroupState { kind: "all" | "ungrouped" | "group"; groupId: string | null; }
 export type ContentKind = "text" | "rich_text" | "image" | "files";
@@ -91,6 +92,7 @@ export interface AppCommands {
   updateAccentColor(accentColor: AccentColor): Promise<SettingsState>;
   updateSoundEnabled(enabled: boolean): Promise<SettingsState>;
   updateCaptureSound(captureSound: CaptureSound): Promise<SettingsState>;
+  updateRecognition(offlineOcrEnabled: boolean, qrRecognitionEnabled: boolean): Promise<SettingsState>;
   updateCapturePaused(paused: boolean): Promise<SettingsState>;
   updateExcludedApplications(applications: string[]): Promise<SettingsState>;
   chooseCustomSound(): Promise<SettingsState | null>;
@@ -105,7 +107,7 @@ export interface AppCommands {
 }
 const CTRL_ALT: ShortcutModifiers = { ctrl: true, alt: true, shift: false, win: false };
 const CTRL_SHIFT: ShortcutModifiers = { ctrl: true, alt: false, shift: true, win: false };
-const defaults: SettingsState = { language: "zh_cn", retention: "thirty_days", storageLimit: "oneGb", evictFavoritesWhenFull: false, startAtSignIn: false, startMinimized: false, showTrayIcon: true, accentColor: "blue", soundEnabled: true, captureSound: "default", customSoundAvailable: false, activationShortcut: { modifiers: CTRL_SHIFT, key: "v" }, groupShortcutModifiers: CTRL_ALT, quickPasteEnabled: false, quickPasteModifiers: CTRL_ALT, storageAvailable: false, hotkeyStatus: "unavailable", capturePaused: false, excludedApplications: [] };
+const defaults: SettingsState = { language: "zh_cn", retention: "thirty_days", storageLimit: "oneGb", evictFavoritesWhenFull: false, startAtSignIn: false, startMinimized: false, showTrayIcon: true, accentColor: "blue", soundEnabled: true, captureSound: "default", customSoundAvailable: false, activationShortcut: { modifiers: CTRL_SHIFT, key: "v" }, groupShortcutModifiers: CTRL_ALT, quickPasteEnabled: false, quickPasteModifiers: CTRL_ALT, storageAvailable: false, hotkeyStatus: "unavailable", capturePaused: false, excludedApplications: [], offlineOcrEnabled: false, qrRecognitionEnabled: false, ocrLanguageAvailable: false };
 const tauriCommands: AppCommands = {
   listSessionRecords: () => invoke("list_session_records"), pasteSelected: (recordId) => invoke("paste_selected", { recordId }),
   listHistoryPage: (query) => invoke("list_history_page", { query }),
@@ -139,6 +141,7 @@ const tauriCommands: AppCommands = {
   updateAccentColor: (accentColor) => invoke("update_accent_color", { accentColor }),
   updateSoundEnabled: (enabled) => invoke("update_sound_enabled", { enabled }),
   updateCaptureSound: (captureSound) => invoke("update_capture_sound", { captureSound }),
+  updateRecognition: (offlineOcrEnabled, qrRecognitionEnabled) => invoke("update_recognition", { offlineOcrEnabled, qrRecognitionEnabled }),
   updateCapturePaused: (paused) => invoke("update_capture_paused", { paused }),
   updateExcludedApplications: (applications) => invoke("update_excluded_applications", { applications }),
   chooseCustomSound: () => invoke("choose_custom_sound"),
@@ -485,6 +488,10 @@ function SettingsShell({ commands, settings, setSettings, text }: { commands: Ap
         <div className="setting-row"><div><Download size={16} /><span><strong>{text.backupHistory}</strong><span>{backupStatus === "exported" ? text.backupExported : text.backupHistoryDetail}</span></span></div><button className="secondary-button" type="button" disabled={!settings.storageAvailable || backupBusy} onClick={() => { setBackupBusy(true); setBackupStatus(null); void commands.exportBackup().then((exported) => { if (exported) setBackupStatus("exported"); }).catch(() => setBackupStatus("failed")).finally(() => setBackupBusy(false)); }}><Download size={14} />{text.backupHistory}</button></div>
         <div className="setting-row"><div><Upload size={16} /><span><strong>{text.restoreBackup}</strong><span>{backupStatus === "restored" ? text.backupRestored : backupStatus === "failed" ? text.backupFailed : text.restoreBackupDetail}</span></span></div>{confirmRestore ? <div className="confirm-actions"><button className="secondary-button" type="button" disabled={backupBusy} onClick={() => setConfirmRestore(false)}>{text.cancel}</button><button className="danger-button" type="button" disabled={backupBusy} onClick={() => { setBackupBusy(true); setBackupStatus(null); void commands.restoreBackup().then((value) => { if (value) { setSettings(value); setBackupStatus("restored"); setConfirmRestore(false); } }).catch(() => setBackupStatus("failed")).finally(() => setBackupBusy(false)); }}>{text.confirmRestore}</button></div> : <button className="secondary-button" type="button" disabled={!settings.storageAvailable || backupBusy} onClick={() => setConfirmRestore(true)}><Upload size={14} />{text.restoreBackup}</button>}</div>
         <div className="setting-row danger-row"><div><Trash2 size={16} /><span><strong>{text.clearHistory}</strong><span>{clearStatus === "cleared" ? text.historyCleared : clearStatus === "failed" ? text.clearHistoryFailed : text.clearHistoryDetail}</span></span></div>{confirmClear ? <div className="confirm-actions"><button className="secondary-button" type="button" onClick={() => setConfirmClear(false)}>{text.cancel}</button><button className="danger-button" type="button" onClick={() => { setClearStatus(null); void commands.clearClipboardHistory().then(() => { setClearStatus("cleared"); setConfirmClear(false); }).catch(() => setClearStatus("failed")); }}>{text.confirmClear}</button></div> : <button className="danger-button" type="button" disabled={!settings.storageAvailable} onClick={() => setConfirmClear(true)}><Trash2 size={14} />{text.clearHistory}</button>}</div>
+      </SettingsSection>
+      <SettingsSection id="recognition" icon={<ScanLine size={18} />} title={text.recognition} badge={text.localPrivate}>
+        <ToggleRow title={text.offlineOcr} detail={settings.ocrLanguageAvailable ? text.offlineOcrDetail : text.ocrLanguageUnavailable} checked={settings.offlineOcrEnabled} disabled={!settings.ocrLanguageAvailable} onChange={(enabled) => commands.updateRecognition(enabled, settings.qrRecognitionEnabled).then(setSettings)} />
+        <ToggleRow title={text.qrRecognition} detail={text.qrRecognitionDetail} checked={settings.qrRecognitionEnabled} onChange={(enabled) => commands.updateRecognition(settings.offlineOcrEnabled, enabled).then(setSettings)} />
       </SettingsSection>
       <SettingsSection id="shortcuts" icon={<Keyboard size={18} />} title={text.shortcuts}>
         <ShortcutRecorder title={text.togglePanel} detail={shortcutError ?? hotkey} keys={shortcutKeys(settings.activationShortcut)} text={text} onCapture={(modifiers, key) => updateShortcuts({ modifiers, key })} />

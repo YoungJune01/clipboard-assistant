@@ -338,6 +338,9 @@ struct SettingsView {
     hotkey_status: HotkeyStatus,
     capture_paused: bool,
     excluded_applications: Vec<String>,
+    offline_ocr_enabled: bool,
+    qr_recognition_enabled: bool,
+    ocr_language_available: bool,
 }
 
 #[cfg(windows)]
@@ -372,6 +375,7 @@ struct ApplicationSettings {
     custom_sound_path: std::path::PathBuf,
     capture_policy: Arc<platform::windows::clipboard::CapturePolicy>,
     mutation_coordinator: Arc<PersistenceMutationCoordinator>,
+    recognition: Option<Arc<services::recognition::RecognitionService>>,
 }
 
 #[cfg(windows)]
@@ -398,6 +402,9 @@ impl ApplicationSettings {
             hotkey_status: *lock_unpoisoned(&self.hotkey_status),
             capture_paused: self.capture_policy.is_paused(),
             excluded_applications: self.capture_policy.excluded_applications(),
+            offline_ocr_enabled: current.offline_ocr_enabled,
+            qr_recognition_enabled: current.qr_recognition_enabled,
+            ocr_language_available: platform::windows::ocr::installed_language_available(),
         }
     }
 
@@ -485,6 +492,26 @@ impl ApplicationSettings {
     fn update_capture_sound(&self, capture_sound: CaptureSound) -> SettingsView {
         let _coordinated = self.mutation_coordinator.lock();
         lock_unpoisoned(&self.current).capture_sound = capture_sound;
+        self.persist_settings_coordinated();
+        self.view()
+    }
+
+    fn update_recognition(
+        &self,
+        offline_ocr_enabled: bool,
+        qr_recognition_enabled: bool,
+    ) -> SettingsView {
+        let _coordinated = self.mutation_coordinator.lock();
+        let mut current = lock_unpoisoned(&self.current);
+        current.offline_ocr_enabled = offline_ocr_enabled;
+        current.qr_recognition_enabled = qr_recognition_enabled;
+        drop(current);
+        if let Some(recognition) = &self.recognition {
+            recognition.set_options(services::recognition::RecognitionOptions {
+                ocr: offline_ocr_enabled,
+                qr: qr_recognition_enabled,
+            });
+        }
         self.persist_settings_coordinated();
         self.view()
     }
@@ -876,6 +903,7 @@ mod runtime_tests {
             }));
         }
         let settings = ApplicationSettings {
+            recognition: None,
             current: Mutex::new(UserSettings {
                 retention: RetentionPeriod::Forever,
                 ..UserSettings::default()
@@ -900,6 +928,7 @@ mod runtime_tests {
     fn storage_policy_failure_does_not_publish_runtime_settings() {
         let original = UserSettings::default();
         let settings = ApplicationSettings {
+            recognition: None,
             current: Mutex::new(original),
             persistence: None,
             records: Arc::new(SessionRecordStore::default()),
@@ -953,6 +982,7 @@ mod runtime_tests {
             Arc::clone(&mutation_coordinator),
         ));
         let settings = Arc::new(ApplicationSettings {
+            recognition: None,
             current: Mutex::new(UserSettings {
                 retention: RetentionPeriod::OneDay,
                 ..UserSettings::default()
@@ -1333,6 +1363,7 @@ mod runtime_tests {
     #[test]
     fn hiding_the_tray_also_disables_start_minimized() {
         let settings = ApplicationSettings {
+            recognition: None,
             current: Mutex::new(UserSettings {
                 start_minimized: true,
                 show_tray_icon: true,
@@ -1365,6 +1396,7 @@ mod runtime_tests {
             }],
         }));
         let settings = Arc::new(ApplicationSettings {
+            recognition: None,
             current: Mutex::new(UserSettings {
                 retention: RetentionPeriod::OneDay,
                 ..UserSettings::default()
@@ -1926,6 +1958,19 @@ fn update_capture_sound(
 
 #[cfg(windows)]
 #[tauri::command]
+fn update_recognition(
+    offline_ocr_enabled: bool,
+    qr_recognition_enabled: bool,
+    settings: tauri::State<'_, Arc<ApplicationSettings>>,
+    app: tauri::AppHandle,
+) -> SettingsView {
+    let view = settings.update_recognition(offline_ocr_enabled, qr_recognition_enabled);
+    let _ = app.emit("settings-changed", &view);
+    view
+}
+
+#[cfg(windows)]
+#[tauri::command]
 fn choose_custom_sound(
     settings: tauri::State<'_, Arc<ApplicationSettings>>,
     app: tauri::AppHandle,
@@ -2483,6 +2528,16 @@ pub fn run() {
                     Arc::clone(&storage_available),
                 )),
             };
+            let recognition = persistence.as_ref().and_then(|persistence| {
+                services::recognition::RecognitionService::start(Arc::clone(persistence)).ok()
+            });
+            if let Some(recognition) = &recognition {
+                recognition.set_options(services::recognition::RecognitionOptions {
+                    ocr: user_settings.offline_ocr_enabled,
+                    qr: user_settings.qr_recognition_enabled,
+                });
+                session_records.attach_recognition(Arc::clone(recognition));
+            }
             let capture_policy = Arc::new(platform::windows::clipboard::CapturePolicy::new(
                 normalize_excluded_applications(excluded_applications).unwrap_or_default(),
             ));
@@ -2502,6 +2557,7 @@ pub fn run() {
                 custom_sound_path,
                 capture_policy,
                 mutation_coordinator,
+                recognition,
             });
             let settings_window = app
                 .get_webview_window("settings")
@@ -2710,6 +2766,7 @@ pub fn run() {
             update_accent_color,
             update_sound_enabled,
             update_capture_sound,
+            update_recognition,
             update_capture_paused,
             update_excluded_applications,
             choose_custom_sound,

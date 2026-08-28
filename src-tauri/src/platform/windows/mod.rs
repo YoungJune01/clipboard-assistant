@@ -3,6 +3,7 @@ pub mod clipboard;
 pub mod hotkey;
 mod message_loop;
 pub mod monitor;
+pub mod ocr;
 pub mod paste;
 pub mod sound;
 pub mod startup;

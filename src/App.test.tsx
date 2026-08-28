@@ -23,7 +23,7 @@ const record: SessionRecord = {
   sensitive: false,
 };
 
-function commands(records = [record]): AppCommands {
+function commands(records = [record], settingsOverrides: Partial<SettingsState> = {}): AppCommands {
   let settings: SettingsState = {
     language: "zh_cn",
     retention: "thirty_days",
@@ -44,6 +44,10 @@ function commands(records = [record]): AppCommands {
     hotkeyStatus: "available",
     capturePaused: false,
     excludedApplications: [],
+    offlineOcrEnabled: false,
+    qrRecognitionEnabled: false,
+    ocrLanguageAvailable: true,
+    ...settingsOverrides,
   };
   let activeGroupListener: ((active: { kind: "all" | "ungrouped" | "group"; groupId: string | null }) => void) | undefined;
   return {
@@ -114,6 +118,10 @@ function commands(records = [record]): AppCommands {
     }),
     updateCaptureSound: vi.fn().mockImplementation(async (captureSound) => {
       settings = { ...settings, captureSound };
+      return settings;
+    }),
+    updateRecognition: vi.fn().mockImplementation(async (offlineOcrEnabled, qrRecognitionEnabled) => {
+      settings = { ...settings, offlineOcrEnabled, qrRecognitionEnabled };
       return settings;
     }),
     updateCapturePaused: vi.fn().mockImplementation(async (capturePaused) => {
@@ -801,6 +809,29 @@ describe("window routing", () => {
     expect(screen.getByRole("option", { name: "Unlimited" })).toBeInTheDocument();
   });
 
+  it("updates offline OCR and QR recognition independently", async () => {
+    const api = commands([]);
+    const user = userEvent.setup();
+    render(<ClipboardAssistantApp windowLabel="settings" commands={api} />);
+
+    await user.click(await screen.findByRole("checkbox", { name: "离线 OCR" }));
+    expect(api.updateRecognition).toHaveBeenCalledWith(true, false);
+    await user.click(screen.getByRole("checkbox", { name: "二维码识别" }));
+    expect(api.updateRecognition).toHaveBeenLastCalledWith(true, true);
+  });
+
+  it("disables OCR without an installed Windows language capability but keeps QR available", async () => {
+    const api = commands([], { ocrLanguageAvailable: false });
+    const user = userEvent.setup();
+    render(<ClipboardAssistantApp windowLabel="settings" commands={api} />);
+
+    expect(await screen.findByRole("checkbox", { name: "离线 OCR" })).toBeDisabled();
+    const qr = screen.getByRole("checkbox", { name: "二维码识别" });
+    expect(qr).toBeEnabled();
+    await user.click(qr);
+    expect(api.updateRecognition).toHaveBeenCalledWith(false, true);
+  });
+
   it("keeps the persisted storage policy visible when an update fails", async () => {
     const api = commands([]);
     vi.mocked(api.updateStoragePolicy).mockRejectedValueOnce(new Error("storage unavailable"));
@@ -825,7 +856,7 @@ describe("window routing", () => {
     expect(await screen.findByLabelText("快速剪贴板")).toBeInTheDocument();
     expect(document.documentElement.lang).toBe("zh-CN");
 
-    update!({ language: "en", retention: "thirty_days", storageLimit: "oneGb", evictFavoritesWhenFull: false, startAtSignIn: false, startMinimized: false, showTrayIcon: true, accentColor: "rose", soundEnabled: true, captureSound: "default", customSoundAvailable: false, activationShortcut: { modifiers: { ctrl: true, alt: false, shift: true, win: false }, key: "v" }, groupShortcutModifiers: { ctrl: true, alt: true, shift: false, win: false }, quickPasteEnabled: false, quickPasteModifiers: { ctrl: true, alt: true, shift: false, win: false }, storageAvailable: true, hotkeyStatus: "available", capturePaused: false, excludedApplications: [] });
+    update!({ language: "en", retention: "thirty_days", storageLimit: "oneGb", evictFavoritesWhenFull: false, startAtSignIn: false, startMinimized: false, showTrayIcon: true, accentColor: "rose", soundEnabled: true, captureSound: "default", customSoundAvailable: false, activationShortcut: { modifiers: { ctrl: true, alt: false, shift: true, win: false }, key: "v" }, groupShortcutModifiers: { ctrl: true, alt: true, shift: false, win: false }, quickPasteEnabled: false, quickPasteModifiers: { ctrl: true, alt: true, shift: false, win: false }, storageAvailable: true, hotkeyStatus: "available", capturePaused: false, excludedApplications: [], offlineOcrEnabled: false, qrRecognitionEnabled: false, ocrLanguageAvailable: true });
 
     expect(await screen.findByLabelText("Quick clipboard")).toBeInTheDocument();
     await waitFor(() => expect(document.documentElement.lang).toBe("en"));

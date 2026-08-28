@@ -197,6 +197,10 @@ pub struct UserSettings {
     pub group_shortcut_modifiers: ShortcutModifiers,
     pub quick_paste_enabled: bool,
     pub quick_paste_modifiers: ShortcutModifiers,
+    #[serde(default)]
+    pub offline_ocr_enabled: bool,
+    #[serde(default)]
+    pub qr_recognition_enabled: bool,
 }
 
 impl Default for UserSettings {
@@ -216,6 +220,8 @@ impl Default for UserSettings {
             group_shortcut_modifiers: ShortcutModifiers::CTRL_ALT,
             quick_paste_enabled: false,
             quick_paste_modifiers: ShortcutModifiers::CTRL_ALT,
+            offline_ocr_enabled: false,
+            qr_recognition_enabled: false,
         }
     }
 }
@@ -280,6 +286,8 @@ mod tests {
                 group_shortcut_modifiers: ShortcutModifiers::CTRL_ALT,
                 quick_paste_enabled: false,
                 quick_paste_modifiers: ShortcutModifiers::CTRL_ALT,
+                offline_ocr_enabled: false,
+                qr_recognition_enabled: false,
             }
         );
         assert_eq!(RetentionPeriod::Forever.days(), None);
@@ -331,6 +339,8 @@ mod tests {
 
         assert_eq!(settings.storage_limit, StorageLimit::OneGb);
         assert!(!settings.evict_favorites_when_full);
+        assert!(!settings.offline_ocr_enabled);
+        assert!(!settings.qr_recognition_enabled);
     }
 
     #[test]
