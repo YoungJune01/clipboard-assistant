@@ -4,3 +4,5 @@ mod clipboard_windows;
 mod panel_windows;
 #[cfg(windows)]
 mod paste_windows;
+#[cfg(windows)]
+mod performance_windows;

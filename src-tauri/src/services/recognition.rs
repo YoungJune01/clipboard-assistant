@@ -1,6 +1,7 @@
 use std::{
     collections::HashSet,
     io::Cursor,
+    sync::atomic::{AtomicUsize, Ordering},
     sync::{Arc, Mutex, mpsc},
     thread::{self, JoinHandle},
 };
@@ -35,6 +36,7 @@ pub(crate) struct RecognitionService {
     scheduled: Arc<Mutex<HashSet<ContentIdentity>>>,
     thread: Mutex<Option<JoinHandle<()>>>,
     options: Mutex<RecognitionOptions>,
+    pending: Arc<AtomicUsize>,
 }
 
 impl RecognitionService {
@@ -45,14 +47,25 @@ impl RecognitionService {
         let (sender, receiver) = mpsc::sync_channel(QUEUE_CAPACITY);
         let scheduled = Arc::new(Mutex::new(HashSet::new()));
         let worker_scheduled = Arc::clone(&scheduled);
+        let pending = Arc::new(AtomicUsize::new(0));
+        let worker_pending = Arc::clone(&pending);
         let thread = thread::Builder::new()
             .name("clipboard-recognition".to_owned())
-            .spawn(move || run_worker(receiver, persistence, worker_scheduled, on_saved))?;
+            .spawn(move || {
+                run_worker(
+                    receiver,
+                    persistence,
+                    worker_scheduled,
+                    worker_pending,
+                    on_saved,
+                )
+            })?;
         Ok(Arc::new(Self {
             sender: Mutex::new(Some(sender)),
             scheduled,
             thread: Mutex::new(Some(thread)),
             options: Mutex::new(RecognitionOptions::default()),
+            pending,
         }))
     }
 
@@ -78,13 +91,20 @@ impl RecognitionService {
             image,
             options,
         };
+        self.pending.fetch_add(1, Ordering::AcqRel);
         let sent = lock_unpoisoned(&self.sender)
             .as_ref()
             .is_some_and(|sender| sender.try_send(job).is_ok());
         if !sent {
+            self.pending.fetch_sub(1, Ordering::AcqRel);
             scheduled.remove(&record.content_identity);
         }
         sent
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_jobs(&self) -> usize {
+        self.pending.load(Ordering::Acquire)
     }
 }
 
@@ -109,6 +129,7 @@ fn run_worker(
     receiver: mpsc::Receiver<RecognitionJob>,
     persistence: Arc<PersistenceWorker>,
     scheduled: Arc<Mutex<HashSet<ContentIdentity>>>,
+    pending: Arc<AtomicUsize>,
     on_saved: Arc<dyn Fn() + Send + Sync>,
 ) {
     while let Ok(job) = receiver.recv() {
@@ -125,6 +146,7 @@ fn run_worker(
             on_saved();
         }
         lock_unpoisoned(&scheduled).remove(&job.identity);
+        pending.fetch_sub(1, Ordering::AcqRel);
     }
 }
 

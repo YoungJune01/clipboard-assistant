@@ -378,6 +378,7 @@ struct WebDavSyncRuntime {
     persistence: Option<Arc<PersistenceWorker>>,
     staging_root: std::path::PathBuf,
     scheduler: Mutex<Option<services::sync::SyncScheduler>>,
+    sync_gate: services::sync::SyncGate,
 }
 
 #[cfg(windows)]
@@ -392,6 +393,7 @@ impl WebDavSyncRuntime {
             persistence,
             staging_root: app_data_dir.join("webdav-sync"),
             scheduler: Mutex::new(None),
+            sync_gate: services::sync::SyncGate::default(),
         });
         runtime.reconfigure_scheduler();
         runtime
@@ -470,6 +472,10 @@ impl WebDavSyncRuntime {
     }
 
     fn synchronize_now(&self) -> Result<WebDavSettingsView, String> {
+        let _run = self
+            .sync_gate
+            .try_enter()
+            .ok_or_else(|| "webdav_sync_in_progress".to_owned())?;
         let persistence = self
             .persistence
             .as_ref()

@@ -434,6 +434,12 @@ impl SessionRecordStore {
             .collect()
     }
 
+    #[cfg(test)]
+    pub(crate) fn working_set_stats(&self) -> (usize, usize, usize) {
+        let state = lock_unpoisoned(&self.state);
+        (state.records.len(), state.page.len(), state.total_bytes)
+    }
+
     pub fn representations(&self, id: RecordId) -> Option<Vec<ClipboardRepresentation>> {
         self.record_details(id)
             .ok()

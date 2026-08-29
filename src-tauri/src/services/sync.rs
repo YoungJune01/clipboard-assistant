@@ -3,7 +3,10 @@ use std::{
     fmt, fs,
     io::{Read, Write},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -27,6 +30,30 @@ use crate::{
 const ARCHIVE_NAME: &str = "clipboard-assistant-latest.clipbackup";
 const STATE_NAME: &str = "clipboard-assistant-state.json";
 const MAX_STATE_BYTES: u64 = 64 * 1024;
+
+#[derive(Default)]
+pub struct SyncGate {
+    running: AtomicBool,
+}
+
+impl SyncGate {
+    pub fn try_enter(&self) -> Option<SyncRunGuard<'_>> {
+        self.running
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| SyncRunGuard { gate: self })
+    }
+}
+
+pub struct SyncRunGuard<'a> {
+    gate: &'a SyncGate,
+}
+
+impl Drop for SyncRunGuard<'_> {
+    fn drop(&mut self) {
+        self.gate.running.store(false, Ordering::Release);
+    }
+}
 
 #[derive(Clone)]
 pub struct WebDavCredential {
@@ -752,5 +779,14 @@ mod tests {
                 .unwrap()
                 .contains("password")
         );
+    }
+
+    #[test]
+    fn sync_gate_prevents_overlapping_runs_and_recovers_after_drop() {
+        let gate = SyncGate::default();
+        let first = gate.try_enter().expect("first sync run should start");
+        assert!(gate.try_enter().is_none());
+        drop(first);
+        assert!(gate.try_enter().is_some());
     }
 }

@@ -1596,6 +1596,20 @@ impl SqliteRepository {
         }
         Ok(())
     }
+
+    #[cfg(test)]
+    pub(crate) fn seed_records_for_performance(
+        &self,
+        records: &[ClipboardRecord],
+    ) -> Result<(), PersistenceError> {
+        let mut state = lock_unpoisoned(&self.state);
+        let transaction = state.connection.transaction()?;
+        for record in records {
+            write_record(&transaction, record)?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
 }
 
 fn legacy_quick_paste_modifiers(value: &str) -> Option<ShortcutModifiers> {
