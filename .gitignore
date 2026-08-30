@@ -47,6 +47,14 @@ secrets.json
 *.sln
 *.sw?
 
-# Local implementation worktrees and portable acceptance builds
+# Local implementation worktrees and build artifacts
 .worktrees/
-artifacts/*.exe
+artifacts/
+
+# Local application data and backups
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+*.backup

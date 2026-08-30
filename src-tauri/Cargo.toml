@@ -3,6 +3,8 @@ name = "clipboard-assistant"
 version = "0.1.0"
 description = "Windows desktop application for Clipboard Assistant"
 authors = ["Clipboard Assistant Contributors"]
+license = "MIT"
+repository = "https://github.com/YoungJune01/clipboard-assistant"
 edition = "2024"
 
 [features]

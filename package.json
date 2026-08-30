@@ -2,6 +2,12 @@
   "name": "clipboard-assistant",
   "private": true,
   "version": "0.1.0",
+  "description": "A local-first clipboard manager for Windows",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/YoungJune01/clipboard-assistant.git"
+  },
   "type": "module",
   "scripts": {
     "dev": "vite",
